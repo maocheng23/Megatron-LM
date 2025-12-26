@@ -205,6 +205,9 @@ class TransformerConfig(ModelParallelConfig):
     """Whether to log the max attention logit across whole model. Decoupled from qk_clip,
     defualts to False. Setting qk_clip will automatically log the max logit"""
 
+    post_self_attn_layernorm: bool = False
+    post_mlp_layernorm: bool = False
+
     test_mode: bool = False
     """Whether to run real-time tests."""
 
@@ -424,6 +427,12 @@ class TransformerConfig(ModelParallelConfig):
     kitchen_attention_backend: Literal["sdpa", "fa"] = "sdpa"
     """Which kitchen attention backend to use when use_kitchen_attention=True.
     "sdpa" for KitchenDotProductAttention, "fa" for KitchenFlashAttention."""
+
+    use_sglang: bool = False
+    """Use the SGLang extension for batch-invariant kernels."""
+
+    use_sglang_attention: bool = True
+    """Use the SGLang extension for attention (Flash Attention 3 with batch-invariant mode)."""
 
     ####################
     # fp4 related

@@ -85,6 +85,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_rerun_machine_args(parser)
     parser = _add_msc_args(parser)
     parser = _add_kitchen_quantization_arguments(parser)
+    parser = _add_sglang_arguments(parser)
     parser = _add_sft_args(parser)
 
     return parser
@@ -1318,9 +1319,35 @@ def core_transformer_config_from_args(args, config_class=None):
 
     # Translate args to core transformer configuration
     kw_args = {}
+    # Handle SGLang arguments FIRST, before the loop, to ensure they're set correctly
+    if hasattr(args, "use_sglang"):
+        kw_args['use_sglang'] = args.use_sglang
+        # If use_sglang is True, default use_sglang_attention to True if not explicitly set
+        if args.use_sglang:
+            if hasattr(args, "use_sglang_attention"):
+                # Check if it was explicitly set (not just the default from argparse)
+                # If use_sglang_attention is False but use_sglang is True, it might be unset
+                # We'll default it to True unless explicitly disabled
+                if not args.use_sglang_attention:
+                    # Check if --no-use-sglang-attention was passed
+                    if not hasattr(args, '_use_sglang_attention_explicitly_disabled'):
+                        kw_args['use_sglang_attention'] = True
+                        print("⚠️  SGLANG: use_sglang_attention was False, but defaulting to True since use_sglang=True", flush=True)
+                    else:
+                        kw_args['use_sglang_attention'] = False
+                else:
+                    kw_args['use_sglang_attention'] = args.use_sglang_attention
+            else:
+                kw_args['use_sglang_attention'] = True
+        else:
+            if hasattr(args, "use_sglang_attention"):
+                kw_args['use_sglang_attention'] = args.use_sglang_attention
+    
     for f in dataclasses.fields(config_class):
         if hasattr(args, f.name):
-            kw_args[f.name] = getattr(args, f.name)
+            # Skip use_sglang and use_sglang_attention as they're already handled above
+            if f.name not in ['use_sglang', 'use_sglang_attention']:
+                kw_args[f.name] = getattr(args, f.name)
     kw_args['persist_layer_norm'] = not args.no_persist_layer_norm
     kw_args['layernorm_zero_centered_gamma'] = args.apply_layernorm_1p
     kw_args['layernorm_epsilon'] = args.norm_epsilon
@@ -1368,6 +1395,9 @@ def core_transformer_config_from_args(args, config_class=None):
 
     kw_args['inference_sampling_seed'] = args.seed
 
+    kw_args['post_self_attn_layernorm'] = args.post_self_attn_layernorm
+    kw_args['post_mlp_layernorm'] = args.post_mlp_layernorm
+
     # handle quantization config
     # NOTE: Kitchen arguments are only added to the namespace when
     # Kitchen library is available.
@@ -1390,8 +1420,30 @@ def core_transformer_config_from_args(args, config_class=None):
     if hasattr(args, "kitchen_attention_backend"):
         kw_args['kitchen_attention_backend'] = args.kitchen_attention_backend
 
+    # Note: SGLang arguments are handled at the beginning of the function, before the loop
+
+    # Print clear SGLang configuration status
+    if hasattr(args, "use_sglang") and args.use_sglang:
+        print("=" * 80, flush=True)
+        print("📋 SGLANG KERNEL: Configuration detected in arguments", flush=True)
+        print(f"   - use_sglang: {args.use_sglang}", flush=True)
+        print(f"   - use_sglang_attention: {kw_args.get('use_sglang_attention', 'NOT SET')}", flush=True)
+        print("=" * 80, flush=True)
+    elif hasattr(args, "use_sglang") and not args.use_sglang:
+        print("⚠️  SGLANG KERNEL: NOT enabled (use_sglang=False). Using Transformer Engine backend.", flush=True)
+
     # Return config.
-    return config_class(**kw_args)
+    config = config_class(**kw_args)
+    
+    # Debug: Verify SGLang config was set correctly
+    if hasattr(args, "use_sglang") and args.use_sglang:
+        print(f"🔍 SGLANG DEBUG: After creating config, config.use_sglang = {config.use_sglang}", flush=True)
+        print(f"🔍 SGLANG DEBUG: After creating config, config.use_sglang_attention = {getattr(config, 'use_sglang_attention', 'NOT SET')}", flush=True)
+        if not config.use_sglang:
+            print("⚠️  ERROR: config.use_sglang is False even though args.use_sglang is True!", flush=True)
+            print(f"🔍 SGLANG DEBUG: kw_args['use_sglang'] = {kw_args.get('use_sglang', 'NOT SET')}", flush=True)
+    
+    return config
 
 
 def _add_transformer_engine_args(parser):
@@ -1747,6 +1799,12 @@ def _add_network_size_args(parser):
                        action='store_true',
                        help='If set, use original BERT residula connection '
                        'ordering.')
+    group.add_argument('--post-self-attn-layernorm', action='store_true',
+                       help='If set, use post self attention layernorm.')
+    group.add_argument('--post-mlp-layernorm', action='store_true',
+                       help='If set, use post MLP layernorm.')
+    group.add_argument('--use-gated-attention', action='store_true',
+                       help='If set, use gated attention as in Qwen3Next')
     group.add_argument('--openai-gelu', action='store_true',
                        help='Use OpenAIs GeLU implementation. This option'
                        'should not be used unless for backward compatibility'
@@ -3466,6 +3524,39 @@ def _add_kitchen_quantization_arguments(parser: argparse.ArgumentParser):
             default='sdpa',
             choices=['fa', 'sdpa'],
             help="The backend to use for kitchen attention. The default is 'fa'.",
+        )
+    return parser
+
+def _add_sglang_arguments(parser: argparse.ArgumentParser):
+    """Add SGLang-specific arguments to the main parser
+
+    If sglang isn't available, nothing to do here, return unchanged parser
+    """
+    try:
+        from megatron.core.extensions.sglang import SGLangSpecProvider
+
+        have_sglang = True
+    except (ImportError, ModuleNotFoundError):
+        have_sglang = False
+
+    if have_sglang:
+        group = parser.add_argument_group(title="sglang")
+        group.add_argument(
+            '--use-sglang',
+            action="store_true",
+            help="Use SGLang extension for batch-invariant kernels.",
+        )
+        group.add_argument(
+            '--use-sglang-attention',
+            action="store_true",
+            default=False,
+            help="Use SGLang's Flash Attention 3 with batch-invariant mode. Defaults to True when --use-sglang is enabled.",
+        )
+        group.add_argument(
+            '--no-use-sglang-attention',
+            action='store_false',
+            dest='use_sglang_attention',
+            help="Explicitly disable SGLang's Flash Attention 3 (use fallback instead).",
         )
     return parser
 

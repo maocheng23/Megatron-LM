@@ -129,10 +129,18 @@ class MLP(MegatronModule):
             stride=fc1_stride,
         )
 
-        if self.config.use_te_activation_func and not (submodules.activation_func is None):
+        # Use custom activation if provided (e.g., SGLangSwiGLU for true on-policy)
+        # This takes precedence regardless of use_te_activation_func setting
+        if submodules.activation_func is not None:
             self.activation_func = build_module(submodules.activation_func, config=self.config)
+            self._use_custom_activation = True
+        elif self.config.use_te_activation_func:
+            # TE activation requested but no submodule provided - shouldn't happen
+            self.activation_func = self.config.activation_func
+            self._use_custom_activation = False
         else:
             self.activation_func = self.config.activation_func
+            self._use_custom_activation = False
 
         self.linear_fc2 = build_module(
             submodules.linear_fc2,
@@ -151,12 +159,26 @@ class MLP(MegatronModule):
     def forward(self, hidden_states, per_token_scale=None):
         """Perform the forward pass through the MLP block."""
         # [s, b, 4 * h/p]
+        # For SGLang true on-policy: cast to bfloat16 BEFORE linear_fc1
+        # to match SGLang's Qwen2MLP which does x = x.bfloat16() first
+        if getattr(self, '_use_custom_activation', False):
+            hidden_states = hidden_states.to(torch.bfloat16)
+
         nvtx_range_push(suffix="linear_fc1")
         intermediate_parallel, bias_parallel = self.linear_fc1(hidden_states)
         nvtx_range_pop(suffix="linear_fc1")
 
         nvtx_range_push(suffix="activation")
-        if self.config.use_te_activation_func:
+        # Check for custom activation (e.g., SGLangSwiGLU for true on-policy)
+        if getattr(self, '_use_custom_activation', False):
+            if bias_parallel is not None:
+                intermediate_parallel = intermediate_parallel + bias_parallel
+            intermediate_parallel = self.activation_func(intermediate_parallel)
+            if per_token_scale is not None:
+                original_dtype = intermediate_parallel.dtype
+                intermediate_parallel = intermediate_parallel * per_token_scale.unsqueeze(-1)
+                intermediate_parallel = intermediate_parallel.to(original_dtype)
+        elif self.config.use_te_activation_func:
             if bias_parallel is not None:
                 intermediate_parallel = intermediate_parallel + bias_parallel
             intermediate_parallel = self.activation_func(intermediate_parallel)

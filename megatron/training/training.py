@@ -950,12 +950,18 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         else:
             pre_process = is_pp_first_stage(pg_collection.pp)
             post_process = is_pp_last_stage(pg_collection.pp)
-            model = model_provider_func(
-                pre_process=pre_process,
-                post_process=post_process,
-                config=config,
-                pg_collection=pg_collection,
-            )
+            if config is not None and pg_collection is not None:
+                model = model_provider_func(
+                    pre_process=pre_process,
+                    post_process=post_process,
+                    config=config,
+                    pg_collection=pg_collection,
+                )
+            else:
+                model = model_provider_func(
+                    pre_process=pre_process,
+                    post_process=post_process,
+                )
             model.model_type = model_type
         return model
 

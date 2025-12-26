@@ -37,7 +37,27 @@ from megatron.core.transformer.transformer_layer import (
     TransformerLayerSubmodules,
     get_transformer_layer_offset,
 )
-from megatron.core.utils import is_te_min_version
+from megatron.core.utils import is_te_min_version, log_single_rank
+import logging
+
+_logger = logging.getLogger(__name__)
+
+
+def _print_sglang_log(message: str, level: int = logging.INFO):
+    """Print SGLang log message on rank 0 in distributed training."""
+    log_single_rank(_logger, level, message)
+    # Also print to stdout for visibility
+    try:
+        import torch
+        if torch.distributed.is_initialized():
+            if torch.distributed.get_rank() == 0:
+                print(message, flush=True)
+        else:
+            print(message, flush=True)
+    except Exception:
+        # Fallback if distributed is not available
+        print(message, flush=True)
+
 
 try:
     import transformer_engine as te  # type: ignore[import-untyped]  # pylint: disable=unused-import
@@ -59,6 +79,13 @@ except ImportError:
     HAVE_KITCHEN = False
 
 try:
+    from megatron.core.extensions.sglang import SGLangSpecProvider
+
+    HAVE_SGLANG = True
+except ImportError:
+    HAVE_SGLANG = False
+
+try:
     import apex  # type: ignore[import-untyped]  # pylint: disable=unused-import
 
     from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
@@ -66,8 +93,6 @@ try:
     HAVE_APEX = True
     LNImpl = FusedLayerNorm
 except ImportError:
-    import warnings
-
     from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
     warnings.warn("Apex is not installed. Falling back to Torch Norm")
@@ -184,6 +209,10 @@ def get_gpt_layer_with_transformer_engine_spec(
     use_te_activation_func: bool = False,
     use_kitchen_attention: bool = False,
     kitchen_attention_backend: str = "sdpa",
+    use_sglang: bool = False,
+    use_sglang_attention: bool = True,
+    post_self_attn_layernorm: bool = False,
+    post_mlp_layernorm: bool = False,
 ) -> ModuleSpec:
     """Use this spec to use lower-level Transformer Engine modules (required for fp8 training).
 
@@ -203,13 +232,56 @@ def get_gpt_layer_with_transformer_engine_spec(
         ModuleSpec: Module specification with TE modules
 
     """
+    # SGLang debugging: Log function entry with call stack
+    import traceback
+    _print_sglang_log("🔍 SGLANG DEBUG: get_gpt_layer_with_transformer_engine_spec() called")
+    _print_sglang_log(f"🔍 SGLANG DEBUG:   - use_sglang parameter: {use_sglang}")
+    _print_sglang_log(f"🔍 SGLANG DEBUG:   - use_sglang_attention parameter: {use_sglang_attention}")
+    # Print call stack to see where this is being called from
+    stack = traceback.format_stack()
+    _print_sglang_log("🔍 SGLANG DEBUG: Call stack (last 5 frames):")
+    for line in stack[-5:]:
+        _print_sglang_log(f"   {line.strip()}")
+
     if fp8 is not None:
         warnings.warn(
             'The fp8 argument in "get_gpt_layer_with_transformer_engine_spec" has been deprecated'
             " and will be removed soon. Please update your code accordingly."
         )
 
-    if use_kitchen:
+    if use_sglang:
+        assert HAVE_SGLANG, "--use-sglang requires SGLang extension"
+        # Import and enable SGLang batch-invariant mode and RoPE
+        from megatron.core.extensions.sglang import (
+            enable_sglang_batch_invariant_mode,
+            enable_sglang_rope,
+        )
+        enable_sglang_batch_invariant_mode()
+        enable_sglang_rope()  # Use SGLang-compatible RoPE for true on-policy
+
+        _print_sglang_log("=" * 80)
+        _print_sglang_log("🎯 SGLANG KERNEL: Building GPT layer with SGLang backend")
+        _print_sglang_log(f"   - use_sglang: {use_sglang}")
+        _print_sglang_log(f"   - use_sglang_attention: {use_sglang_attention}")
+        _print_sglang_log(f"   - SGLang RoPE enabled: True")
+        _print_sglang_log("=" * 80)
+        backend: BackendSpecProvider = SGLangSpecProvider(
+            fallback=TESpecProvider(),
+            use_sglang_attention=use_sglang_attention,
+        )
+        # Verify that core_attention returns SGLangFlashAttention
+        core_attn_type = backend.core_attention()
+        _print_sglang_log(f"🔍 SGLANG DEBUG: core_attention() returned: {core_attn_type}")
+        _print_sglang_log("🔍 SGLANG DEBUG: Expected: SGLangFlashAttention")
+        if core_attn_type.__name__ != "SGLangFlashAttention":
+            _print_sglang_log(f"⚠️  WARNING: core_attention() did not return SGLangFlashAttention! Got: {core_attn_type.__name__}", level=logging.WARNING)
+        if use_te_op_fuser:
+            raise AssertionError("use_te_op_fuser not compatible with using sglang in mlp.")
+        # Auto-enable use_te_activation_func for SGLang to use SGLangSwiGLU
+        # This ensures identical numerical behavior with SGLang inference
+        use_te_activation_func = True
+        _print_sglang_log("🔧 Auto-enabling use_te_activation_func for SGLang compatibility")
+    elif use_kitchen:
         assert HAVE_KITCHEN
         backend: BackendSpecProvider = KitchenSpecProvider(
             fallback=TESpecProvider(),
@@ -222,6 +294,8 @@ def get_gpt_layer_with_transformer_engine_spec(
             raise AssertionError("use_te_activation_func not compatible with using kitchen.")
     else:
         backend = TESpecProvider()
+        if use_sglang:
+            _print_sglang_log("⚠️  WARNING: use_sglang=True but code took 'else' branch! Using TESpecProvider instead!", level=logging.WARNING)
 
     mlp = get_mlp_module_spec_for_backend(
         backend=backend,
@@ -271,6 +345,10 @@ def get_gpt_layer_with_transformer_engine_spec(
         )
     else:
         qk_norm = backend.layer_norm(for_qk=True)
+        # Get core attention type and log it for debugging
+        core_attn_class = backend.core_attention()
+        if use_sglang:
+            _print_sglang_log(f"🔍 SGLANG DEBUG: Setting core_attention in ModuleSpec to: {core_attn_class.__name__}")
         return ModuleSpec(
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
@@ -279,7 +357,7 @@ def get_gpt_layer_with_transformer_engine_spec(
                     params={"attn_mask_type": AttnMaskType.causal},
                     submodules=SelfAttentionSubmodules(
                         linear_qkv=backend.column_parallel_layer_norm_linear(),
-                        core_attention=backend.core_attention(),
+                        core_attention=core_attn_class,
                         linear_proj=backend.row_parallel_linear(),
                         q_layernorm=(
                             L2Norm if qk_l2_norm else (qk_norm if qk_layernorm else IdentityOp)
@@ -317,6 +395,8 @@ def get_gpt_layer_local_spec(
     use_kitchen: bool = False,
     use_kitchen_attention: bool = False,
     kitchen_attention_backend: str = "sdpa",
+    use_sglang: bool = False,
+    use_sglang_attention: bool = True,
 ) -> ModuleSpec:
     """Use this spec for an implementation using only modules in Megatron-Core.
 
@@ -334,7 +414,27 @@ def get_gpt_layer_local_spec(
         ModuleSpec: Module specification with Megatron-Core modules
     """
 
-    if use_kitchen:
+    if use_sglang:
+        assert HAVE_SGLANG, "--use-sglang requires SGLang extension"
+        # Import and enable SGLang batch-invariant mode and RoPE
+        from megatron.core.extensions.sglang import (
+            enable_sglang_batch_invariant_mode,
+            enable_sglang_rope,
+        )
+        enable_sglang_batch_invariant_mode()
+        enable_sglang_rope()  # Use SGLang-compatible RoPE for true on-policy
+
+        _print_sglang_log("=" * 80)
+        _print_sglang_log("🎯 SGLANG KERNEL: Building GPT layer with SGLang backend (local spec)")
+        _print_sglang_log(f"   - use_sglang: {use_sglang}")
+        _print_sglang_log(f"   - use_sglang_attention: {use_sglang_attention}")
+        _print_sglang_log(f"   - SGLang RoPE enabled: True")
+        _print_sglang_log("=" * 80)
+        backend = SGLangSpecProvider(
+            fallback=LocalSpecProvider(),
+            use_sglang_attention=use_sglang_attention,
+        )
+    elif use_kitchen:
         assert HAVE_KITCHEN
         backend = KitchenSpecProvider(
             fallback=LocalSpecProvider(),
@@ -524,8 +624,62 @@ def get_gpt_decoder_block_spec(
     pp_rank: Optional[int] = None,
 ) -> TransformerBlockSubmodules:
     """GPT block spec."""
+    # SGLang debugging: Log config values
+    _print_sglang_log("🔍 SGLANG DEBUG: get_gpt_decoder_block_spec() called")
+    _print_sglang_log(f"🔍 SGLANG DEBUG:   - config.use_sglang = {config.use_sglang}")
+    _print_sglang_log(f"🔍 SGLANG DEBUG:   - config.use_sglang_attention = {getattr(config, 'use_sglang_attention', 'NOT SET')}")
+    _print_sglang_log(f"🔍 SGLANG DEBUG:   - use_transformer_engine = {use_transformer_engine}")
+    
+    # Create backend to get the correct layer_norm implementation
+    # This ensures final_layernorm uses SGLang's norm when use_sglang=True
     if use_transformer_engine:
-        layer_norm_impl = TENorm
+        if config.use_sglang:
+            backend: BackendSpecProvider = SGLangSpecProvider(
+                fallback=TESpecProvider(),
+                use_sglang_attention=config.use_sglang_attention,
+            )
+        elif config.use_kitchen:
+            backend = KitchenSpecProvider(
+                fallback=TESpecProvider(),
+                use_kitchen_attention=config.use_kitchen_attention,
+                kitchen_attention_backend=config.kitchen_attention_backend,
+            )
+        else:
+            backend = TESpecProvider()
+    else:
+        if config.use_sglang:
+            backend = SGLangSpecProvider(
+                fallback=LocalSpecProvider(),
+                use_sglang_attention=config.use_sglang_attention,
+            )
+        elif config.use_kitchen:
+            backend = KitchenSpecProvider(
+                fallback=LocalSpecProvider(),
+                use_kitchen_attention=config.use_kitchen_attention,
+                kitchen_attention_backend=config.kitchen_attention_backend,
+            )
+        else:
+            backend = LocalSpecProvider()
+    
+    # Get layer_norm implementation from backend based on normalization type
+    # Use normalization parameter if provided, otherwise check config
+    norm_type = normalization if normalization is not None else getattr(config, 'normalization', 'LayerNorm')
+    
+    # For final layer norm with SGLang, use SGLangFinalRMSNorm to match true on-policy mode
+    # This ensures override_orig_dtype=torch.float32 like SGLang's final norm
+    if config.use_sglang and norm_type == "RMSNorm":
+        from megatron.core.extensions.sglang import SGLangFinalRMSNorm
+        layer_norm_impl = SGLangFinalRMSNorm
+        _print_sglang_log("🔍 SGLANG DEBUG: Using SGLangFinalRMSNorm for final_layernorm (true on-policy mode)")
+    elif norm_type == "RMSNorm":
+        layer_norm_impl = backend.layer_norm(rms_norm=True, for_qk=False)
+    else:
+        layer_norm_impl = backend.layer_norm(rms_norm=False, for_qk=False)
+    
+    _print_sglang_log(f"🔍 SGLANG DEBUG: final_layernorm will use: {layer_norm_impl}")
+    
+    if use_transformer_engine:
+        _print_sglang_log(f"🔍 SGLANG DEBUG: Calling get_gpt_layer_with_transformer_engine_spec for dense_layer_spec with use_sglang={config.use_sglang}")
         dense_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=None,
             moe_grouped_gemm=False,
@@ -537,7 +691,10 @@ def get_gpt_decoder_block_spec(
             use_te_activation_func=config.use_te_activation_func,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            use_sglang=config.use_sglang,
+            use_sglang_attention=config.use_sglang_attention,
         )
+        _print_sglang_log(f"🔍 SGLANG DEBUG: Calling get_gpt_layer_with_transformer_engine_spec for moe_layer_spec with use_sglang={config.use_sglang}")
         moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=config.num_moe_experts,
             moe_grouped_gemm=config.moe_grouped_gemm,
@@ -549,9 +706,10 @@ def get_gpt_decoder_block_spec(
             use_te_activation_func=config.use_te_activation_func,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            use_sglang=config.use_sglang,
+            use_sglang_attention=config.use_sglang_attention,
         )
     else:
-        layer_norm_impl = LNImpl
         dense_layer_spec = get_gpt_layer_local_spec(
             num_experts=None,
             moe_grouped_gemm=False,
@@ -563,6 +721,8 @@ def get_gpt_decoder_block_spec(
             use_kitchen=config.use_kitchen,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            use_sglang=config.use_sglang,
+            use_sglang_attention=config.use_sglang_attention,
         )
         moe_layer_spec = get_gpt_layer_local_spec(
             num_experts=config.num_moe_experts,
@@ -575,6 +735,8 @@ def get_gpt_decoder_block_spec(
             use_kitchen=config.use_kitchen,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            use_sglang=config.use_sglang,
+            use_sglang_attention=config.use_sglang_attention,
         )
 
     # Parse config.moe_layer_freq to determine the pattern of expert/dense layers.
@@ -641,25 +803,33 @@ def get_gpt_mtp_block_spec(
 ) -> MultiTokenPredictionBlockSubmodules:
     """GPT Multi-Token Prediction (MTP) block spec."""
     if use_transformer_engine:
-        backend: BackendSpecProvider = (
-            KitchenSpecProvider(
+        if config.use_sglang:
+            backend: BackendSpecProvider = SGLangSpecProvider(
+                fallback=TESpecProvider(),
+                use_sglang_attention=config.use_sglang_attention,
+            )
+        elif config.use_kitchen:
+            backend = KitchenSpecProvider(
                 fallback=TESpecProvider(),
                 use_kitchen_attention=config.use_kitchen_attention,
                 kitchen_attention_backend=config.kitchen_attention_backend,
             )
-            if config.use_kitchen
-            else TESpecProvider()
-        )
+        else:
+            backend = TESpecProvider()
     else:
-        backend = (
-            KitchenSpecProvider(
+        if config.use_sglang:
+            backend = SGLangSpecProvider(
+                fallback=LocalSpecProvider(),
+                use_sglang_attention=config.use_sglang_attention,
+            )
+        elif config.use_kitchen:
+            backend = KitchenSpecProvider(
                 fallback=LocalSpecProvider(),
                 use_kitchen_attention=config.use_kitchen_attention,
                 kitchen_attention_backend=config.kitchen_attention_backend,
             )
-            if config.use_kitchen
-            else LocalSpecProvider()
-        )
+        else:
+            backend = LocalSpecProvider()
     return get_gpt_mtp_block_spec_for_backend(
         config=config, spec=spec, backend=backend, vp_stage=vp_stage, pp_rank=pp_rank
     )
@@ -697,7 +867,7 @@ def get_gpt_mtp_block_spec_for_backend(
     if len(mtp_layer_specs) > 0:
         assert (
             len(mtp_layer_specs) == config.mtp_num_layers
-        ), f"currently all of the mtp layers must stage in the same pipeline stage."
+        ), "currently all of the mtp layers must stage in the same pipeline stage."
         mtp_block_spec = MultiTokenPredictionBlockSubmodules(layer_specs=mtp_layer_specs)
     else:
         mtp_block_spec = None

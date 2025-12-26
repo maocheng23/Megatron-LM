@@ -13,6 +13,18 @@ from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_with_cos_sin,
 )
+
+# Import SGLang RoPE for true on-policy mode
+try:
+    from megatron.core.extensions.sglang import (
+        is_sglang_rope_enabled,
+        sglang_apply_rotary_pos_emb,
+    )
+    HAVE_SGLANG_ROPE = True
+except ImportError:
+    HAVE_SGLANG_ROPE = False
+    is_sglang_rope_enabled = lambda: False
+    sglang_apply_rotary_pos_emb = None
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_data_parallel_group,
@@ -899,30 +911,132 @@ class Attention(MegatronModule, ABC):
                 cu_seqlens_q = cu_seqlens_kv = None
 
             if split_qkv:
+                # Check if SGLang RoPE mode is enabled for true on-policy
+                use_sglang_rope = HAVE_SGLANG_ROPE and is_sglang_rope_enabled()
+                
                 if q_pos_emb is not None:
-                    # TODO VIJAY: simplify
-                    if inference_context is None or inference_context.is_static_batching():
-                        query = apply_rotary_pos_emb(
-                            query,
-                            q_pos_emb,
+                    sglang_rope_applied = False
+                    if use_sglang_rope:
+                        # Use SGLang-compatible RoPE for true on-policy consistency
+                        # Extract cos/sin from Megatron's freqs format
+                        q_freqs, _ = q_pos_emb if isinstance(q_pos_emb, tuple) else (q_pos_emb, q_pos_emb)
+                        # Megatron freqs: [seq, 1, 1, head_dim] with interleaved cos/sin
+                        # Check if sequence lengths match
+                        q_seq_len = query.shape[0]
+                        freqs_seq_len = q_freqs.shape[0]
+                        
+                        # Debug log (only for first layer, first call)
+                        if self.layer_number == 1 and not hasattr(self, '_sglang_rope_logged'):
+                            self._sglang_rope_logged = True
+                            print(f"[SGLang RoPE] Layer {self.layer_number}: "
+                                  f"query shape={query.shape}, freqs shape={q_freqs.shape}, "
+                                  f"seq_match={q_seq_len == freqs_seq_len}")
+                        
+                        # Reshape to [seq, head_dim] for easier extraction
+                        # Megatron freqs format: [seq, 1, 1, head_dim] where 
+                        # head_dim = concat(angles, angles) - raw angles duplicated
+                        # We need to compute cos/sin from the angles
+                        q_freqs_flat = q_freqs.squeeze(1).squeeze(1)  # [seq, head_dim]
+                        head_dim = query.shape[-1]
+                        # First half contains the raw angles, second half is duplicate
+                        raw_angles = q_freqs_flat[..., :head_dim // 2]  # [seq, head_dim/2]
+                        q_cos = torch.cos(raw_angles)  # Compute cos from angles
+                        q_sin = torch.sin(raw_angles)  # Compute sin from angles
+                        is_neox_style = not getattr(self.config, 'rotary_interleaved', False)
+                        
+                        # Debug log (first layer only)
+                        if self.layer_number == 1 and not hasattr(self, '_rope_angles_logged'):
+                            self._rope_angles_logged = True
+                            print(f"[SGLang RoPE] Computing cos/sin from raw angles: "
+                                  f"angles shape={raw_angles.shape}, cos/sin range=[{q_cos.min():.4f}, {q_cos.max():.4f}]")
+                            # Print angles and cos/sin at position 91 for debugging
+                            pos_91_idx = min(90, raw_angles.shape[0] - 1)  # 0-indexed
+                            angles_at_91 = raw_angles[pos_91_idx, :5].tolist()
+                            cos_at_91 = q_cos[pos_91_idx, :5].tolist()
+                            sin_at_91 = q_sin[pos_91_idx, :5].tolist()
+                            print(f"[SGLang RoPE] At position {pos_91_idx}: "
+                                  f"angles[:5]={[f'{a:.4f}' for a in angles_at_91]}, "
+                                  f"cos[:5]={[f'{c:.4f}' for c in cos_at_91]}, "
+                                  f"sin[:5]={[f'{s:.4f}' for s in sin_at_91]}")
+                        
+                        if q_seq_len == freqs_seq_len:
+                            # Perfect match - apply to full sequence
+                            query = sglang_apply_rotary_pos_emb(query, q_cos, q_sin, is_neox_style)
+                            sglang_rope_applied = True
+                        elif freqs_seq_len < q_seq_len:
+                            # Freqs only cover actual tokens, query includes padding
+                            # Apply RoPE only to the first freqs_seq_len positions
+                            if self.layer_number == 1 and not hasattr(self, '_partial_rope_logged'):
+                                self._partial_rope_logged = True
+                                print(f"[SGLang RoPE] Partial apply: Layer {self.layer_number} "
+                                      f"applying to first {freqs_seq_len} of {q_seq_len} positions")
+                            # Apply to valid positions, leave padding unchanged
+                            query_valid = query[:freqs_seq_len]  # [freqs_seq_len, num_heads, head_dim]
+                            query_valid = sglang_apply_rotary_pos_emb(
+                                query_valid, q_cos, q_sin, is_neox_style
+                            )
+                            query = torch.cat([query_valid, query[freqs_seq_len:]], dim=0)
+                            sglang_rope_applied = True
+                        else:
+                            # Freqs longer than query - shouldn't happen, fallback
+                            if self.layer_number == 1:
+                                print(f"[SGLang RoPE] FALLBACK: Layer {self.layer_number} "
+                                      f"freqs longer than query ({freqs_seq_len} > {q_seq_len})")
+                    
+                    if not sglang_rope_applied:
+                        if inference_context is None or inference_context.is_static_batching():
+                            query = apply_rotary_pos_emb(
+                                query,
+                                q_pos_emb,
+                                config=self.config,
+                                cu_seqlens=cu_seqlens_q,
+                                mscale=_yarn_get_concentration_factor_from_config(self.config),
+                                cp_group=self.pg_collection.cp,
+                            )
+                        else:
+                            query = inference_context.apply_rotary_emb_query(
+                                query, q_pos_emb, self.config, cu_seqlens_q, self.pg_collection.cp
+                            )
+                            
+                if k_pos_emb is not None:
+                    sglang_rope_applied = False
+                    if use_sglang_rope:
+                        # Use SGLang-compatible RoPE for key as well
+                        _, k_freqs = k_pos_emb if isinstance(k_pos_emb, tuple) else (k_pos_emb, k_pos_emb)
+                        # Check if sequence lengths match
+                        k_seq_len = key.shape[0]
+                        freqs_seq_len = k_freqs.shape[0]
+                        
+                        # Megatron freqs format: raw angles duplicated
+                        k_freqs_flat = k_freqs.squeeze(1).squeeze(1)
+                        head_dim = key.shape[-1]
+                        raw_angles = k_freqs_flat[..., :head_dim // 2]  # Extract raw angles
+                        k_cos = torch.cos(raw_angles)  # Compute cos from angles
+                        k_sin = torch.sin(raw_angles)  # Compute sin from angles
+                        is_neox_style = not getattr(self.config, 'rotary_interleaved', False)
+                        
+                        if k_seq_len == freqs_seq_len:
+                            key = sglang_apply_rotary_pos_emb(key, k_cos, k_sin, is_neox_style)
+                            sglang_rope_applied = True
+                        elif freqs_seq_len < k_seq_len:
+                            # Apply RoPE only to the first freqs_seq_len positions (valid tokens)
+                            key_valid = key[:freqs_seq_len]
+                            key_valid = sglang_apply_rotary_pos_emb(
+                                key_valid, k_cos, k_sin, is_neox_style
+                            )
+                            key = torch.cat([key_valid, key[freqs_seq_len:]], dim=0)
+                            sglang_rope_applied = True
+                        # If freqs longer than key, fallback to Megatron RoPE
+                    
+                    if not sglang_rope_applied:
+                        key = apply_rotary_pos_emb(
+                            key,
+                            k_pos_emb,
                             config=self.config,
-                            cu_seqlens=cu_seqlens_q,
+                            cu_seqlens=cu_seqlens_kv,
                             mscale=_yarn_get_concentration_factor_from_config(self.config),
                             cp_group=self.pg_collection.cp,
                         )
-                    else:
-                        query = inference_context.apply_rotary_emb_query(
-                            query, q_pos_emb, self.config, cu_seqlens_q, self.pg_collection.cp
-                        )
-                if k_pos_emb is not None:
-                    key = apply_rotary_pos_emb(
-                        key,
-                        k_pos_emb,
-                        config=self.config,
-                        cu_seqlens=cu_seqlens_kv,
-                        mscale=_yarn_get_concentration_factor_from_config(self.config),
-                        cp_group=self.pg_collection.cp,
-                    )
             else:
                 query, key, value = apply_fused_qkv_rotary_pos_emb(
                     mixed_qkv, q_pos_emb, k_pos_emb, qkv_split_arg_list
@@ -932,6 +1046,35 @@ class Attention(MegatronModule, ABC):
             # absolute positional embedding.
             # otherwise, only relative positional embedding takes effect
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
+            
+            # Debug: Dump Q/K after RoPE for true on-policy debugging
+            # This helps identify RoPE-related divergence between SGLang and Megatron
+            # Automatically dumps when global dumper is active
+            try:
+                # Use the same import path as loss.py to share global dumper
+                from slime.backends.megatron_utils.debug_tensor_dump import (
+                    get_global_dumper
+                )
+                dumper = get_global_dumper()
+                if dumper is not None:
+                    # Log shapes for debugging (only first layer, first time)
+                    if self.layer_number == 1 and not hasattr(self, '_qk_dump_logged'):
+                        self._qk_dump_logged = True
+                        print(f"[Q/K Dump] Dumping Q/K after RoPE: layer={self.layer_number}, "
+                              f"query={query.shape}, key={key.shape}")
+                    dumper.add_tensor(
+                        f"layer_{self.layer_number}_q_after_rope", query
+                    )
+                    dumper.add_tensor(
+                        f"layer_{self.layer_number}_k_after_rope", key
+                    )
+                elif self.layer_number == 1 and not hasattr(self, '_no_dumper_logged'):
+                    self._no_dumper_logged = True
+                    print(f"[Q/K Dump] No global dumper found at layer {self.layer_number}")
+            except ImportError as e:
+                if self.layer_number == 1:
+                    print(f"[Q/K Dump] Import failed: {e}")
+                    
         nvtx_range_pop(suffix="rotary_pos_emb")
 
         # ==================================

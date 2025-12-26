@@ -254,8 +254,20 @@ def _get_block_submodules(
             return spec.submodules
         elif issubclass(spec.module, BaseTransformerLayer):
             num_layers = get_num_layers_to_build(config, vp_stage, pp_rank)
+            # For SGLang with RMSNorm, use SGLangFinalRMSNorm for final layer norm
+            # to match true on-policy mode (override_orig_dtype=torch.float32)
+            if getattr(config, 'use_sglang', False):
+                norm_type = getattr(config, 'normalization', 'LayerNorm')
+                if norm_type == "RMSNorm":
+                    from megatron.core.extensions.sglang import SGLangFinalRMSNorm
+                    layer_norm_impl = SGLangFinalRMSNorm
+                    logger.info("🔍 SGLANG DEBUG: Using SGLangFinalRMSNorm for final_layernorm (from ModuleSpec path)")
+                else:
+                    layer_norm_impl = LayerNormImpl
+            else:
+                layer_norm_impl = LayerNormImpl
             return TransformerBlockSubmodules(
-                layer_specs=[spec] * num_layers, layer_norm=LayerNormImpl
+                layer_specs=[spec] * num_layers, layer_norm=layer_norm_impl
             )
         else:
             raise Exception(f"specialize for {spec.module.__name__}.")
@@ -375,12 +387,20 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         # In pipeline parallelism, we want to add this LN only to the last stage of the pipeline
         # self.post_process and self.post_layer_norm guide this behavior
         if self.submodules.layer_norm and self.post_process and self.post_layer_norm:
+            # Debug: Log what layer_norm class is being used
+            layer_norm_class = self.submodules.layer_norm
+            if isinstance(layer_norm_class, type):
+                logger.info(f"🔍 Building final_layernorm with class: {layer_norm_class.__name__}")
+            else:
+                logger.info(f"🔍 Building final_layernorm with spec: {layer_norm_class}")
             self.final_layernorm = build_module(
                 self.submodules.layer_norm,
                 config=self.config,
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
             )
+            # Debug: Verify the built module
+            logger.info(f"🔍 Built final_layernorm type: {type(self.final_layernorm).__name__}")
         else:
             self.final_layernorm = None  # Either this or nn.Identity
 

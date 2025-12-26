@@ -22,7 +22,15 @@ import megatron.legacy.model  # isort: skip
 
 
 def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
-    print_rank_0('building GPT model ...')
+    # Debug: Print on all ranks with flush to ensure visibility
+    print('=' * 80, flush=True)
+    print('🔍 DEBUG: gpt_builder() called - building GPT model ...', flush=True)
+    print(f'🔍 DEBUG:   - pre_process={pre_process}, post_process={post_process}, vp_stage={vp_stage}', flush=True)
+    print(f'🔍 DEBUG:   - config is None: {config is None}', flush=True)
+    if config is not None:
+        print(f'🔍 DEBUG:   - config.use_sglang={getattr(config, "use_sglang", "NOT SET")}', flush=True)
+    print('=' * 80, flush=True)
+    print('building GPT model ...', flush=True)
     if config is None:
         if args.yaml_cfg is not None:
             config = core_transformer_config_from_yaml(args, "language_model")
@@ -41,10 +49,15 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
             transformer_layer_spec = import_module(args.spec)
         else:
             use_te = args.transformer_impl == "transformer_engine"
+            # Log which path we're taking for SGLang debugging
+            if config.use_sglang:
+                print(f"🔍 SGLANG DEBUG: transformer_impl={args.transformer_impl}, use_te={use_te}")
 
             if args.num_experts:
                 assert not (config.transformer_impl == "inference_optimized")
                 # Define the decoder block spec
+                if config.use_sglang:
+                    print(f"🔍 SGLANG DEBUG: Using get_gpt_decoder_block_spec (MoE path), config.use_sglang={config.use_sglang}")
                 transformer_layer_spec = get_gpt_decoder_block_spec(
                     config,
                     use_transformer_engine=use_te,
@@ -110,8 +123,17 @@ def _get_transformer_layer_spec(use_te, config):
     Returns:
         transformer_layer_spec: The transformer layer specification
     """
+    # Debug: Print function entry
+    print('🔍 DEBUG: _get_transformer_layer_spec() called', flush=True)
+    print(f'🔍 DEBUG:   - use_te={use_te}', flush=True)
+    
     args = get_args()
+    # Debug: Log config values before calling
+    if hasattr(config, 'use_sglang'):
+        print(f"🔍 SGLANG DEBUG: _get_transformer_layer_spec() - config.use_sglang = {config.use_sglang}", flush=True)
+        print(f"🔍 SGLANG DEBUG: _get_transformer_layer_spec() - config.use_sglang_attention = {getattr(config, 'use_sglang_attention', 'NOT SET')}", flush=True)
     if use_te:
+        print_rank_0(f"🔍 SGLANG DEBUG: Calling get_gpt_layer_with_transformer_engine_spec with use_sglang={config.use_sglang}")
         return get_gpt_layer_with_transformer_engine_spec(
             args.num_experts,
             args.moe_grouped_gemm,
@@ -122,6 +144,8 @@ def _get_transformer_layer_spec(use_te, config):
             use_kitchen=config.use_kitchen,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            use_sglang=config.use_sglang,
+            use_sglang_attention=config.use_sglang_attention,
         )
     elif config.transformer_impl == "inference_optimized":
         return get_gpt_layer_with_inference_spec(
@@ -140,4 +164,6 @@ def _get_transformer_layer_spec(use_te, config):
             use_kitchen=config.use_kitchen,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            use_sglang=config.use_sglang,
+            use_sglang_attention=config.use_sglang_attention,
         )

@@ -262,7 +262,10 @@ def _log_softmax_kernel(
         max_val = tl.max(tl.maximum(vals, max_val))
 
     # Step 2: Compute sum of exp(x - max_val)
-    sum_exp = 0.0
+    # IMPORTANT: Initialize sum_exp with the same dtype as max_val to match SGLang's
+    # batch_invariant_ops.py implementation. Using 0.0 (float32) causes precision
+    # differences when input is bfloat16, leading to different log_softmax results.
+    sum_exp = tl.sum(tl.zeros([1], dtype=max_val.dtype))
     for col_offset in range(0, n_cols, BLOCK_SIZE):
         col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
         mask = col_idx < n_cols
