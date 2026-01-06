@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import copy
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -46,6 +46,7 @@ from megatron.core.utils import (
     get_pg_size,
     is_fa_min_version,
     is_te_min_version,
+    is_using_quantization_scales,
     nvtx_range_pop,
     nvtx_range_push,
 )
@@ -53,7 +54,7 @@ from megatron.core.utils import (
 from ..models.common.embeddings.yarn_rotary_pos_embedding import (
     _yarn_get_concentration_factor_from_config,
 )
-from .enums import AttnMaskType
+from .enums import AttnMaskType, CudaGraphScope
 from .transformer_config import TransformerConfig
 
 try:
@@ -863,7 +864,7 @@ class Attention(MegatronModule, ABC):
         if (
             in_decode_mode
             and self.config.cuda_graph_impl == "local"
-            and self.config.cuda_graph_scope != "full_iteration"
+            and CudaGraphScope.full_iteration not in self.config.cuda_graph_scope
             and inference_context.is_static_batching()
         ):
             raise ValueError(f"CUDA graphs must use flash decode with static batching!")
@@ -1124,6 +1125,11 @@ class Attention(MegatronModule, ABC):
                 )
                 core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
 
+                # Clear the outputs for padding tokens when using quantization scales
+                # to avoid corrupting amax calculations
+                if is_using_quantization_scales(self.config):
+                    core_attn_out[inference_context.padding_slice] = 0.0
+
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             # reshape to same output shape as unpacked case
             # (t, np, hn) -> (t, b=1, h=np*hn)
@@ -1135,7 +1141,6 @@ class Attention(MegatronModule, ABC):
         # =================
         # Output. [sq, b, h]
         # =================
-
         nvtx_range_push(suffix="linear_proj")
         output, bias = self.linear_proj(core_attn_out)
         nvtx_range_pop(suffix="linear_proj")
