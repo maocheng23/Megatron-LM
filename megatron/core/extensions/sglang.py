@@ -251,11 +251,17 @@ def sglang_mm(a: Tensor, b: Tensor) -> Tensor:
     """
     Batch-invariant matrix multiplication.
 
-    Uses SGLang's mm_batch_invariant when available and enabled,
-    otherwise falls back to torch.mm.
+    IMPORTANT: Always use torch.mm() instead of directly calling mm_batch_invariant().
+    
+    When enable_batch_invariant_mode() is called, mm_batch_invariant is registered
+    as the aten::mm CUDA implementation via torch.library. This means:
+    - torch.mm() will automatically dispatch to mm_batch_invariant
+    - PyTorch's autograd system knows it's an aten::mm operation
+    - Backward pass works correctly using aten::mm's gradient formula
+    
+    If we call mm_batch_invariant() directly, we bypass the aten dispatcher,
+    and autograd doesn't know how to compute gradients - breaking training!
     """
-    if HAVE_SGLANG_BATCH_INVARIANT and is_batch_invariant_mode_enabled():
-        return mm_batch_invariant(a, b)
     return torch.mm(a, b)
 
 
@@ -268,19 +274,22 @@ def sglang_addmm(
 ) -> Tensor:
     """
     Batch-invariant addmm: beta * input + alpha * (mat1 @ mat2).
+    
+    IMPORTANT: Always use torch.addmm() - see sglang_mm() docstring for why.
+    When batch_invariant_mode is enabled, torch.addmm dispatches to addmm_batch_invariant
+    while preserving autograd functionality.
     """
-    assert beta == 1.0 and alpha == 1.0, "beta and alpha must be 1.0"
-    if HAVE_SGLANG_BATCH_INVARIANT and is_batch_invariant_mode_enabled():
-        return addmm_batch_invariant(input, mat1, mat2, beta=beta, alpha=alpha)
     return torch.addmm(input, mat1, mat2, beta=beta, alpha=alpha)
 
 
 def sglang_bmm(a: Tensor, b: Tensor) -> Tensor:
     """
     Batch-invariant batch matrix multiplication.
+    
+    IMPORTANT: Always use torch.bmm() - see sglang_mm() docstring for why.
+    When batch_invariant_mode is enabled, torch.bmm dispatches to bmm_batch_invariant
+    while preserving autograd functionality.
     """
-    if HAVE_SGLANG_BATCH_INVARIANT and is_batch_invariant_mode_enabled():
-        return bmm_batch_invariant(a, b)
     return torch.bmm(a, b)
 
 
