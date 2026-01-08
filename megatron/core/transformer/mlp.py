@@ -129,7 +129,8 @@ class MLP(MegatronModule):
             stride=fc1_stride,
         )
 
-        if self.config.use_te_activation_func and not (submodules.activation_func is None):
+        self.use_sglang = getattr(self.config, 'use_sglang', False)
+        if (self.config.use_te_activation_func or self.use_sglang) and submodules.activation_func is not None:
             self.activation_func = build_module(submodules.activation_func, config=self.config)
         else:
             self.activation_func = self.config.activation_func
@@ -151,12 +152,16 @@ class MLP(MegatronModule):
     def forward(self, hidden_states, per_token_scale=None):
         """Perform the forward pass through the MLP block."""
         # [s, b, 4 * h/p]
+        if self.use_sglang:
+            sglang_dtype = getattr(self.config, 'params_dtype', torch.bfloat16)
+            hidden_states = hidden_states.to(sglang_dtype)
+
         nvtx_range_push(suffix="linear_fc1")
         intermediate_parallel, bias_parallel = self.linear_fc1(hidden_states)
         nvtx_range_pop(suffix="linear_fc1")
 
         nvtx_range_push(suffix="activation")
-        if self.config.use_te_activation_func:
+        if self.use_sglang or self.config.use_te_activation_func:
             if bias_parallel is not None:
                 intermediate_parallel = intermediate_parallel + bias_parallel
             intermediate_parallel = self.activation_func(intermediate_parallel)
