@@ -13,6 +13,20 @@ from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_with_cos_sin,
 )
+
+# Import SGLang RoPE for true on-policy mode
+try:
+    from megatron.core.extensions.sglang import (
+        is_sglang_rope_enabled,
+        sglang_apply_rotary_pos_emb,
+        sglang_apply_rotary_pos_emb_with_freqs,
+    )
+    HAVE_SGLANG_ROPE = True
+except ImportError:
+    HAVE_SGLANG_ROPE = False
+    is_sglang_rope_enabled = lambda: False
+    sglang_apply_rotary_pos_emb = None
+    sglang_apply_rotary_pos_emb_with_freqs = None
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_data_parallel_group,
@@ -900,30 +914,49 @@ class Attention(MegatronModule, ABC):
                 cu_seqlens_q = cu_seqlens_kv = None
 
             if split_qkv:
+                # Check if SGLang RoPE mode is enabled for true on-policy
+                use_sglang_rope = HAVE_SGLANG_ROPE and is_sglang_rope_enabled()
+                
                 if q_pos_emb is not None:
-                    # TODO VIJAY: simplify
-                    if inference_context is None or inference_context.is_static_batching():
-                        query = apply_rotary_pos_emb(
-                            query,
-                            q_pos_emb,
+                    sglang_rope_applied = False
+                    if use_sglang_rope and sglang_apply_rotary_pos_emb_with_freqs is not None:
+                        q_freqs, _ = q_pos_emb if isinstance(q_pos_emb, tuple) else (q_pos_emb, q_pos_emb)
+                        query = sglang_apply_rotary_pos_emb_with_freqs(
+                            query, q_freqs, self.config, layer_number=self.layer_number
+                        )
+                        sglang_rope_applied = True
+                    if not sglang_rope_applied:
+                        if inference_context is None or inference_context.is_static_batching():
+                            query = apply_rotary_pos_emb(
+                                query,
+                                q_pos_emb,
+                                config=self.config,
+                                cu_seqlens=cu_seqlens_q,
+                                mscale=_yarn_get_concentration_factor_from_config(self.config),
+                                cp_group=self.pg_collection.cp,
+                            )
+                        else:
+                            query = inference_context.apply_rotary_emb_query(
+                                query, q_pos_emb, self.config, cu_seqlens_q, self.pg_collection.cp
+                            )
+                            
+                if k_pos_emb is not None:
+                    sglang_rope_applied = False
+                    if use_sglang_rope and sglang_apply_rotary_pos_emb_with_freqs is not None:
+                        _, k_freqs = k_pos_emb if isinstance(k_pos_emb, tuple) else (k_pos_emb, k_pos_emb)
+                        key = sglang_apply_rotary_pos_emb_with_freqs(
+                            key, k_freqs, self.config, layer_number=self.layer_number
+                        )
+                        sglang_rope_applied = True
+                    if not sglang_rope_applied:
+                        key = apply_rotary_pos_emb(
+                            key,
+                            k_pos_emb,
                             config=self.config,
-                            cu_seqlens=cu_seqlens_q,
+                            cu_seqlens=cu_seqlens_kv,
                             mscale=_yarn_get_concentration_factor_from_config(self.config),
                             cp_group=self.pg_collection.cp,
                         )
-                    else:
-                        query = inference_context.apply_rotary_emb_query(
-                            query, q_pos_emb, self.config, cu_seqlens_q, self.pg_collection.cp
-                        )
-                if k_pos_emb is not None:
-                    key = apply_rotary_pos_emb(
-                        key,
-                        k_pos_emb,
-                        config=self.config,
-                        cu_seqlens=cu_seqlens_kv,
-                        mscale=_yarn_get_concentration_factor_from_config(self.config),
-                        cp_group=self.pg_collection.cp,
-                    )
             else:
                 query, key, value = apply_fused_qkv_rotary_pos_emb(
                     mixed_qkv, q_pos_emb, k_pos_emb, qkv_split_arg_list
