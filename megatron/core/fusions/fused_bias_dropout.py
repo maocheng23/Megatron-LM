@@ -8,13 +8,16 @@ from megatron.core.jit import jit_fuser
 # pylint: disable=missing-function-docstring
 
 
-def _bias_dropout_add_func(x_with_bias, residual, prob, training):
-    # type: (Tuple[Tensor, Optional[Tensor]], Tensor, float, bool) -> Tensor
+def _bias_dropout_add_func(x_with_bias, residual, prob, training, use_fp32_residual=False, output_dtype=None):
+    # type: (Tuple[Tensor, Optional[Tensor]], Tensor, float, bool, bool, Optional[torch.dtype]) -> Tensor
     # NOTE: Previously, the argument `bias` used to be passed as
     # `bias.expand_as(residual)` when the `bias_dropout_func` is called from the
     # transformer layer but broadcasting should automatically take care of that.
     # Also, looking at broadcasting semantics, `expand_as` and broadcasting
     # seem to be identical performance-wise (both just change the view).
+    #
+    # If use_fp32_residual=True (for SGLang mode), perform residual sum in FP32,
+    # then convert to output_dtype (bf16 for intermediate layers, fp32 for final layer).
 
     x, bias = x_with_bias  # unpack
 
@@ -26,59 +29,91 @@ def _bias_dropout_add_func(x_with_bias, residual, prob, training):
         and (bias is None or not bias.requires_grad)
     )
 
-    # If we want to train mixed precision, then the output of this function
-    # should be half precision. However, in AMP O1, the input (residual) is
-    # in fp32, and it will up-cast the result to fp32, causing pipeline parallel
-    # GPU communication to hang. Therefore, we need to cast residual to the same
-    # dtype as x.
-    residual = residual if residual.dtype == x.dtype else residual.to(x.dtype)
-
-    # The Dropout operation, Residual Addition and the tensor returning can be
-    # done generically outside the if statement, but that stops fusing of Bias
-    # Addition-Dropout-Residual Addition operation. So doing it together inside
-    # the conditional branch to improve performance
-    if bias is not None:
+    # For SGLang mode: perform residual sum in FP32 to match SGLang's behavior
+    # SGLang converts tensors to FP32, performs sum, uses FP32 sum for RMSNorm,
+    # then converts back to bf16 (for intermediate layers) or keeps fp32 (for final layer)
+    if use_fp32_residual:
+        # Store original dtype for output conversion
+        orig_dtype = x.dtype if output_dtype is None else output_dtype
+        
+        x_fp32 = x.to(torch.float32)
+        residual_fp32 = residual.to(torch.float32)
+        
+        if bias is not None:
+            bias_fp32 = bias.to(torch.float32) if bias is not None else None
+            if inplace:
+                x_fp32.add_(bias_fp32)
+            else:
+                x_fp32 = x_fp32 + bias_fp32
+        out_fp32 = torch.nn.functional.dropout(x_fp32, p=prob, training=training, inplace=inplace)
         if inplace:
-            x.add_(bias)
+            out_fp32.add_(residual_fp32)
         else:
-            x = x + bias
-        out = torch.nn.functional.dropout(x, p=prob, training=training, inplace=inplace)
-        if inplace:
-            out.add_(residual)
-        else:
-            out = residual + out
-        return out
+            out_fp32 = residual_fp32 + out_fp32
+        
+        return out_fp32.to(orig_dtype)
     else:
-        out = torch.nn.functional.dropout(x, p=prob, training=training, inplace=inplace)
-        if inplace:
-            out.add_(residual)
+        residual = residual if residual.dtype == x.dtype else residual.to(x.dtype)
+
+        # The Dropout operation, Residual Addition and the tensor returning can be
+        # done generically outside the if statement, but that stops fusing of Bias
+        # Addition-Dropout-Residual Addition operation. So doing it together inside
+        # the conditional branch to improve performance
+        if bias is not None:
+            if inplace:
+                x.add_(bias)
+            else:
+                x = x + bias
+            out = torch.nn.functional.dropout(x, p=prob, training=training, inplace=inplace)
+            if inplace:
+                out.add_(residual)
+            else:
+                out = residual + out
+            return out
         else:
-            out = residual + out
-        return out
+            out = torch.nn.functional.dropout(x, p=prob, training=training, inplace=inplace)
+            if inplace:
+                out.add_(residual)
+            else:
+                out = residual + out
+            return out
 
 
-def bias_dropout_add_unfused(training):
+def bias_dropout_add_unfused(training, use_fp32_residual=False, output_dtype=None):
     def _bias_dropout_add(x_with_bias, residual, prob):
-        return _bias_dropout_add_func(x_with_bias, residual, prob, training)
+        return _bias_dropout_add_func(x_with_bias, residual, prob, training, use_fp32_residual, output_dtype)
 
     return _bias_dropout_add
+
+
+def get_bias_dropout_add_sglang(training, fused, is_final_layer=False):
+    output_dtype = torch.float32 if is_final_layer else torch.bfloat16
+    
+    return bias_dropout_add_unfused(training, use_fp32_residual=True, output_dtype=output_dtype)
 
 
 @jit_fuser
 def bias_dropout_add_fused_train(
     x_with_bias: Tuple[torch.Tensor, Optional[torch.Tensor]], residual: torch.Tensor, prob: float
 ) -> torch.Tensor:
-    return _bias_dropout_add_func(x_with_bias, residual, prob, True)
+    return _bias_dropout_add_func(x_with_bias, residual, prob, True, False, None)
 
 
 @jit_fuser
 def bias_dropout_add_fused_inference(
     x_with_bias: Tuple[torch.Tensor, Optional[torch.Tensor]], residual: torch.Tensor, prob: float
 ) -> torch.Tensor:
-    return _bias_dropout_add_func(x_with_bias, residual, prob, False)
+    return _bias_dropout_add_func(x_with_bias, residual, prob, False, False, None)
 
 
-def get_bias_dropout_add(training, fused):
+def get_bias_dropout_add(training, fused, use_sglang=False, is_final_layer=False):
+    if use_sglang:
+        # For SGLang mode, use FP32 residual sum to match SGLang's behavior
+        # SGLang converts tensors to FP32, performs sum, uses FP32 sum for RMSNorm,
+        # then converts back to bf16 (for intermediate layers) or keeps fp32 (for final layer)
+        output_dtype = torch.float32 if is_final_layer else torch.bfloat16
+        return bias_dropout_add_unfused(training, use_fp32_residual=True, output_dtype=output_dtype)
+    
     if fused:
         # jit scripting for a nn.module (with dropout) is not
         # triggering the fusion kernel. For now, we use two
