@@ -1494,21 +1494,41 @@ class SGLangFlashAttention(MegatronModule):
         # flash_attn_varlen_func wraps it with proper backward implementation
         if HAVE_FA3_VARLEN and fa3_varlen_func is not None:
             # Use the high-level API with backward support
-            output = fa3_varlen_func(
-                q=query,
-                k=key,
-                v=value,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlen_k,
-                dropout_p=self.attention_dropout if self.training else 0.0,
-                softmax_scale=self.softmax_scale,
-                causal=True,
-                window_size=(-1, -1),
-                softcap=0.0,
-                return_attn_probs=False,
-            )
+            # num_splits=1 is CRITICAL for batch-invariant (deterministic) behavior
+            # This ensures consistent results regardless of batch size
+            import inspect
+            sig = inspect.signature(fa3_varlen_func)
+            
+            # Base kwargs that should work with all FA3 variants
+            fa3_kwargs = {
+                'q': query,
+                'k': key,
+                'v': value,
+                'cu_seqlens_q': cu_seqlens_q,
+                'cu_seqlens_k': cu_seqlens_k,
+                'max_seqlen_q': max_seqlen_q,
+                'max_seqlen_k': max_seqlen_k,
+                'softmax_scale': self.softmax_scale,
+                'causal': True,
+            }
+            
+            # Add optional parameters if supported by this FA3 variant
+            if 'dropout_p' in sig.parameters:
+                fa3_kwargs['dropout_p'] = self.attention_dropout if self.training else 0.0
+            if 'window_size' in sig.parameters:
+                fa3_kwargs['window_size'] = (-1, -1)
+            if 'softcap' in sig.parameters:
+                fa3_kwargs['softcap'] = 0.0
+            if 'return_attn_probs' in sig.parameters:
+                fa3_kwargs['return_attn_probs'] = False
+            if 'return_softmax_lse' in sig.parameters:
+                fa3_kwargs['return_softmax_lse'] = False
+            # CRITICAL: num_splits=1 for batch-invariant mode
+            if 'num_splits' in sig.parameters:
+                fa3_kwargs['num_splits'] = 1
+            
+            output = fa3_varlen_func(**fa3_kwargs)
+            
             # flash_attn_varlen_func returns output directly (or tuple if return_attn_probs=True)
             if isinstance(output, tuple):
                 output = output[0]
