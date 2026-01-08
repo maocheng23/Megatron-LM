@@ -37,7 +37,7 @@ from megatron.core.transformer.transformer_layer import (
     TransformerLayerSubmodules,
     get_transformer_layer_offset,
 )
-from megatron.core.utils import is_te_min_version
+from megatron.core.utils import is_te_min_version, log_single_rank
 
 try:
     import transformer_engine as te  # type: ignore[import-untyped]  # pylint: disable=unused-import
@@ -59,6 +59,13 @@ except ImportError:
     HAVE_KITCHEN = False
 
 try:
+    from megatron.core.extensions.sglang import SGLangSpecProvider
+
+    HAVE_SGLANG = True
+except ImportError:
+    HAVE_SGLANG = False
+
+try:
     import apex  # type: ignore[import-untyped]  # pylint: disable=unused-import
 
     from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
@@ -66,13 +73,16 @@ try:
     HAVE_APEX = True
     LNImpl = FusedLayerNorm
 except ImportError:
-    import warnings
-
-    from megatron.core.transformer.torch_norm import WrappedTorchNorm
-
     warnings.warn("Apex is not installed. Falling back to Torch Norm")
-    LNImpl = WrappedTorchNorm
+    LNImpl = None
     HAVE_APEX = False
+
+# Always import WrappedTorchNorm for use when not using LayerNorm or when Apex is not available
+from megatron.core.transformer.torch_norm import WrappedTorchNorm
+
+# If Apex is not available, use WrappedTorchNorm as LNImpl
+if not HAVE_APEX:
+    LNImpl = WrappedTorchNorm
 
 
 def get_gpt_layer_with_inference_spec(
@@ -184,6 +194,10 @@ def get_gpt_layer_with_transformer_engine_spec(
     use_te_activation_func: bool = False,
     use_kitchen_attention: bool = False,
     kitchen_attention_backend: str = "sdpa",
+    use_sglang: bool = False,
+    use_sglang_attention: bool = True,
+    post_self_attn_layernorm: bool = False,
+    post_mlp_layernorm: bool = False,
 ) -> ModuleSpec:
     """Use this spec to use lower-level Transformer Engine modules (required for fp8 training).
 
@@ -209,7 +223,24 @@ def get_gpt_layer_with_transformer_engine_spec(
             " and will be removed soon. Please update your code accordingly."
         )
 
-    if use_kitchen:
+    if use_sglang:
+        assert HAVE_SGLANG, "--use-sglang requires SGLang extension"
+        # Import and enable SGLang batch-invariant mode and RoPE
+        from megatron.core.extensions.sglang import (
+            enable_sglang_batch_invariant_mode,
+            enable_sglang_rope,
+        )
+        enable_sglang_batch_invariant_mode()
+        enable_sglang_rope()  # Use SGLang-compatible RoPE for true on-policy
+
+        backend: BackendSpecProvider = SGLangSpecProvider(
+            fallback=TESpecProvider(),
+            use_sglang_attention=use_sglang_attention,
+        )
+        if use_te_op_fuser:
+            raise AssertionError("use_te_op_fuser not compatible with using sglang in mlp.")
+        use_te_activation_func = True
+    elif use_kitchen:
         assert HAVE_KITCHEN
         backend: BackendSpecProvider = KitchenSpecProvider(
             fallback=TESpecProvider(),
@@ -317,6 +348,8 @@ def get_gpt_layer_local_spec(
     use_kitchen: bool = False,
     use_kitchen_attention: bool = False,
     kitchen_attention_backend: str = "sdpa",
+    use_sglang: bool = False,
+    use_sglang_attention: bool = True,
 ) -> ModuleSpec:
     """Use this spec for an implementation using only modules in Megatron-Core.
 
@@ -334,7 +367,20 @@ def get_gpt_layer_local_spec(
         ModuleSpec: Module specification with Megatron-Core modules
     """
 
-    if use_kitchen:
+    if use_sglang:
+        assert HAVE_SGLANG, "--use-sglang requires SGLang extension"
+        from megatron.core.extensions.sglang import (
+            enable_sglang_batch_invariant_mode,
+            enable_sglang_rope,
+        )
+        enable_sglang_batch_invariant_mode()
+        enable_sglang_rope()  # Use SGLang-compatible RoPE for true on-policy
+
+        backend = SGLangSpecProvider(
+            fallback=LocalSpecProvider(),
+            use_sglang_attention=use_sglang_attention,
+        )
+    elif use_kitchen:
         assert HAVE_KITCHEN
         backend = KitchenSpecProvider(
             fallback=LocalSpecProvider(),
@@ -524,8 +570,17 @@ def get_gpt_decoder_block_spec(
     pp_rank: Optional[int] = None,
 ) -> TransformerBlockSubmodules:
     """GPT block spec."""
-    if use_transformer_engine:
+    norm_type = normalization if normalization is not None else getattr(config, 'normalization', 'LayerNorm')
+    
+    if config.use_sglang and norm_type == "RMSNorm":
+        from megatron.core.extensions.sglang import SGLangFinalRMSNorm
+        layer_norm_impl = SGLangFinalRMSNorm
+    elif use_transformer_engine:
         layer_norm_impl = TENorm
+    else:
+        layer_norm_impl = LNImpl if norm_type == "LayerNorm" else WrappedTorchNorm
+    
+    if use_transformer_engine:
         dense_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=None,
             moe_grouped_gemm=False,
@@ -537,6 +592,8 @@ def get_gpt_decoder_block_spec(
             use_te_activation_func=config.use_te_activation_func,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            use_sglang=config.use_sglang,
+            use_sglang_attention=config.use_sglang_attention,
         )
         moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=config.num_moe_experts,
@@ -549,9 +606,10 @@ def get_gpt_decoder_block_spec(
             use_te_activation_func=config.use_te_activation_func,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            use_sglang=config.use_sglang,
+            use_sglang_attention=config.use_sglang_attention,
         )
     else:
-        layer_norm_impl = LNImpl
         dense_layer_spec = get_gpt_layer_local_spec(
             num_experts=None,
             moe_grouped_gemm=False,
@@ -563,6 +621,8 @@ def get_gpt_decoder_block_spec(
             use_kitchen=config.use_kitchen,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            use_sglang=config.use_sglang,
+            use_sglang_attention=config.use_sglang_attention,
         )
         moe_layer_spec = get_gpt_layer_local_spec(
             num_experts=config.num_moe_experts,
@@ -575,6 +635,8 @@ def get_gpt_decoder_block_spec(
             use_kitchen=config.use_kitchen,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            use_sglang=config.use_sglang,
+            use_sglang_attention=config.use_sglang_attention,
         )
 
     # Parse config.moe_layer_freq to determine the pattern of expert/dense layers.
@@ -641,25 +703,33 @@ def get_gpt_mtp_block_spec(
 ) -> MultiTokenPredictionBlockSubmodules:
     """GPT Multi-Token Prediction (MTP) block spec."""
     if use_transformer_engine:
-        backend: BackendSpecProvider = (
-            KitchenSpecProvider(
+        if config.use_sglang:
+            backend: BackendSpecProvider = SGLangSpecProvider(
+                fallback=TESpecProvider(),
+                use_sglang_attention=config.use_sglang_attention,
+            )
+        elif config.use_kitchen:
+            backend = KitchenSpecProvider(
                 fallback=TESpecProvider(),
                 use_kitchen_attention=config.use_kitchen_attention,
                 kitchen_attention_backend=config.kitchen_attention_backend,
             )
-            if config.use_kitchen
-            else TESpecProvider()
-        )
+        else:
+            backend = TESpecProvider()
     else:
-        backend = (
-            KitchenSpecProvider(
+        if config.use_sglang:
+            backend = SGLangSpecProvider(
+                fallback=LocalSpecProvider(),
+                use_sglang_attention=config.use_sglang_attention,
+            )
+        elif config.use_kitchen:
+            backend = KitchenSpecProvider(
                 fallback=LocalSpecProvider(),
                 use_kitchen_attention=config.use_kitchen_attention,
                 kitchen_attention_backend=config.kitchen_attention_backend,
             )
-            if config.use_kitchen
-            else LocalSpecProvider()
-        )
+        else:
+            backend = LocalSpecProvider()
     return get_gpt_mtp_block_spec_for_backend(
         config=config, spec=spec, backend=backend, vp_stage=vp_stage, pp_rank=pp_rank
     )
