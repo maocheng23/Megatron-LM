@@ -1437,30 +1437,8 @@ def core_transformer_config_from_args(args, config_class=None):
     if hasattr(args, "kitchen_attention_backend"):
         kw_args['kitchen_attention_backend'] = args.kitchen_attention_backend
 
-    # Note: SGLang arguments are handled at the beginning of the function, before the loop
-
-    # Print clear SGLang configuration status
-    if hasattr(args, "use_sglang") and args.use_sglang:
-        print("=" * 80, flush=True)
-        print("📋 SGLANG KERNEL: Configuration detected in arguments", flush=True)
-        print(f"   - use_sglang: {args.use_sglang}", flush=True)
-        print(f"   - use_sglang_attention: {kw_args.get('use_sglang_attention', 'NOT SET')}", flush=True)
-        print("=" * 80, flush=True)
-    elif hasattr(args, "use_sglang") and not args.use_sglang:
-        print("⚠️  SGLANG KERNEL: NOT enabled (use_sglang=False). Using Transformer Engine backend.", flush=True)
-
     # Return config.
-    config = config_class(**kw_args)
-    
-    # Debug: Verify SGLang config was set correctly
-    if hasattr(args, "use_sglang") and args.use_sglang:
-        print(f"🔍 SGLANG DEBUG: After creating config, config.use_sglang = {config.use_sglang}", flush=True)
-        print(f"🔍 SGLANG DEBUG: After creating config, config.use_sglang_attention = {getattr(config, 'use_sglang_attention', 'NOT SET')}", flush=True)
-        if not config.use_sglang:
-            print("⚠️  ERROR: config.use_sglang is False even though args.use_sglang is True!", flush=True)
-            print(f"🔍 SGLANG DEBUG: kw_args['use_sglang'] = {kw_args.get('use_sglang', 'NOT SET')}", flush=True)
-    
-    return config
+    return config_class(**kw_args)
 
 
 def _add_transformer_engine_args(parser):
