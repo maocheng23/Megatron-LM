@@ -133,16 +133,35 @@ except ImportError:
     ENABLE_JIT_DEEPGEMM = False
 
 # Try to import Flash Attention 3
+# IMPORTANT: Use flash_attn_varlen_func (high-level API with backward support)
+# instead of _flash_attn_forward (low-level kernel without backward support)
 try:
-    from flash_attn_3.flash_attn_interface import _flash_attn_forward
+    # First try flash_attn_interface (FA3 standard location)
+    from flash_attn_interface import flash_attn_varlen_func as fa3_varlen_func
+    from flash_attn_3.flash_attn_interface import _flash_attn_forward  # Keep for reference
     from flash_attn_3.flash_attn_interface import (
         flash_attn_with_kvcache as flash_attn3_with_kvcache,
     )
     HAVE_FA3 = True
+    HAVE_FA3_VARLEN = True
+    _print_sglang_log("✅ FA3: Using flash_attn_varlen_func (with backward support)")
 except ImportError:
-    HAVE_FA3 = False
-    _flash_attn_forward = None
-    flash_attn3_with_kvcache = None
+    try:
+        # Fallback: try flash_attn_3 module directly
+        from flash_attn_3.flash_attn_interface import flash_attn_varlen_func as fa3_varlen_func
+        from flash_attn_3.flash_attn_interface import _flash_attn_forward
+        from flash_attn_3.flash_attn_interface import (
+            flash_attn_with_kvcache as flash_attn3_with_kvcache,
+        )
+        HAVE_FA3 = True
+        HAVE_FA3_VARLEN = True
+        _print_sglang_log("✅ FA3: Using flash_attn_varlen_func from flash_attn_3 (with backward support)")
+    except ImportError:
+        HAVE_FA3 = False
+        HAVE_FA3_VARLEN = False
+        _flash_attn_forward = None
+        fa3_varlen_func = None
+        flash_attn3_with_kvcache = None
 
 
 # =============================================================================
@@ -1469,43 +1488,72 @@ class SGLangFlashAttention(MegatronModule):
             max_seqlen_q = sq
             max_seqlen_k = sk
 
-        # Use Flash Attention 3 with batch-invariant mode (num_splits=1)
-        # num_splits=1 ensures deterministic, batch-invariant results
-        output = _flash_attn_forward(
-            q=query,
-            k=key,
-            v=value,
-            k_new=None,
-            v_new=None,
-            qv=None,
-            out=None,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            cu_seqlens_k_new=None,
-            seqused_q=None,
-            seqused_k=None,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            page_table=None,
-            kv_batch_idx=None,
-            leftpad_k=None,
-            rotary_cos=None,
-            rotary_sin=None,
-            seqlens_rotary=None,
-            q_descale=None,
-            k_descale=None,
-            v_descale=None,
-            softmax_scale=self.softmax_scale,
-            causal=True,
-            window_size=(-1, -1),
-            attention_chunk=0,
-            softcap=0.0,
-            rotary_interleaved=True,
-            scheduler_metadata=None,
-            num_splits=1,  # ⭐ Batch-invariant mode: num_splits=1
-            pack_gqa=None,
-            sm_margin=0,
-        )[0]  # _flash_attn_forward returns (output, softmax_lse, ...)
+        # Use Flash Attention 3 with backward support
+        # CRITICAL: Use flash_attn_varlen_func (high-level API) instead of _flash_attn_forward
+        # _flash_attn_forward is a low-level CUDA kernel WITHOUT autograd support
+        # flash_attn_varlen_func wraps it with proper backward implementation
+        if HAVE_FA3_VARLEN and fa3_varlen_func is not None:
+            # Use the high-level API with backward support
+            output = fa3_varlen_func(
+                q=query,
+                k=key,
+                v=value,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                dropout_p=self.attention_dropout if self.training else 0.0,
+                softmax_scale=self.softmax_scale,
+                causal=True,
+                window_size=(-1, -1),
+                softcap=0.0,
+                return_attn_probs=False,
+            )
+            # flash_attn_varlen_func returns output directly (or tuple if return_attn_probs=True)
+            if isinstance(output, tuple):
+                output = output[0]
+        else:
+            # Fallback to _flash_attn_forward (WARNING: no backward support!)
+            _print_sglang_log(
+                "⚠️  WARNING: Using _flash_attn_forward without backward support! "
+                "Training will NOT work correctly!", 
+                level=logging.WARNING
+            )
+            output = _flash_attn_forward(
+                q=query,
+                k=key,
+                v=value,
+                k_new=None,
+                v_new=None,
+                qv=None,
+                out=None,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                cu_seqlens_k_new=None,
+                seqused_q=None,
+                seqused_k=None,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                page_table=None,
+                kv_batch_idx=None,
+                leftpad_k=None,
+                rotary_cos=None,
+                rotary_sin=None,
+                seqlens_rotary=None,
+                q_descale=None,
+                k_descale=None,
+                v_descale=None,
+                softmax_scale=self.softmax_scale,
+                causal=True,
+                window_size=(-1, -1),
+                attention_chunk=0,
+                softcap=0.0,
+                rotary_interleaved=True,
+                scheduler_metadata=None,
+                num_splits=1,
+                pack_gqa=None,
+                sm_margin=0,
+            )[0]
 
         # Reshape output based on input format
         if is_packed:
