@@ -1,4 +1,3 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 # SGLang Backend Extension for Megatron-LM
 #
 # This module provides wrappers for SGLang's batch-invariant (deterministic) kernels
@@ -25,43 +24,36 @@
 # - All kernels use batch-invariant operations for training-inference consistency
 # - FA3 with num_splits=1 for deterministic attention
 # - DeepGEMM support for FP8 quantization
-# - Full MoE support with grouped linear layers
+# TODO: Add full MoE support with grouped linear layers
 
 import logging
 import math
 import os
 import warnings
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Tuple, Union
+import inspect
+from typing import Callable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from megatron.core import tensor_parallel
-from megatron.core.fusions.fused_softmax import FusedScaleMaskSoftmax
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
-    get_expert_data_parallel_rank,
     get_expert_model_parallel_rank,
     get_expert_model_parallel_world_size,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.random import (
-    get_cuda_rng_tracker,
-    get_data_parallel_rng_tracker_name,
-    get_expert_parallel_rng_tracker_name,
-)
 from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.utils import attention_mask_func, make_sharded_tensors_for_checkpoint
+from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 from megatron.core.utils import get_tensor_model_parallel_group_if_none, log_single_rank
 
 logger = logging.getLogger(__name__)
@@ -90,18 +82,13 @@ def _print_sglang_log(message: str, level: int = logging.INFO):
 
 try:
     from sglang.srt.batch_invariant_ops.batch_invariant_ops import (
-        # Core batch-invariant operations
         mm_batch_invariant,
         addmm_batch_invariant,
         bmm_batch_invariant,
         rms_norm_batch_invariant,
-        # Mode management
         enable_batch_invariant_mode,
         disable_batch_invariant_mode,
-        set_batch_invariant_mode,
         is_batch_invariant_mode_enabled,
-        # Attention block size for batch-invariant attention
-        get_batch_invariant_attention_block_size,
     )
     HAVE_SGLANG_BATCH_INVARIANT = True
 except ImportError:
@@ -112,8 +99,6 @@ except ImportError:
     rms_norm_batch_invariant = None
     enable_batch_invariant_mode = None
     disable_batch_invariant_mode = None
-    set_batch_invariant_mode = None
-    get_batch_invariant_attention_block_size = None
 
     def is_batch_invariant_mode_enabled():
         """Fallback when SGLang is not available."""
@@ -123,11 +108,7 @@ except ImportError:
 # Try to import DeepGEMM for FP8 support
 try:
     from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
-    if ENABLE_JIT_DEEPGEMM:
-        import deep_gemm
-        HAVE_DEEPGEMM = True
-    else:
-        HAVE_DEEPGEMM = False
+    HAVE_DEEPGEMM = bool(ENABLE_JIT_DEEPGEMM)
 except ImportError:
     HAVE_DEEPGEMM = False
     ENABLE_JIT_DEEPGEMM = False
@@ -139,29 +120,20 @@ try:
     # First try flash_attn_interface (FA3 standard location)
     from flash_attn_interface import flash_attn_varlen_func as fa3_varlen_func
     from flash_attn_3.flash_attn_interface import _flash_attn_forward  # Keep for reference
-    from flash_attn_3.flash_attn_interface import (
-        flash_attn_with_kvcache as flash_attn3_with_kvcache,
-    )
     HAVE_FA3 = True
     HAVE_FA3_VARLEN = True
-    _print_sglang_log("✅ FA3: Using flash_attn_varlen_func (with backward support)")
 except ImportError:
     try:
         # Fallback: try flash_attn_3 module directly
         from flash_attn_3.flash_attn_interface import flash_attn_varlen_func as fa3_varlen_func
         from flash_attn_3.flash_attn_interface import _flash_attn_forward
-        from flash_attn_3.flash_attn_interface import (
-            flash_attn_with_kvcache as flash_attn3_with_kvcache,
-        )
         HAVE_FA3 = True
         HAVE_FA3_VARLEN = True
-        _print_sglang_log("✅ FA3: Using flash_attn_varlen_func from flash_attn_3 (with backward support)")
     except ImportError:
         HAVE_FA3 = False
         HAVE_FA3_VARLEN = False
         _flash_attn_forward = None
         fa3_varlen_func = None
-        flash_attn3_with_kvcache = None
 
 
 # =============================================================================
@@ -171,13 +143,9 @@ except ImportError:
 @dataclass
 class SGLangConfig:
     """Configuration for SGLang extension."""
-    # Whether to use batch-invariant mode globally
     batch_invariant_mode: bool = True
-    # Whether to use DeepGEMM for FP8 operations
     use_deep_gemm: bool = True
-    # Whether to use SGLang's attention kernel (FA3)
     use_sglang_attention: bool = True
-    # Whether to fall back to non-batch-invariant ops when shape is unsupported
     allow_fallback: bool = True
 
 
@@ -201,58 +169,24 @@ def set_sglang_config(config: SGLangConfig):
 # =============================================================================
 
 def enable_sglang_batch_invariant_mode(enable_bmm: bool = True):
-    """
-    Enable SGLang's batch-invariant mode for training-inference consistency.
-
-    This function:
-    1. Enables SGLang's batch_invariant_ops which replaces PyTorch's default
-       implementations with Triton persistent kernels
-    2. Sets PyTorch and CUDA flags for deterministic behavior
-    3. Configures NCCL for deterministic communication
-
-    The batch-invariant ops that get replaced:
-    - aten::mm -> mm_batch_invariant (Triton persistent GEMM)
-    - aten::addmm -> addmm_batch_invariant
-    - aten::bmm -> bmm_batch_invariant
-    - aten::_log_softmax -> _log_softmax_batch_invariant
-    - aten::mean.dim -> mean_batch_invariant
-
-    Args:
-        enable_bmm: Whether to also replace torch.bmm. Default True.
-    """
-    _print_sglang_log("=" * 80)
-    _print_sglang_log("🚀 SGLANG KERNEL: Enabling SGLang batch-invariant mode")
-    _print_sglang_log("=" * 80)
-
-    # Enable SGLang's batch-invariant ops
     if HAVE_SGLANG_BATCH_INVARIANT:
         enable_batch_invariant_mode(enable_bmm=enable_bmm)
-        _print_sglang_log("✅ SGLang batch-invariant ops enabled (Triton kernels active)")
+        logger.info("SGLang batch-invariant ops enabled (Triton kernels active)")
     else:
-        _print_sglang_log("⚠️  WARNING: SGLang batch_invariant_ops not available, using PyTorch fallbacks.", level=logging.WARNING)
+        logger.warning("WARNING: SGLang batch_invariant_ops not available, using PyTorch fallbacks.")
 
-    # PyTorch deterministic mode
     torch.use_deterministic_algorithms(True)
 
-    # CUDA deterministic settings
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-    # cuBLAS workspace config for deterministic behavior
     os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
-
-    # NCCL deterministic algorithm
     os.environ['NCCL_ALGO'] = 'Ring'
-
-    # Disable non-deterministic algorithms in TE if available
     os.environ['NVTE_ALLOW_NONDETERMINISTIC_ALGO'] = '0'
 
-    _print_sglang_log("✅ Deterministic mode fully enabled (PyTorch, CUDA, NCCL configured)")
-    _print_sglang_log("=" * 80)
 
 
 def disable_sglang_batch_invariant_mode():
-    """Disable SGLang's batch-invariant mode."""
     if HAVE_SGLANG_BATCH_INVARIANT:
         disable_batch_invariant_mode()
         logger.info("SGLang batch-invariant ops disabled.")
@@ -267,20 +201,6 @@ enable_sglang_deterministic_mode = enable_sglang_batch_invariant_mode
 # =============================================================================
 
 def sglang_mm(a: Tensor, b: Tensor) -> Tensor:
-    """
-    Batch-invariant matrix multiplication.
-
-    IMPORTANT: Always use torch.mm() instead of directly calling mm_batch_invariant().
-    
-    When enable_batch_invariant_mode() is called, mm_batch_invariant is registered
-    as the aten::mm CUDA implementation via torch.library. This means:
-    - torch.mm() will automatically dispatch to mm_batch_invariant
-    - PyTorch's autograd system knows it's an aten::mm operation
-    - Backward pass works correctly using aten::mm's gradient formula
-    
-    If we call mm_batch_invariant() directly, we bypass the aten dispatcher,
-    and autograd doesn't know how to compute gradients - breaking training!
-    """
     return torch.mm(a, b)
 
 
@@ -291,34 +211,16 @@ def sglang_addmm(
     beta: float = 1.0,
     alpha: float = 1.0
 ) -> Tensor:
-    """
-    Batch-invariant addmm: beta * input + alpha * (mat1 @ mat2).
-    
-    IMPORTANT: Always use torch.addmm() - see sglang_mm() docstring for why.
-    When batch_invariant_mode is enabled, torch.addmm dispatches to addmm_batch_invariant
-    while preserving autograd functionality.
-    """
     return torch.addmm(input, mat1, mat2, beta=beta, alpha=alpha)
 
 
 def sglang_bmm(a: Tensor, b: Tensor) -> Tensor:
-    """
-    Batch-invariant batch matrix multiplication.
-    
-    IMPORTANT: Always use torch.bmm() - see sglang_mm() docstring for why.
-    When batch_invariant_mode is enabled, torch.bmm dispatches to bmm_batch_invariant
-    while preserving autograd functionality.
-    """
     return torch.bmm(a, b)
 
 
 def sglang_rms_norm(input: Tensor, weight: Tensor, eps: float = 1e-6) -> Tensor:
-    """
-    Batch-invariant RMS normalization.
-    """
     if HAVE_SGLANG_BATCH_INVARIANT and is_batch_invariant_mode_enabled():
         return rms_norm_batch_invariant(input, weight, eps=eps)
-    # Fallback implementation
     input_dtype = input.dtype
     input_float = input.float()
     variance = input_float.pow(2).mean(-1, keepdim=True)
@@ -333,14 +235,6 @@ def sglang_rms_norm(input: Tensor, weight: Tensor, eps: float = 1e-6) -> Tensor:
 class SGLangLinear(MegatronModule):
     """
     SGLang-compatible Linear layer using batch-invariant operations.
-
-    This is the base class for all SGLang linear layers, matching the
-    structure of KitchenLinear.
-
-    Key features:
-    - Uses mm_batch_invariant for deterministic GEMM
-    - Uses addmm_batch_invariant for bias addition
-    - Supports tensor parallelism modes: "column", "row", "duplicated"
     """
 
     def __init__(
@@ -795,14 +689,6 @@ class SGLangRowParallelGroupedLinear(SGLangGroupedLinear):
 class SGLangRMSNorm(MegatronModule):
     """
     RMSNorm matching SGLang's FSDP-compatible numerical paths.
-
-    When true on-policy mode is enabled, uses the same computation as SGLang's
-    forward_native with:
-    - FP32 weights
-    - FP32 computation
-    - cast_x_before_out_mul=True (weight * x.to(orig_dtype))
-    
-    This ensures bitwise-identical results between SGLang inference and Megatron training.
     """
 
     def __init__(
@@ -828,13 +714,6 @@ class SGLangRMSNorm(MegatronModule):
 
     def forward(self, x: Tensor) -> Tensor:
         """Forward matching SGLang's forward_native with FSDP settings.
-        
-        Matches SGLang's RMSNorm.forward_native with:
-        - cast_x_before_out_mul=True
-        - Uses input dtype (not override_orig_dtype=torch.float32)
-        
-        This is used for Q/K norms and other intermediate norms.
-        For final layer norm, use SGLangFinalRMSNorm instead.
         """
         if not x.is_contiguous():
             x = x.contiguous()
@@ -1172,22 +1051,6 @@ def sglang_apply_rotary_pos_emb(
     sin: Tensor,
     is_neox_style: bool = True,
 ) -> Tensor:
-    """
-    Apply rotary positional embedding matching SGLang's implementation exactly.
-    
-    This matches SGLang's `_apply_rotary_emb` in `sglang/srt/layers/rotary_embedding.py`.
-    
-    Args:
-        x: Input tensor [seq_len, batch, num_heads, head_dim] or [num_tokens, num_heads, head_dim]
-        cos: Cosine values [seq_len, head_dim // 2] or [num_tokens, head_dim // 2]
-        sin: Sine values [seq_len, head_dim // 2] or [num_tokens, head_dim // 2]
-        is_neox_style: True for neox-style (split in half), False for GPT-J (interleaved)
-    
-    Returns:
-        Rotated tensor with same shape as input
-    """
-    # Ensure cos/sin have correct shape for broadcasting
-    # SGLang: cos = cos.unsqueeze(-2).to(x.dtype)  # [seq, 1, head_dim//2]
     if cos.dim() == 2:
         cos = cos.unsqueeze(-2)  # [seq, 1, head_dim//2]
         sin = sin.unsqueeze(-2)
@@ -1196,14 +1059,11 @@ def sglang_apply_rotary_pos_emb(
     sin = sin.to(x.dtype)
     
     if is_neox_style:
-        # Split in half (LLaMA/Qwen style)
         x1, x2 = torch.chunk(x, 2, dim=-1)
     else:
-        # Interleaved (GPT-J style)
         x1 = x[..., ::2]
         x2 = x[..., 1::2]
     
-    # Apply rotation
     o1 = x1 * cos - x2 * sin
     o2 = x2 * cos + x1 * sin
     
@@ -1219,36 +1079,14 @@ def sglang_apply_rotary_pos_emb_to_qk(
     freqs: Tensor,
     config: "TransformerConfig",
 ) -> Tuple[Tensor, Tensor]:
-    """
-    Apply rotary positional embedding to query and key tensors.
-    
-    This is a wrapper that matches Megatron's interface but uses SGLang's
-    numerical implementation for true on-policy consistency.
-    
-    Args:
-        query: Query tensor [sq, b, np, hn]
-        key: Key tensor [sk, b, ng, hn]
-        freqs: Rotary embedding frequencies (cos, sin tuple or combined)
-        config: Transformer config for rotary_interleaved setting
-    
-    Returns:
-        Tuple of (rotated_query, rotated_key)
-    """
-    # Megatron passes freqs as (q_freqs, k_freqs) tuple
     if isinstance(freqs, tuple):
         q_freqs, k_freqs = freqs
     else:
         q_freqs = k_freqs = freqs
     
-    # Extract cos and sin from freqs
-    # Megatron freqs format: [seq, 1, 1, head_dim] interleaved cos/sin
-    # We need to deinterleave to get separate cos and sin
     head_dim = query.shape[-1]
     
-    # freqs contains interleaved cos, sin: [cos0, sin0, cos1, sin1, ...]
-    # Reshape to extract cos and sin
     if q_freqs.shape[-1] == head_dim:
-        # Already in correct format, split into cos/sin
         cos = q_freqs[..., :head_dim // 2]
         sin = q_freqs[..., head_dim // 2:]
     else:
@@ -1256,18 +1094,14 @@ def sglang_apply_rotary_pos_emb_to_qk(
         cos = q_freqs[..., 0::2]
         sin = q_freqs[..., 1::2]
     
-    # Remove extra dimensions if present
     while cos.dim() > 3 and cos.shape[1] == 1:
         cos = cos.squeeze(1)
         sin = sin.squeeze(1)
     
-    # is_neox_style = not config.rotary_interleaved
     is_neox_style = not getattr(config, 'rotary_interleaved', False)
     
-    # Apply RoPE using SGLang's implementation
     rotated_query = sglang_apply_rotary_pos_emb(query, cos, sin, is_neox_style)
     
-    # For key, use k_freqs if different
     if k_freqs is not q_freqs:
         if k_freqs.shape[-1] == head_dim:
             k_cos = k_freqs[..., :head_dim // 2]
@@ -1301,23 +1135,6 @@ def sglang_apply_rotary_pos_emb_with_freqs(
     config: "TransformerConfig",
     layer_number: Optional[int] = None,
 ) -> Tensor:
-    """
-    Apply SGLang RoPE to a tensor using freqs (raw angles).
-    
-    This is a convenience wrapper that handles:
-    - Extracting cos/sin from freqs (raw angles)
-    - Handling sequence length mismatches (partial apply)
-    - Calling sglang_apply_rotary_pos_emb
-    
-    Args:
-        x: Input tensor [seq_len, batch, num_heads, head_dim] or [seq_len, num_heads, head_dim]
-        freqs: Rotary embedding frequencies (raw angles) [freqs_seq_len, 1, 1, head_dim] or similar
-        config: Transformer config for rotary_interleaved setting
-        layer_number: Optional layer number for logging partial apply cases
-    
-    Returns:
-        Rotated tensor with same shape as input
-    """
     x_seq_len = x.shape[0]
     freqs_seq_len = freqs.shape[0]
     
@@ -1337,7 +1154,6 @@ def sglang_apply_rotary_pos_emb_with_freqs(
         # Partial apply: only apply to first freqs_seq_len positions
         if layer_number == 1:
             # Log only once for the first layer
-            import warnings
             warnings.warn(
                 f"[SGLang RoPE] Partial apply: Layer {layer_number} "
                 f"applying to first {freqs_seq_len} of {x_seq_len} positions",
@@ -1555,7 +1371,6 @@ class SGLangFlashAttention(MegatronModule):
             # Use the high-level API with backward support
             # num_splits=1 is CRITICAL for batch-invariant (deterministic) behavior
             # This ensures consistent results regardless of batch size
-            import inspect
             sig = inspect.signature(fa3_varlen_func)
             
             # Base kwargs that should work with all FA3 variants
