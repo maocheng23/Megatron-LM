@@ -21,6 +21,11 @@ from megatron.core.transformer.moe.moe_utils import (
     topk_routing_with_score_function,
     z_loss_func,
 )
+from megatron.core.transformer.moe.deterministic_router import (
+    fused_moe_router_deterministic,
+    convert_topk_to_megatron_format,
+    is_sglang_router_available,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -575,6 +580,13 @@ class TopKRouter(Router):
 
         # Apply input jitter
         input = self.apply_input_jitter(input)
+        
+        # Option 1: Use SGLang's fused router directly (GEMM + Softcap + TopK in one kernel)
+        # This provides bit-exact same results as SGLang inference
+        if self.config.use_sglang_router:
+            return self._sglang_router_forward(input)
+        
+        # Option 2: Standard Megatron routing path
         logits = self.gating(input)
 
         if self.config.moe_router_force_load_balancing:
@@ -583,6 +595,50 @@ class TopKRouter(Router):
 
         probs, routing_map = self.routing(logits)
 
+        return probs, routing_map
+    
+    def _sglang_router_forward(self, input: torch.Tensor):
+        # Ensure router is available
+        if not is_sglang_router_available() and input.is_cuda:
+            import warnings
+            warnings.warn(
+                "SGLang router not available, falling back to deterministic PyTorch implementation. "
+                "Install SGLang for optimal performance: pip install sglang"
+            )
+        
+        # Reshape input: [seq_len, batch_size, hidden_dim] -> [num_tokens, hidden_dim]
+        original_shape = input.shape
+        if len(original_shape) == 3:
+            seq_len, batch_size, hidden_dim = original_shape
+            input_2d = input.view(-1, hidden_dim)
+        else:
+            input_2d = input
+        
+        # Move router weight to same device if needed
+        if self.weight.device.type == 'cpu':
+            self.weight.data = self.weight.data.to(device=input.device)
+        
+        # Call SGLang's fused router (or fallback)
+        # This matches SGLang's FusedMoeRouter.forward_cuda() exactly
+        topk_weights, topk_ids = fused_moe_router_deterministic(
+            hidden_states=input_2d,
+            router_weight=self.weight,
+            topk=self.topk,
+            moe_softcapping=self.config.moe_softcapping,
+            correction_bias=self.expert_bias,  # SGLang calls this correction_bias
+        )
+        
+        # Convert SGLang format (topk_weights, topk_ids) to Megatron format (probs, routing_map)
+        probs, routing_map = convert_topk_to_megatron_format(
+            topk_weights,
+            topk_ids,
+            num_experts=self.config.num_moe_experts,
+            dtype=input.dtype,
+        )
+        
+        # Apply expert bias tracking (for load balancing)
+        self._apply_expert_bias(routing_map)
+        
         return probs, routing_map
 
     def _load_from_state_dict(self, *args, **kwargs):

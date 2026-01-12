@@ -563,6 +563,18 @@ class TransformerConfig(ModelParallelConfig):
     """[Experimental] Force load balancing with random logits for MoE router, supports naive topk 
     and group-limited topk. This is an experimental feature and only for benchmark."""
 
+    use_sglang_router: bool = False
+    """Use SGLang's fused_moe_router_cudacore directly for MoE routing.
+    This provides bit-exact same results as SGLang's inference.
+    When enabled, bypasses Megatron's routing logic and uses SGLang's implementation.
+    Requires: pip install sglang (or sglang available in PYTHONPATH).
+    This is similar to --use-sglang and --use-sglang-attention for other components."""
+
+    moe_softcapping: float = 0.0
+    """Softcapping value for router logits. Used in Gemma2 and similar models.
+    softcap(x) = tanh(x / cap) * cap
+    Set to 0.0 to disable softcapping."""
+
     moe_grouped_gemm: bool = False
     """When there are multiple experts per rank, compress multiple local (potentially small) gemms
     in a single kernel launch to improve the utilization and performance by leveraging the Grouped
