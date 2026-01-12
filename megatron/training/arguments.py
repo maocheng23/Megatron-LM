@@ -3528,6 +3528,13 @@ def _add_sglang_arguments(parser: argparse.ArgumentParser):
             dest='use_sglang_attention',
             help="Explicitly disable SGLang's Flash Attention 3 (use fallback instead).",
         )
+        group.add_argument(
+            '--use-sglang-router',
+            action="store_true",
+            default=False,
+            help="Use SGLang's fused MoE router for deterministic routing. "
+                 "Provides bit-exact same results as SGLang inference.",
+        )
     return parser
 
 def _add_sft_args(parser):
