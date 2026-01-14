@@ -152,6 +152,23 @@ class MLP(MegatronModule):
     def forward(self, hidden_states, per_token_scale=None):
         """Perform the forward pass through the MLP block."""
         # [s, b, 4 * h/p]
+        
+        import os
+        if os.environ.get('SLIME_DEBUG_LOGPROB_DIFF', '0') == '1':
+            import torch.distributed as dist
+            from megatron.core import parallel_state
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
+            tp_size = parallel_state.get_tensor_model_parallel_world_size() if parallel_state.is_initialized() else 1
+            position = 91
+            hidden_states_pos = hidden_states[position, :] if hidden_states.dim() >= 2 else hidden_states
+            print(
+                f"[DEBUG MLP input hidden_states] rank={rank}, tp_rank={tp_rank}, tp_size={tp_size}, "
+                f"position={position}, shape={hidden_states_pos.shape}, sum={hidden_states_pos.float().sum().item():.6f}, "
+                f"first 5={hidden_states_pos.flatten()[:5].float().tolist()}, "
+                f"last 5={hidden_states_pos.flatten()[-5:].float().tolist()}",
+                flush=True
+            )
         if self.use_sglang:
             sglang_dtype = getattr(self.config, 'params_dtype', torch.bfloat16)
             hidden_states = hidden_states.to(sglang_dtype)
@@ -159,6 +176,29 @@ class MLP(MegatronModule):
         nvtx_range_push(suffix="linear_fc1")
         intermediate_parallel, bias_parallel = self.linear_fc1(hidden_states)
         nvtx_range_pop(suffix="linear_fc1")
+        
+        # Debug logging for MLP intermediate states
+        import os
+        if os.environ.get('SLIME_DEBUG_LOGPROB_DIFF', '0') == '1':
+            import torch.distributed as dist
+            from megatron.core import parallel_state
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
+            tp_size = parallel_state.get_tensor_model_parallel_world_size() if parallel_state.is_initialized() else 1
+            position = 91
+            fc1_out = intermediate_parallel[position, :] if intermediate_parallel.dim() >= 2 else intermediate_parallel
+            # Check weight info
+            weight_shape = self.linear_fc1.weight.shape if hasattr(self.linear_fc1, 'weight') else 'N/A'
+            partition_stride = getattr(self.linear_fc1.weight, 'partition_stride', 'N/A') if hasattr(self.linear_fc1, 'weight') else 'N/A'
+            print(
+                f"[DEBUG MLP FC1 OUTPUT] rank={rank}, tp_rank={tp_rank}, tp_size={tp_size}, "
+                f"position={position}, output_shape={intermediate_parallel.shape}, "
+                f"weight_shape={weight_shape}, partition_stride={partition_stride}, "
+                f"fc1_sum={fc1_out.float().sum().item():.6f}, "
+                f"fc1_first5={fc1_out.flatten()[:5].float().tolist()}, "
+                f"fc1_last5={fc1_out.flatten()[-5:].float().tolist()}",
+                flush=True
+            )
 
         nvtx_range_push(suffix="activation")
         if self.use_sglang or self.config.use_te_activation_func:
@@ -235,12 +275,43 @@ class MLP(MegatronModule):
                 intermediate_parallel = intermediate_parallel * per_token_scale.unsqueeze(-1)
                 intermediate_parallel = intermediate_parallel.to(original_dtype)
         nvtx_range_pop(suffix="activation")
+        
+        # Debug logging for activation output
+        import os
+        if os.environ.get('SLIME_DEBUG_LOGPROB_DIFF', '0') == '1':
+            import torch.distributed as dist
+            from megatron.core import parallel_state
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
+            position = 91
+            act_out = intermediate_parallel[position, :] if intermediate_parallel.dim() >= 2 else intermediate_parallel
+            print(
+                f"[DEBUG MLP ACTIVATION OUTPUT] rank={rank}, tp_rank={tp_rank}, "
+                f"position={position}, shape={intermediate_parallel.shape}, "
+                f"act_sum={act_out.float().sum().item():.6f}, "
+                f"act_first5={act_out.flatten()[:5].float().tolist()}, "
+                f"act_last5={act_out.flatten()[-5:].float().tolist()}",
+                flush=True
+            )
 
         # [s, b, h]
         nvtx_range_push(suffix="linear_fc2")
 
         output, output_bias = self.linear_fc2(intermediate_parallel)
         nvtx_range_pop(suffix="linear_fc2")
+        
+        # Debug logging for FC2 output
+        if os.environ.get('SLIME_DEBUG_LOGPROB_DIFF', '0') == '1':
+            fc2_out = output[position, :] if output.dim() >= 2 else output
+            fc2_weight_shape = self.linear_fc2.weight.shape if hasattr(self.linear_fc2, 'weight') else 'N/A'
+            print(
+                f"[DEBUG MLP FC2 OUTPUT] rank={rank}, tp_rank={tp_rank}, "
+                f"position={position}, shape={output.shape}, "
+                f"fc2_weight_shape={fc2_weight_shape}, "
+                f"fc2_sum={fc2_out.float().sum().item():.6f}, "
+                f"fc2_first5={fc2_out.flatten()[:5].float().tolist()}",
+                flush=True
+            )
 
         if per_token_scale is not None and output_bias is not None:
             # if this MLP is an expert, and bias is required, we add the bias to output directly

@@ -630,6 +630,77 @@ class GPTModel(LanguageModule):
                     hidden_states.squeeze(1).unsqueeze(0)
                 ).unsqueeze(1)
 
+        # DEBUG: Print hidden_states before output_layer to compare with SGLang (only first call)
+        if not hasattr(self, '_debug_hidden_printed'):
+            self._debug_hidden_printed = True
+            import torch.distributed as dist
+            from megatron.core import parallel_state as mpu
+            
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            tp_rank = mpu.get_tensor_model_parallel_rank()
+            tp_size = mpu.get_tensor_model_parallel_world_size()
+            
+            local_seq_len = hidden_states.shape[0]
+            # If sequence parallel is enabled, the full sequence is split across TP ranks
+            is_sp = self.config.sequence_parallel if hasattr(self.config, 'sequence_parallel') else False
+            full_seq_len = local_seq_len * tp_size if is_sp else local_seq_len
+            
+            print(f"[DEBUG Megatron hidden] rank={rank}, tp_rank={tp_rank}, tp_size={tp_size}, is_sp={is_sp}: "
+                  f"hidden_states.shape={hidden_states.shape}, local_seq_len={local_seq_len}, full_seq_len={full_seq_len}, "
+                  f"sum={hidden_states.sum().item():.4f}, first 5={hidden_states.view(-1)[:5].tolist()}")
+            
+            # Find prompt_length from loss_mask (prompt part has loss_mask=0, response part has loss_mask=1)
+            if loss_mask is not None:
+                # loss_mask shape: [1, seq_len] or [batch, seq_len] - this is the FULL sequence length
+                loss_mask_flat = loss_mask.view(-1)
+                print(f"[DEBUG Megatron] rank={rank}: loss_mask.shape={loss_mask.shape}, loss_mask_flat.shape={loss_mask_flat.shape}")
+                
+                # Find first position where loss_mask is 1 (start of response) in FULL sequence
+                nonzero_indices = torch.nonzero(loss_mask_flat, as_tuple=True)[0]
+                if len(nonzero_indices) > 0:
+                    prompt_length = nonzero_indices[0].item()  # This is in FULL sequence coordinates
+                    
+                    # Calculate which TP rank owns this position and the local index
+                    if is_sp:
+                        owning_tp_rank = prompt_length // local_seq_len
+                        local_idx = prompt_length % local_seq_len
+                        print(f"[DEBUG Megatron] rank={rank}: prompt_length={prompt_length} (full seq), "
+                              f"owning_tp_rank={owning_tp_rank}, local_idx={local_idx}")
+                        
+                        if owning_tp_rank == tp_rank:
+                            # This rank owns the response_first position
+                            response_first_hidden = hidden_states[local_idx, :, :]
+                            print(f"[DEBUG Megatron response_first] rank={rank}: prompt_length={prompt_length}, "
+                                  f"response_first_hidden.shape={response_first_hidden.shape}, "
+                                  f"sum={response_first_hidden.sum().item():.4f}, "
+                                  f"first 5={response_first_hidden.view(-1)[:5].tolist()}")
+                            response_first_hidden = hidden_states[local_idx+1, :, :]
+                            print(f"[DEBUG Megatron response_first2] rank={rank}: prompt_length={prompt_length+1}, "
+                                  f"response_first_hidden.shape={response_first_hidden.shape}, "
+                                  f"sum={response_first_hidden.sum().item():.4f}, "
+                                  f"first 5={response_first_hidden.view(-1)[:5].tolist()}")
+                        else:   
+                            print(f"[DEBUG Megatron] rank={rank}: response_first is on tp_rank={owning_tp_rank}, not this rank")
+                    else:
+                        # No sequence parallel, use prompt_length directly
+                        if prompt_length < local_seq_len:
+                            response_first_hidden = hidden_states[prompt_length, :, :]
+                            print(f"[DEBUG Megatron response_first] rank={rank}: prompt_length={prompt_length}, "
+                                  f"response_first_hidden.shape={response_first_hidden.shape}, "
+                                  f"sum={response_first_hidden.sum().item():.4f}, "
+                                  f"first 5={response_first_hidden.view(-1)[:5].tolist()}")
+                            response_first_hidden = hidden_states[prompt_length+1, :, :]
+                            print(f"[DEBUG Megatron response_first2] rank={rank}: prompt_length={prompt_length+1}, "
+                                  f"response_first_hidden.shape={response_first_hidden.shape}, "
+                                  f"sum={response_first_hidden.sum().item():.4f}, "
+                                  f"first 5={response_first_hidden.view(-1)[:5].tolist()}")
+                        else:
+                            print(f"[DEBUG Megatron] rank={rank}: prompt_length={prompt_length} >= local_seq_len={local_seq_len}")
+                else:
+                    print(f"[DEBUG Megatron] rank={rank}: loss_mask all zeros, cannot find prompt_length")
+            else:
+                print(f"[DEBUG Megatron] rank={rank}: loss_mask is None, cannot find prompt_length")
+        
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
         )

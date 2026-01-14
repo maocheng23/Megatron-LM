@@ -1029,9 +1029,100 @@ class Attention(MegatronModule, ABC):
         # =================
         # Output. [sq, b, h]
         # =================
+        # Debug logging for o_proj INPUT (before linear_proj, this is FA3 output after reshape)
+        import os
+        if os.environ.get('SLIME_DEBUG_LOGPROB_DIFF', '0') == '1':
+            import torch.distributed as dist
+            from megatron.core import parallel_state
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
+            if self.layer_number <= 1:
+                position = 91
+                # core_attn_out shape: [sq, b, hidden_size_per_partition]
+                # For batch=1, squeeze to get [hidden_size_per_partition]
+                core_pos = core_attn_out[position, 0, :] if core_attn_out.dim() == 3 else core_attn_out[position, :]
+                print(
+                    f"[DEBUG Megatron O_PROJ INPUT Layer {self.layer_number}] rank={rank}, tp_rank={tp_rank}, "
+                    f"position={position}, shape={core_pos.shape}, sum={core_pos.float().sum().item():.6f}, "
+                    f"first 5={core_pos.flatten()[:5].float().tolist()}",
+                    flush=True
+                )
+        
         nvtx_range_push(suffix="linear_proj")
         output, bias = self.linear_proj(core_attn_out)
         nvtx_range_pop(suffix="linear_proj")
+
+        # Debug logging for o_proj output
+        import os
+        if os.environ.get('SLIME_DEBUG_LOGPROB_DIFF', '0') == '1':
+            import torch.distributed as dist
+            from megatron.core import parallel_state
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
+            if self.layer_number <= 1:
+                position = 91
+                # output shape: [sq, b, hidden_size]
+                # For batch=1, squeeze to get [hidden_size]
+                output_pos = output[position, 0, :] if output.dim() == 3 else output[position, :]
+                print(
+                    f"[DEBUG Megatron O_PROJ OUTPUT AFTER all-reduce Layer {self.layer_number}] rank={rank}, tp_rank={tp_rank}, "
+                    f"position={position}, shape={output_pos.shape}, sum={output_pos.float().sum().item():.6f}, "
+                    f"first 5={output_pos.flatten()[:5].float().tolist()}",
+                    flush=True
+                )
+                
+                # Also compute and log the LOCAL result BEFORE all-reduce for comparison with SGLang
+                # This manually does the matmul without all-reduce
+                import torch
+                with torch.no_grad():
+                    # Get the weight from linear_proj
+                    weight = self.linear_proj.weight  # shape: [hidden_size, hidden_size_per_partition]
+                    
+                    # Log weight info for debugging
+                    print(
+                        f"[DEBUG Megatron O_PROJ WEIGHT Layer {self.layer_number}] rank={rank}, tp_rank={tp_rank}, "
+                        f"shape={weight.shape}, dtype={weight.dtype}, "
+                        f"sum={weight.float().sum().item():.6f}, "
+                        f"first 5={weight.flatten()[:5].float().tolist()}, "
+                        f"row0 first 5={weight[0, :5].float().tolist()}, "
+                        f"col0 first 5={weight[:5, 0].float().tolist()}",
+                        flush=True
+                    )
+                    
+                    # Log bias info if exists
+                    bias = getattr(self.linear_proj, 'bias', None)
+                    if bias is not None:
+                        print(
+                            f"[DEBUG Megatron O_PROJ BIAS Layer {self.layer_number}] rank={rank}, tp_rank={tp_rank}, "
+                            f"shape={bias.shape}, dtype={bias.dtype}, "
+                            f"sum={bias.float().sum().item():.6f}, "
+                            f"first 5={bias.flatten()[:5].float().tolist()}",
+                            flush=True
+                        )
+                    else:
+                        print(f"[DEBUG Megatron O_PROJ BIAS Layer {self.layer_number}] NO BIAS", flush=True)
+                    
+                    # core_attn_out shape: [sq, b, hidden_size_per_partition]
+                    # For position 91, get the input vector
+                    core_pos = core_attn_out[position, 0, :] if core_attn_out.dim() == 3 else core_attn_out[position, :]
+                    
+                    # Log input info
+                    print(
+                        f"[DEBUG Megatron O_PROJ MATMUL INPUT Layer {self.layer_number}] rank={rank}, tp_rank={tp_rank}, "
+                        f"input shape={core_pos.shape}, input dtype={core_pos.dtype}, "
+                        f"input sum={core_pos.float().sum().item():.6f}, "
+                        f"input first 5={core_pos.flatten()[:5].float().tolist()}",
+                        flush=True
+                    )
+                    
+                    # Manual matmul: output = input @ weight.T
+                    local_output = torch.matmul(core_pos.float(), weight.t().float())  # [hidden_size]
+                    print(
+                        f"[DEBUG Megatron O_PROJ OUTPUT BEFORE all-reduce Layer {self.layer_number}] rank={rank}, tp_rank={tp_rank}, "
+                        f"position={position}, shape={local_output.shape}, sum={local_output.float().sum().item():.6f}, "
+                        f"first 5={local_output.flatten()[:5].float().tolist()}",
+                        flush=True
+                    )
 
         return output, bias
 

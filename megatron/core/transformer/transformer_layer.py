@@ -644,6 +644,23 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     attention_output_with_bias, residual, self.hidden_dropout
                 )
         nvtx_range_pop(suffix="self_attn_bda")
+        
+        # Debug logging for after residual add (before MLP)
+        import os
+        if os.environ.get('SLIME_DEBUG_LOGPROB_DIFF', '0') == '1':
+            import torch.distributed as dist
+            from megatron.core import parallel_state
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
+            if self.layer_number <= 1:
+                position = 91
+                hs_pos = hidden_states[position, 0, :] if hidden_states.dim() == 3 else hidden_states[position, :]
+                print(
+                    f"[DEBUG Megatron Layer {self.layer_number} AFTER RESIDUAL ADD (before MLP layernorm)] rank={rank}, tp_rank={tp_rank}, "
+                    f"position={position}, shape={hs_pos.shape}, sum={hs_pos.float().sum().item():.6f}, "
+                    f"first 5={hs_pos.flatten()[:5].float().tolist()}",
+                    flush=True
+                )
 
         # Residual connection.
         residual = hidden_states
@@ -685,6 +702,23 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Residual connection.
         residual = hidden_states
 
+        # Debug logging for MLP input (after pre_mlp_layernorm)
+        import os
+        if os.environ.get('SLIME_DEBUG_LOGPROB_DIFF', '0') == '1':
+            import torch.distributed as dist
+            from megatron.core import parallel_state
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
+            if self.layer_number <= 1:
+                position = 91
+                mlp_in = residual[position, 0, :] if residual.dim() == 3 else residual[position, :]
+                print(
+                    f"[DEBUG Megatron Layer {self.layer_number} MLP residual INPUT] rank={rank}, tp_rank={tp_rank}, "
+                    f"position={position}, shape={mlp_in.shape}, sum={mlp_in.float().sum().item():.6f}, "
+                    f"first 5={mlp_in.flatten()[:5].float().tolist()}",
+                    flush=True
+                )
+                
         # Optional Layer norm post the cross-attention.
         if self.recompute_pre_mlp_layernorm:
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
@@ -693,6 +727,23 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
         else:
             pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
+
+        # Debug logging for MLP input (after pre_mlp_layernorm)
+        import os
+        if os.environ.get('SLIME_DEBUG_LOGPROB_DIFF', '0') == '1':
+            import torch.distributed as dist
+            from megatron.core import parallel_state
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
+            if self.layer_number <= 1:
+                position = 91
+                mlp_in = pre_mlp_layernorm_output[position, 0, :] if pre_mlp_layernorm_output.dim() == 3 else pre_mlp_layernorm_output[position, :]
+                print(
+                    f"[DEBUG Megatron Layer {self.layer_number} MLP INPUT (after pre_mlp_layernorm)] rank={rank}, tp_rank={tp_rank}, "
+                    f"position={position}, shape={mlp_in.shape}, sum={mlp_in.float().sum().item():.6f}, "
+                    f"first 5={mlp_in.flatten()[:5].float().tolist()}",
+                    flush=True
+                )
 
         nvtx_range_push(suffix="mlp")
         # Potentially chunk the MLP computation during prefill to minimize the peak activation size
@@ -747,6 +798,22 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         mlp_output, mlp_output_bias = mlp_output_with_bias
         mlp_output = self.post_mlp_layernorm(mlp_output)
         mlp_output_with_bias = (mlp_output, mlp_output_bias)
+
+        # Debug logging for MLP output (before final residual add)
+        import os
+        if os.environ.get('SLIME_DEBUG_LOGPROB_DIFF', '0') == '1':
+            import torch.distributed as dist
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
+            if self.layer_number <= 1:
+                position = 91
+                mlp_output_pos = mlp_output[position, :]
+                print(
+                    f"[DEBUG Megatron Layer {self.layer_number} MLP OUTPUT (before final residual)] rank={rank}, tp_rank={tp_rank}, "
+                    f"position={position}, shape={mlp_output_pos.shape}, sum={mlp_output_pos.float().sum().item():.6f}, "
+                    f"first 5={mlp_output_pos.flatten()[:5].float().tolist()}",
+                    flush=True
+                )
 
         if self.recompute_pre_mlp_layernorm:
             # discard the output of the pre-mlp layernorm and register the recompute
@@ -813,6 +880,22 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         output = make_viewless_tensor(
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
+
+        # Debug logging for final layer output (after MLP + residual)
+        import os
+        if os.environ.get('SLIME_DEBUG_LOGPROB_DIFF', '0') == '1':
+            import torch.distributed as dist
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
+            if self.layer_number <= 1:
+                position = 91
+                output_pos = output[position, :]
+                print(
+                    f"[DEBUG Megatron Layer {self.layer_number} FINAL OUTPUT] rank={rank}, tp_rank={tp_rank}, "
+                    f"position={position}, shape={output_pos.shape}, sum={output_pos.float().sum().item():.6f}, "
+                    f"first 5={output_pos.flatten()[:5].float().tolist()}",
+                    flush=True
+                )
 
         return output
 

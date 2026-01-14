@@ -252,6 +252,7 @@ class SGLangLinear(MegatronModule):
         layer_number: Optional[int] = None,
         is_expert: bool = False,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        stride: int = 1,
     ):
         super().__init__(config=config)
 
@@ -262,6 +263,7 @@ class SGLangLinear(MegatronModule):
         self.is_expert = is_expert
         self.skip_bias_add = skip_bias_add
         self.layer_number = layer_number
+        self.stride = stride
 
         # Determine device and dtype
         if config.init_model_with_meta_device:
@@ -295,6 +297,19 @@ class SGLangLinear(MegatronModule):
             )
             if config.perform_initialization and device != 'meta':
                 init_method(self.weight)
+            
+            # Set TP attributes for weight update/checkpoint compatibility
+            # NOTE: partition_stride tracks stride-based sharding so TP weight
+            # reconstruction can restore GLU gate/up layout when stride > 1.
+            partition_stride = stride if parallel_mode in ("column", "row") and self.tp_size > 1 else 1
+            if parallel_mode in ("column", "row") and self.tp_size > 1:
+                setattr(self.weight, 'tensor_model_parallel', True)
+                setattr(self.weight, 'partition_dim', 0 if parallel_mode == "column" else 1)
+                setattr(self.weight, 'partition_stride', partition_stride)
+            else:
+                setattr(self.weight, 'tensor_model_parallel', False)
+                setattr(self.weight, 'partition_dim', -1)
+                setattr(self.weight, 'partition_stride', 1)
         else:
             self.register_parameter('weight', None)
 
@@ -303,6 +318,15 @@ class SGLangLinear(MegatronModule):
             self.bias = nn.Parameter(
                 torch.zeros(local_output_size, dtype=dtype, device=device)
             )
+            # Set TP attributes for bias (column parallel has sharded bias)
+            if parallel_mode == "column" and self.tp_size > 1:
+                setattr(self.bias, 'tensor_model_parallel', True)
+                setattr(self.bias, 'partition_dim', 0)
+                setattr(self.bias, 'partition_stride', partition_stride)
+            else:
+                setattr(self.bias, 'tensor_model_parallel', False)
+                setattr(self.bias, 'partition_dim', -1)
+                setattr(self.bias, 'partition_stride', 1)
         else:
             self.register_parameter('bias', None)
 
@@ -313,11 +337,17 @@ class SGLangLinear(MegatronModule):
             else:
                 self.weight.allreduce = True
 
+    _linear_debug_count = 0  # Class-level counter
+    
     def forward(self, x: Tensor) -> Tuple[Tensor, Optional[Tensor]]:
         """Forward pass using batch-invariant operations.
         
         Uses explicit BF16 casting to match SGLang's FSDP-compatible numerical paths.
         """
+        import os
+        debug_enabled = os.environ.get('SLIME_DEBUG_LOGPROB_DIFF', '0') == '1'
+        SGLangLinear._linear_debug_count += 1
+        
         # Cast to BF16 to match SGLang's FSDP-compatible paths
         # In SGLang's logits_processor: torch.matmul(hidden_states.bfloat16(), weight.T.bfloat16())
         x = x.to(torch.bfloat16)
@@ -325,6 +355,41 @@ class SGLangLinear(MegatronModule):
         # Reshape for matrix multiplication
         orig_shape = x.shape
         x = x.view(-1, self.input_size if self.parallel_mode != "row" else x.shape[-1])
+        
+        # Debug: compare with F.linear
+        if debug_enabled and SGLangLinear._linear_debug_count <= 4:
+            import torch.distributed as dist
+            import torch.nn.functional as F
+            from megatron.core import parallel_state
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            tp_rank = parallel_state.get_tensor_model_parallel_rank()
+            position = 91 if x.shape[0] > 91 else 0
+            
+            # Compare torch.mm vs F.linear
+            weight_bf16 = self.weight.to(torch.bfloat16)
+            mm_output = torch.mm(x, weight_bf16.t())
+            flinear_output = F.linear(x, weight_bf16, None)
+            
+            print(
+                f"[DEBUG Megatron SGLangLinear #{SGLangLinear._linear_debug_count}] "
+                f"rank={rank}, tp_rank={tp_rank}, parallel_mode={self.parallel_mode}, "
+                f"orig_shape={orig_shape}, reshaped_shape={x.shape}, "
+                f"input_pos91_sum={x[position].float().sum().item():.6f}, "
+                f"input_pos91_first5={x[position, :5].float().tolist()}",
+                f"[DEBUG Megatron SGLangLinear #{SGLangLinear._linear_debug_count}] "
+                f"weight_shape={weight_bf16.shape}, "
+                f"weight_sum={weight_bf16.float().sum().item():.6f}, "
+                f"first 5 weights={weight_bf16[0, :5].float().tolist()}, ",
+                f"second 5 weights={weight_bf16[1, :5].float().tolist()}, "
+                f"second last 5 weights={weight_bf16[-2, :5].float().tolist()}, "
+                f"last 5 weights={weight_bf16[-1, :5].float().tolist()}, "
+                f"[DEBUG Megatron SGLangLinear #{SGLangLinear._linear_debug_count}] "
+                f"mm_output_pos91_sum={mm_output[position].float().sum().item():.6f}, "
+                f"flinear_output_pos91_sum={flinear_output[position].float().sum().item():.6f}, "
+                f"mm_first5={mm_output[position, :5].float().tolist()}, "
+                f"flinear_first5={flinear_output[position, :5].float().tolist()}",
+                flush=True
+            )
 
         # Use batch-invariant GEMM with BF16 weight
         weight_bf16 = self.weight.to(torch.bfloat16)
@@ -394,6 +459,7 @@ class SGLangColumnParallelLinear(SGLangLinear):
             tp_comm_buffer_name=tp_comm_buffer_name,
             layer_number=layer_number,
             tp_group=tp_group,
+            stride=stride,
         )
 
         self.stride = stride
@@ -412,6 +478,9 @@ class SGLangRowParallelLinear(SGLangLinear):
 
     Equivalent to KitchenRowParallelLinear.
     Splits input dimension across TP ranks.
+    
+    IMPORTANT: Row parallel linear requires all_reduce after GEMM to combine
+    partial results from all TP ranks.
     """
 
     def __init__(
@@ -447,6 +516,61 @@ class SGLangRowParallelLinear(SGLangLinear):
             layer_number=layer_number,
             tp_group=tp_group,
         )
+
+    _debug_count = 0  # Class-level counter
+    
+    def forward(self, x: Tensor) -> Tuple[Tensor, Optional[Tensor]]:
+        """Forward pass with all_reduce for row parallelism.
+        
+        Row parallel linear splits the input along the last dimension.
+        Each rank computes a partial result, then all_reduce combines them.
+        """
+        import os
+        
+        # Call parent's forward to get partial result
+        output_before, bias = super().forward(x)
+        
+        # CRITICAL: all_reduce to combine partial results from all TP ranks
+        # Without this, each rank only has its partial computation
+        if self.tp_size > 1 and self.tp_group is not None:
+            from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
+            
+            # DEBUG: Detailed logging for all_reduce
+            if os.environ.get('SLIME_DEBUG_LOGPROB_DIFF', '0') == '1':
+                SGLangRowParallelLinear._debug_count += 1
+                if SGLangRowParallelLinear._debug_count <= 10:
+                    import torch.distributed as dist
+                    from megatron.core import parallel_state
+                    rank = dist.get_rank() if dist.is_initialized() else 0
+                    tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
+                    actual_group_size = self.tp_group.size() if hasattr(self.tp_group, 'size') else 'unknown'
+                    position = 91 if output_before.shape[0] > 91 else 0
+                    out_pos = output_before[position, 0, :] if output_before.dim() == 3 else output_before[position, :]
+                    print(
+                        f"[DEBUG Megatron RowParallel all_reduce #{SGLangRowParallelLinear._debug_count}] "
+                        f"rank={rank}, tp_rank={tp_rank}, tp_size={self.tp_size}, group_size={actual_group_size}, "
+                        f"layer_num={self.layer_number}, input_size={self.input_size}, output_size={self.output_size}, "
+                        f"BEFORE: position={position}, sum={out_pos.float().sum().item():.6f}, "
+                        f"first 5={out_pos.flatten()[:5].float().tolist()}",
+                        flush=True
+                    )
+            
+            output = reduce_from_tensor_model_parallel_region(output_before, group=self.tp_group)
+            
+            # DEBUG: Log after all_reduce
+            if os.environ.get('SLIME_DEBUG_LOGPROB_DIFF', '0') == '1':
+                if SGLangRowParallelLinear._debug_count <= 10:
+                    out_pos_after = output[position, 0, :] if output.dim() == 3 else output[position, :]
+                    print(
+                        f"[DEBUG Megatron RowParallel all_reduce #{SGLangRowParallelLinear._debug_count}] "
+                        f"AFTER: position={position}, sum={out_pos_after.float().sum().item():.6f}, "
+                        f"first 5={out_pos_after.flatten()[:5].float().tolist()}",
+                        flush=True
+                    )
+        else:
+            output = output_before
+        
+        return output, bias
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 1, bias not sharded."""
@@ -531,12 +655,33 @@ class SGLangGroupedLinear(MegatronModule):
             for weight in self.weights:
                 init_method(weight)
 
+        # Set TP attributes for weights (for weight update/checkpoint compatibility)
+        for weight in self.weights:
+            if self.explicit_expert_comm and self.tp_size > 1:
+                setattr(weight, 'tensor_model_parallel', True)
+                setattr(weight, 'partition_dim', 0 if parallel_mode == "column" else 1)
+                setattr(weight, 'partition_stride', 1)
+            else:
+                setattr(weight, 'tensor_model_parallel', False)
+                setattr(weight, 'partition_dim', -1)
+                setattr(weight, 'partition_stride', 1)
+
         # Initialize biases
         if bias and not skip_bias_add:
             self.biases = nn.ParameterList([
                 nn.Parameter(torch.zeros(local_output_size, dtype=dtype, device=device))
                 for _ in range(num_gemms)
             ])
+            # Set TP attributes for biases
+            for bias_param in self.biases:
+                if self.explicit_expert_comm and parallel_mode == "column" and self.tp_size > 1:
+                    setattr(bias_param, 'tensor_model_parallel', True)
+                    setattr(bias_param, 'partition_dim', 0)
+                    setattr(bias_param, 'partition_stride', 1)
+                else:
+                    setattr(bias_param, 'tensor_model_parallel', False)
+                    setattr(bias_param, 'partition_dim', -1)
+                    setattr(bias_param, 'partition_stride', 1)
         else:
             self.biases = None
 
@@ -649,7 +794,11 @@ class SGLangColumnParallelGroupedLinear(SGLangGroupedLinear):
 
 
 class SGLangRowParallelGroupedLinear(SGLangGroupedLinear):
-    """Row-parallel grouped linear for MoE."""
+    """Row-parallel grouped linear for MoE.
+    
+    IMPORTANT: Row parallel grouped linear requires all_reduce after GEMM
+    to combine partial results from all TP ranks (when not using expert parallel).
+    """
 
     def __init__(
         self,
@@ -680,6 +829,23 @@ class SGLangRowParallelGroupedLinear(SGLangGroupedLinear):
             layer_number=layer_number,
             tp_group=tp_group,
         )
+
+    def forward(self, x: Tensor, m_splits: List[int]) -> Tuple[Tensor, Optional[Tensor]]:
+        """Forward pass with all_reduce for row parallelism.
+        
+        Row parallel grouped linear splits the input along the last dimension.
+        Each rank computes a partial result, then all_reduce combines them.
+        """
+        # Call parent's forward to get partial result
+        output, bias = super().forward(x, m_splits)
+        
+        # CRITICAL: all_reduce to combine partial results from all TP ranks
+        # Skip if using explicit expert comm (EP handles communication differently)
+        if self.tp_size > 1 and self.tp_group is not None and not self.explicit_expert_comm:
+            from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
+            output = reduce_from_tensor_model_parallel_region(output, group=self.tp_group)
+        
+        return output, bias
 
 
 # =============================================================================
@@ -965,9 +1131,72 @@ class SGLangLayerNormColumnParallelLinear(MegatronModule):
         """TE-compatible property for layer norm bias."""
         return getattr(self.norm, 'bias', None)
 
+    _fused_debug_count = 0  # Class-level counter for debug logging
+    
     def forward(self, x: Tensor) -> Tuple[Tensor, Optional[Tensor]]:
+        # Debug logging for fused layernorm+linear input/output
+        import os
+        if os.environ.get('SLIME_DEBUG_LOGPROB_DIFF', '0') == '1':
+            SGLangLayerNormColumnParallelLinear._fused_debug_count += 1
+            if SGLangLayerNormColumnParallelLinear._fused_debug_count <= 2:
+                import torch.distributed as dist
+                from megatron.core import parallel_state
+                rank = dist.get_rank() if dist.is_initialized() else 0
+                tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
+                tp_size = parallel_state.get_tensor_model_parallel_world_size() if parallel_state.is_initialized() else 1
+                position = 91 if x.shape[0] > 91 else 0
+                x_pos = x[position, 0, :] if x.dim() == 3 else x[position, :]
+                print(
+                    f"[DEBUG Megatron FusedLN+Linear #{SGLangLayerNormColumnParallelLinear._fused_debug_count} INPUT] "
+                    f"rank={rank}, tp_rank={tp_rank}, tp_size={tp_size}, "
+                    f"position={position}, shape={x_pos.shape}, sum={x_pos.float().sum().item():.6f}, "
+                    f"first 5={x_pos.flatten()[:5].float().tolist()}",
+                    flush=True
+                )
+        
         normed = self.norm(x)
-        return self.linear(normed)
+        
+        # Debug logging after layernorm
+        if os.environ.get('SLIME_DEBUG_LOGPROB_DIFF', '0') == '1':
+            if SGLangLayerNormColumnParallelLinear._fused_debug_count <= 2:
+                position = 91 if normed.shape[0] > 91 else 0
+                normed_pos = normed[position, 0, :] if normed.dim() == 3 else normed[position, :]
+                print(
+                    f"[DEBUG Megatron FusedLN+Linear #{SGLangLayerNormColumnParallelLinear._fused_debug_count} AFTER NORM] "
+                    f"rank={rank}, tp_rank={tp_rank}, "
+                    f"position={position}, shape={normed_pos.shape}, sum={normed_pos.float().sum().item():.6f}, "
+                    f"first 5={normed_pos.flatten()[:5].float().tolist()}",
+                    flush=True
+                )
+        # Debug: compare weight with SGLang
+        # Only log for count <= 2 (first 2 layers)
+        if os.environ.get('SLIME_DEBUG_LOGPROB_DIFF', '0') == '1':
+            if SGLangLayerNormColumnParallelLinear._fused_debug_count <= 2:
+                w = self.linear.weight
+                layer_num = getattr(self.linear, 'layer_number', 'N/A')
+                print(
+                    f"[DEBUG Megatron FC1 WEIGHT] "
+                    f"layer={layer_num}, call_idx={SGLangLayerNormColumnParallelLinear._fused_debug_count}, "
+                    f"rank={rank}, tp_rank={tp_rank}, "
+                    f"weight_shape={w.shape}, stride={getattr(self.linear, 'stride', 'N/A')}, "
+                    f"weight_sum={w.float().sum().item():.6f}, "
+                    f"weight_first_row_first5={w[0, :5].float().tolist()}, "
+                    f"weight_last_row_first5={w[-1, :5].float().tolist()}",
+                    flush=True
+                )
+        
+        linear_output, _ = self.linear(normed)
+        if os.environ.get('SLIME_DEBUG_LOGPROB_DIFF', '0') == '1':
+            if SGLangLayerNormColumnParallelLinear._fused_debug_count <= 2:
+                linear_output_pos = linear_output[position, 0, :] if linear_output.dim() == 3 else linear_output[position, :]
+                print(
+                    f"[DEBUG Megatron FusedLN+Linear #{SGLangLayerNormColumnParallelLinear._fused_debug_count} AFTER LINEAR] "
+                    f"rank={rank}, tp_rank={tp_rank}, "
+                    f"position={position}, shape={linear_output_pos.shape}, sum={linear_output_pos.float().sum().item():.6f}, "
+                    f"first 5={linear_output_pos.flatten()[:5].float().tolist()}",
+                    flush=True
+                )
+        return linear_output, None
 
     def state_dict(self, *args, prefix="", keep_vars=False, **kwargs):
         """State dict with TE-compatible key names for checkpoint compatibility."""
@@ -1290,6 +1519,24 @@ class SGLangFlashAttention(MegatronModule):
         assert attn_mask_type is None or attn_mask_type == AttnMaskType.causal, \
             "Only causal mask is supported for SGLangFlashAttention"
 
+        # Debug logging for attention INPUT (Q, K, V)
+        import os
+        if os.environ.get('SLIME_DEBUG_LOGPROB_DIFF', '0') == '1':
+            import torch.distributed as dist
+            from megatron.core import parallel_state
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
+            # Log all layer numbers for debugging
+            print(f"[DEBUG] SGLangFlashAttention forward called for layer_number={self.layer_number}, rank={rank}", flush=True)
+            if self.layer_number <= 2 or self.layer_number == self.config.num_layers:
+                print(
+                    f"[DEBUG Megatron SGLangFlashAttention Layer {self.layer_number} INPUT] rank={rank}, tp_rank={tp_rank}, \n"
+                    f" position 91: Q shape={query[91,:, :].shape}, Q sum={query[91, :, :].float().sum().item():.6f}, Q first 5={query[91, :, :].flatten().float().tolist()[:5]} \n"
+                    f"position 91: K shape={key[91,:, :].shape}, K sum={key[91, :, :].float().sum().item():.6f}, K first 5={key[91, :, :].flatten().float().tolist()[:5]} \n"
+                    f"position 91: V shape={value[91,:, :].shape}, V sum={value[91, :, :].float().sum().item():.6f}, V first 5={value[91, :, :].flatten().float().tolist()[:5]}",
+                    flush=True
+                )
+
         # Check if using packed sequences (THD format)
         is_packed = packed_seq_params is not None
 
@@ -1406,6 +1653,22 @@ class SGLangFlashAttention(MegatronModule):
             # flash_attn_varlen_func returns output directly (or tuple if return_attn_probs=True)
             if isinstance(output, tuple):
                 output = output[0]
+            
+            # Debug logging for raw FA3 output (before reshape)
+            if os.environ.get('SLIME_DEBUG_LOGPROB_DIFF', '0') == '1':
+                import torch.distributed as dist
+                from megatron.core import parallel_state
+                rank = dist.get_rank() if dist.is_initialized() else 0
+                tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
+                postion = 91
+                output_temp = output[postion, :]
+                if self.layer_number <= 1 or self.layer_number == self.config.num_layers:
+                    print(
+                        f"[DEBUG Megatron FA3 RAW OUTPUT Layer {self.layer_number}] rank={rank}, tp_rank={tp_rank}, "
+                        f"shape={output_temp.shape}, sum={output_temp.float().sum().item():.6f}, "
+                        f"first 5={output_temp.flatten()[:5].float().tolist()}",
+                        flush=True
+                    )
         else:
             # Fallback to _flash_attn_forward (WARNING: no backward support!)
             _print_sglang_log(
@@ -1463,6 +1726,32 @@ class SGLangFlashAttention(MegatronModule):
             output = output.view(b, sq, np, hn)  # [b, sq, np, hn]
             output = output.transpose(0, 1)      # [sq, b, np, hn]
             output = output.reshape(sq, b, self.hidden_size_per_partition)
+
+        # Debug logging for FA3 attention output
+        import os
+        if os.environ.get('SLIME_DEBUG_LOGPROB_DIFF', '0') == '1':
+            import torch.distributed as dist
+            from megatron.core import parallel_state
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
+            # Log first layer FA3 attention output
+            postion = 91
+            output_temp = output[postion, :]
+            if self.layer_number <= 2 or self.layer_number == self.config.num_layers:
+                print(
+                    f"[DEBUG Megatron SGLangFlashAttention Layer {self.layer_number} Output] rank={rank}, tp_rank={tp_rank}, "
+                    f"shape={output_temp.shape}, sum={output_temp.float().sum().item():.6f}, "
+                    f"first 5={output_temp.flatten()[:5].float().tolist()}",
+                    flush=True
+                )
+            # Log last layer FA3 attention output
+            if hasattr(self.config, 'num_layers') and self.layer_number == self.config.num_layers:
+                print(
+                    f"[DEBUG Megatron SGLangFlashAttention Layer {self.layer_number} (Last) Output] rank={rank}, tp_rank={tp_rank}, "
+                    f"shape={output_temp.shape}, sum={output_temp.float().sum().item():.6f}, "
+                    f"first 5={output_temp.flatten()[:5].float().tolist()}",
+                    flush=True
+                )
 
         return output
 
