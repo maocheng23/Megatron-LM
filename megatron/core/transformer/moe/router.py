@@ -605,7 +605,7 @@ class TopKRouter(Router):
                 "SGLang router not available, falling back to deterministic PyTorch implementation. "
                 "Install SGLang for optimal performance: pip install sglang"
             )
-        
+
         # Reshape input: [seq_len, batch_size, hidden_dim] -> [num_tokens, hidden_dim]
         original_shape = input.shape
         if len(original_shape) == 3:
@@ -613,11 +613,11 @@ class TopKRouter(Router):
             input_2d = input.view(-1, hidden_dim)
         else:
             input_2d = input
-        
+
         # Move router weight to same device if needed
         if self.weight.device.type == 'cpu':
             self.weight.data = self.weight.data.to(device=input.device)
-        
+
         # Call SGLang's fused router (or fallback)
         # This matches SGLang's FusedMoeRouter.forward_cuda() exactly
         topk_weights, topk_ids = fused_moe_router_deterministic(
@@ -627,7 +627,25 @@ class TopKRouter(Router):
             moe_softcapping=self.config.moe_softcapping,
             correction_bias=self.expert_bias,  # SGLang calls this correction_bias
         )
-        
+
+        # === DEBUG: Router intermediate results ===
+        if os.environ.get("SLIME_DEBUG_LOGPROB_DIFF", "0") == "1":
+            import torch.distributed as dist
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            # Recompute logits for debugging (fused kernel doesn't output intermediate)
+            logits_debug = input_2d.float() @ self.weight.float().t()
+            if self.config.moe_softcapping != 0:
+                logits_debug = torch.tanh(logits_debug / self.config.moe_softcapping) * self.config.moe_softcapping
+            print(f"[Megatron Router][Rank {rank}][Layer {getattr(self, 'layer_number', '?')}] "
+                  f"input shape: {input_2d.shape}, weight shape: {self.weight.shape}")
+            print(f"[Megatron Router][Rank {rank}][Layer {getattr(self, 'layer_number', '?')}] "
+                  f"logits[:2,:8]:\n{logits_debug[:2, :8]}")
+            print(f"[Megatron Router][Rank {rank}][Layer {getattr(self, 'layer_number', '?')}] "
+                  f"topk_ids[:4]: {topk_ids[:4].tolist()}")
+            print(f"[Megatron Router][Rank {rank}][Layer {getattr(self, 'layer_number', '?')}] "
+                  f"topk_weights[:4]: {topk_weights[:4].tolist()}")
+        # === END DEBUG ===
+
         # Convert SGLang format (topk_weights, topk_ids) to Megatron format (probs, routing_map)
         probs, routing_map = convert_topk_to_megatron_format(
             topk_weights,
@@ -635,10 +653,10 @@ class TopKRouter(Router):
             num_experts=self.config.num_moe_experts,
             dtype=input.dtype,
         )
-        
+
         # Apply expert bias tracking (for load balancing)
         self._apply_expert_bias(routing_map)
-        
+
         return probs, routing_map
 
     def _load_from_state_dict(self, *args, **kwargs):
