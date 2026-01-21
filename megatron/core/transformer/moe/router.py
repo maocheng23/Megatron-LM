@@ -619,6 +619,7 @@ class TopKRouter(Router):
     
     def _sglang_router_forward(self, input: torch.Tensor):
         # Ensure router is available
+        logger.info("Using SGLang router forward")
         if not is_sglang_router_available() and input.is_cuda:
             import warnings
             warnings.warn(
