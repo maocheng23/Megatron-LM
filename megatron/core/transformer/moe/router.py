@@ -65,6 +65,13 @@ class Router(ABC, MegatronModule):
         super().__init__(config)
         self.config = config
         self.num_experts = self.config.num_moe_experts
+
+        # DEBUG: Print use_sglang_router config at init (only once per process)
+        import os
+        if os.environ.get("SLIME_DEBUG_ROUTER", "0") == "1":
+            if not hasattr(Router, '_init_debug_printed'):
+                Router._init_debug_printed = True
+                print(f"[Router.__init__] use_sglang_router = {config.use_sglang_router}", flush=True)
         self.moe_aux_loss_func = None
         self.layer_number = None
         self.tp_group = pg_collection.tp
@@ -600,7 +607,14 @@ class TopKRouter(Router):
 
         # Apply input jitter
         input = self.apply_input_jitter(input)
-        
+
+        # DEBUG: Check if use_sglang_router is set (only print once per layer)
+        import os
+        if os.environ.get("SLIME_DEBUG_ROUTER", "0") == "1":
+            if not hasattr(self, '_debug_printed'):
+                self._debug_printed = True
+                print(f"[Router.forward] use_sglang_router = {self.config.use_sglang_router}", flush=True)
+
         # Option 1: Use SGLang's fused router directly (GEMM + Softcap + TopK in one kernel)
         # This provides bit-exact same results as SGLang inference
         if self.config.use_sglang_router:
@@ -619,6 +633,7 @@ class TopKRouter(Router):
     
     def _sglang_router_forward(self, input: torch.Tensor):
         # Ensure router is available
+        raise Exception("Using SGLang router forward")
         print("Using SGLang router forward")
         if not is_sglang_router_available() and input.is_cuda:
             import warnings

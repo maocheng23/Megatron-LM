@@ -360,14 +360,14 @@ class MoELayer(BaseMoELayer):
 
         # Get routing (this also stores topk_weights and topk_ids in router)
         
-        logger.info("MOElayer _sglang_forward router forward")
+        print("MOElayer _sglang_forward router forward")
         probs, routing_map = self.route(hidden_states)
 
         # Get topk values from router (stored during _sglang_router_forward)
         topk_weights = self.router._sglang_topk_weights
         topk_ids = self.router._sglang_topk_ids
-        logger.info("MOElayer _sglang_forward topk_weights: %s", topk_weights.shape)
-        logger.info("MOElayer _sglang_forward topk_ids: %s", topk_ids.shape)
+        print("MOElayer _sglang_forward topk_weights: %s", topk_weights.shape)
+        print("MOElayer _sglang_forward topk_ids: %s", topk_ids.shape)
         # IMPORTANT: Convert topk_weights to hidden_states dtype to match SGLang
         # SGLang does: routing_weights = routing_weights.to(hidden_states.dtype)
         # before passing to FusedMoE experts
