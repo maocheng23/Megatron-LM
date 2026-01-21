@@ -692,26 +692,26 @@ class TopKRouter(Router):
             import torch.distributed as dist
             rank = dist.get_rank() if dist.is_initialized() else 0
             layer_id = getattr(self, 'layer_number', '?')
-
-            print(
-                f"[Megatron Router][Rank {rank}][Layer {layer_id}] "
-                f"Shapes: input={input_2d.shape}, "
-                f"weight={self.weight.shape}, "
-                f"router_logits={router_logits.shape}, "
-                f"topk_weights={topk_weights.shape}"
-                f"[Megatron Router][Rank {rank}][Layer {layer_id}] "
-                f"Input sample: {input_2d[:2, :5].tolist()}"
-                f"[Megatron Router][Rank {rank}][Layer {layer_id}] "
-                f"Router logits sample: {router_logits[:2, :5].tolist()}"
-                f"[Megatron Router][Rank {rank}][Layer {layer_id}] "
-                f"Routing weights sample: "
-                f"{routing_weights[:2, :].tolist()}"
-                f"[Megatron Router][Rank {rank}][Layer {layer_id}] "
-                f"Selected experts sample: "
-                f"{selected_experts[:2, :].tolist()}"
-                f"[Megatron Router][Rank {rank}][Layer {layer_id}] "
-                f"TopK weights sample: {topk_weights[:2, :].tolist()}"
-            )
+            if layer_id == 1:
+                pos = 91
+                prefix = f"[Megatron Router][Rank {rank}][Layer {layer_id}]"
+                print(f"{prefix} Shapes: "
+                      f"input={input_2d.shape}, "
+                      f"weight={self.weight.shape}, "
+                      f"router_logits={router_logits.shape}, "
+                      f"topk_weights={topk_weights.shape}\n"
+                      f"{prefix} Weight sample [:,:5]: "
+                      f"{self.weight[:2, :5].tolist()}\n"
+                      f"{prefix} Input[{pos},:5]: "
+                      f"{input_2d[pos, :5].tolist()}\n"
+                      f"{prefix} Router logits[{pos},:5]: "
+                      f"{router_logits[pos, :5].tolist()}\n"
+                      f"{prefix} Routing weights[{pos},:] (after softmax+topk+renorm): "
+                      f"{routing_weights[pos, :].tolist()}\n"
+                      f"{prefix} Selected experts[{pos},:]: "
+                      f"{selected_experts[pos, :].tolist()}\n"
+                      f"{prefix} TopK weights[{pos},:]: "
+                      f"{topk_weights[pos, :].tolist()}")
         # === END DEBUG ===
 
         # Convert SGLang format (topk_weights, topk_ids) to Megatron format (probs, routing_map)
