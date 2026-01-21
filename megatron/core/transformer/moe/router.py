@@ -659,14 +659,14 @@ class TopKRouter(Router):
         router_logits = self.gating(input_2d)
 
         # Apply softcapping if needed (before softmax)
-        if self.config.moe_softcapping != 0:
-            router_logits = torch.tanh(
-                router_logits / self.config.moe_softcapping
-            ) * self.config.moe_softcapping
+        # if self.config.moe_softcapping != 0:
+        #     router_logits = torch.tanh(
+        #         router_logits / self.config.moe_softcapping
+        #     ) * self.config.moe_softcapping
 
         # Apply correction bias if provided
-        if self.expert_bias is not None:
-            router_logits = router_logits + self.expert_bias.float()
+        # if self.expert_bias is not None:
+        #     router_logits = router_logits + self.expert_bias.float()
 
         # Apply softmax, topk, and renormalize
         # (matching qwen3_moe.py:296-302)
@@ -705,7 +705,7 @@ class TopKRouter(Router):
                       f"{prefix} Input[{pos},:5]: "
                       f"{input_2d[pos, :5].tolist()}, input2d dtype: {input_2d.dtype}\n"
                       f"{prefix} Router logits[{pos},:5]: "
-                      f"{router_logits[pos, :5].tolist()}\n"
+                      f"{router_logits[pos, :5].tolist()}, router_logits dtype: {router_logits.dtype}\n"
                       f"{prefix} Routing weights[{pos},:] (after softmax+topk+renorm): "
                       f"{routing_weights[pos, :].tolist()}, routing_weights dtype: {routing_weights.dtype}\n"
                       f"{prefix} Selected experts[{pos},:]: "
