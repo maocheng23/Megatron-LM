@@ -654,19 +654,17 @@ class TopKRouter(Router):
             self.weight.data = self.weight.data.to(device=input.device)
 
         # Use the same routing logic as qwen3_moe.py
-        # (matching qwen3_moe.py:296-302)
+        # (matching qwen3_moe.py:295)
+        #
+        # SGLang's ReplicatedLinear does: output = x @ weight.T (+ bias)
+        # in the input's native dtype (bf16/fp16), NOT converted to fp32.
+        #
+        # IMPORTANT: We bypass self.gating() here because it may convert
+        # to fp32 based on moe_router_dtype config, which differs from SGLang.
         # router_logits: (num_tokens, n_experts)
-        router_logits = self.gating(input_2d)
-
-        # Apply softcapping if needed (before softmax)
-        # if self.config.moe_softcapping != 0:
-        #     router_logits = torch.tanh(
-        #         router_logits / self.config.moe_softcapping
-        #     ) * self.config.moe_softcapping
-
-        # Apply correction bias if provided
-        # if self.expert_bias is not None:
-        #     router_logits = router_logits + self.expert_bias.float()
+        router_logits = torch.mm(input_2d, self.weight.t())
+        if self.bias is not None:
+            router_logits = router_logits + self.bias
 
         # Apply softmax, topk, and renormalize
         # (matching qwen3_moe.py:296-302)
