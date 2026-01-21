@@ -619,7 +619,7 @@ class TopKRouter(Router):
     
     def _sglang_router_forward(self, input: torch.Tensor):
         # Ensure router is available
-        logger.info("Using SGLang router forward")
+        print("Using SGLang router forward")
         if not is_sglang_router_available() and input.is_cuda:
             import warnings
             warnings.warn(
@@ -679,32 +679,22 @@ class TopKRouter(Router):
             rank = dist.get_rank() if dist.is_initialized() else 0
             layer_id = getattr(self, 'layer_number', '?')
 
-            logger.info(
+            print(
                 f"[Megatron Router][Rank {rank}][Layer {layer_id}] "
                 f"Shapes: input={input_2d.shape}, "
                 f"weight={self.weight.shape}, "
                 f"router_logits={router_logits.shape}, "
                 f"topk_weights={topk_weights.shape}"
-            )
-            logger.info(
                 f"[Megatron Router][Rank {rank}][Layer {layer_id}] "
                 f"Input sample: {input_2d[:2, :5].tolist()}"
-            )
-            logger.info(
                 f"[Megatron Router][Rank {rank}][Layer {layer_id}] "
                 f"Router logits sample: {router_logits[:2, :5].tolist()}"
-            )
-            logger.info(
                 f"[Megatron Router][Rank {rank}][Layer {layer_id}] "
                 f"Routing weights sample: "
                 f"{routing_weights[:2, :].tolist()}"
-            )
-            logger.info(
                 f"[Megatron Router][Rank {rank}][Layer {layer_id}] "
                 f"Selected experts sample: "
                 f"{selected_experts[:2, :].tolist()}"
-            )
-            logger.info(
                 f"[Megatron Router][Rank {rank}][Layer {layer_id}] "
                 f"TopK weights sample: {topk_weights[:2, :].tolist()}"
             )
