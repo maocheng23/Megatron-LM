@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 
 from megatron.core.jit import jit_fuser
 from megatron.core.tensor_parallel import reduce_from_tensor_model_parallel_region
@@ -22,7 +23,6 @@ from megatron.core.transformer.moe.moe_utils import (
     z_loss_func,
 )
 from megatron.core.transformer.moe.deterministic_router import (
-    fused_moe_router_deterministic,
     convert_topk_to_megatron_format,
     is_sglang_router_available,
 )
@@ -34,6 +34,21 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 
 import logging
 logger = logging.getLogger(__name__)
+
+# Try to import get_global_server_args for rl_on_policy_target check
+try:
+    from sglang.srt.server_args import get_global_server_args
+    HAVE_SGLANG_SERVER_ARGS = True
+except ImportError:
+    HAVE_SGLANG_SERVER_ARGS = False
+
+    def get_global_server_args():
+        # Return a mock object if SGLang is not available
+        class MockServerArgs:
+            rl_on_policy_target = None
+        return MockServerArgs()
+
+
 class Router(ABC, MegatronModule):
     """Base Router class"""
 
@@ -623,20 +638,34 @@ class TopKRouter(Router):
         if self.weight.device.type == 'cpu':
             self.weight.data = self.weight.data.to(device=input.device)
 
-        # Get true on-policy config (model-specific or default)
-        true_on_policy_config = self._get_true_on_policy_config()
+        # Use the same routing logic as qwen3_moe.py
+        # (matching qwen3_moe.py:296-302)
+        # router_logits: (num_tokens, n_experts)
+        router_logits = self.gating(input_2d)
 
-        # Call SGLang's router with model-specific config
-        # This matches SGLang's exact routing flow for the specified model
-        topk_weights, topk_ids = fused_moe_router_deterministic(
-            hidden_states=input_2d,
-            router_weight=self.weight,
-            topk=self.topk,
-            moe_softcapping=self.config.moe_softcapping,
-            correction_bias=self.expert_bias,  # SGLang calls this correction_bias
-            config=true_on_policy_config,
-            layer_id=getattr(self, 'layer_number', None),
+        # Apply softcapping if needed (before softmax)
+        if self.config.moe_softcapping != 0:
+            router_logits = torch.tanh(
+                router_logits / self.config.moe_softcapping
+            ) * self.config.moe_softcapping
+
+        # Apply correction bias if provided
+        if self.expert_bias is not None:
+            router_logits = router_logits + self.expert_bias.float()
+
+        # Apply softmax, topk, and renormalize
+        # (matching qwen3_moe.py:296-302)
+        routing_weights = F.softmax(
+            router_logits, dim=1, dtype=torch.float
         )
+        routing_weights, selected_experts = torch.topk(
+            routing_weights, self.topk, dim=-1
+        )
+        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        routing_weights = routing_weights.to(input_2d.dtype)
+
+        topk_weights = routing_weights
+        topk_ids = selected_experts
 
         # Store topk values for SGLang fused experts (used in MoE layer)
         self._sglang_topk_weights = topk_weights
@@ -644,25 +673,40 @@ class TopKRouter(Router):
 
         # === DEBUG: Router intermediate results ===
         import os
-        if os.environ.get("SLIME_DEBUG_LOGPROB_DIFF", "0") == "1":
+        if os.environ.get("DEBUG_ROUTER", "0") == "1":
             import torch.distributed as dist
             rank = dist.get_rank() if dist.is_initialized() else 0
-            # Recompute logits for debugging (fused kernel doesn't output intermediate)
-            logits_debug = input_2d.float() @ self.weight.float().t()
-            if self.config.moe_softcapping != 0:
-                logits_debug = torch.tanh(logits_debug / self.config.moe_softcapping) * self.config.moe_softcapping
-            logger.info(f"[Megatron Router][Rank {rank}][Layer {getattr(self, 'layer_number', '?')}] "
-                  f"input shape: {input_2d.shape}, weight shape: {self.weight.shape}")
-            logger.info(f"[Megatron Router][Rank {rank}][Layer {getattr(self, 'layer_number', '?')}] "
-                  f"x[:2,:5]: {input_2d[:2, :5].tolist()}")
-            logger.info(f"[Megatron Router][Rank {rank}][Layer {getattr(self, 'layer_number', '?')}] "
-                  f"router_weight[:2,:5]: {self.weight[:2, :5].tolist()}")
-            logger.info(f"[Megatron Router][Rank {rank}][Layer {getattr(self, 'layer_number', '?')}] "
-                  f"logits[:2,:8]:\n{logits_debug[:2, :8]}")
-            logger.info(f"[Megatron Router][Rank {rank}][Layer {getattr(self, 'layer_number', '?')}] "
-                  f"topk_ids[:4]: {topk_ids[:4].tolist()}")
-            logger.info(f"[Megatron Router][Rank {rank}][Layer {getattr(self, 'layer_number', '?')}] "
-                  f"topk_weights[:4]: {topk_weights[:4].tolist()}")
+            layer_id = getattr(self, 'layer_number', '?')
+
+            logger.info(
+                f"[Megatron Router][Rank {rank}][Layer {layer_id}] "
+                f"Shapes: input={input_2d.shape}, "
+                f"weight={self.weight.shape}, "
+                f"router_logits={router_logits.shape}, "
+                f"topk_weights={topk_weights.shape}"
+            )
+            logger.info(
+                f"[Megatron Router][Rank {rank}][Layer {layer_id}] "
+                f"Input sample: {input_2d[:2, :5].tolist()}"
+            )
+            logger.info(
+                f"[Megatron Router][Rank {rank}][Layer {layer_id}] "
+                f"Router logits sample: {router_logits[:2, :5].tolist()}"
+            )
+            logger.info(
+                f"[Megatron Router][Rank {rank}][Layer {layer_id}] "
+                f"Routing weights sample: "
+                f"{routing_weights[:2, :].tolist()}"
+            )
+            logger.info(
+                f"[Megatron Router][Rank {rank}][Layer {layer_id}] "
+                f"Selected experts sample: "
+                f"{selected_experts[:2, :].tolist()}"
+            )
+            logger.info(
+                f"[Megatron Router][Rank {rank}][Layer {layer_id}] "
+                f"TopK weights sample: {topk_weights[:2, :].tolist()}"
+            )
         # === END DEBUG ===
 
         # Convert SGLang format (topk_weights, topk_ids) to Megatron format (probs, routing_map)
