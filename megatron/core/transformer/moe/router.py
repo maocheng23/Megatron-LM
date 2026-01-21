@@ -633,7 +633,6 @@ class TopKRouter(Router):
     
     def _sglang_router_forward(self, input: torch.Tensor):
         # Ensure router is available
-        raise Exception("Using SGLang router forward")
         print("Using SGLang router forward")
         if not is_sglang_router_available() and input.is_cuda:
             import warnings
@@ -689,7 +688,7 @@ class TopKRouter(Router):
 
         # === DEBUG: Router intermediate results ===
         import os
-        if os.environ.get("DEBUG_ROUTER", "0") == "1":
+        if os.environ.get("SLIME_DEBUG_ROUTER", "0") == "1":
             import torch.distributed as dist
             rank = dist.get_rank() if dist.is_initialized() else 0
             layer_id = getattr(self, 'layer_number', '?')
