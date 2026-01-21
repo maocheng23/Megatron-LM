@@ -49,6 +49,7 @@ try:
         # Server args not set - create minimal mock for Megatron usage
         class _MinimalServerArgs:
             enable_deterministic_inference = False
+            rl_on_policy_target = None
         set_global_server_args_for_scheduler(_MinimalServerArgs())
 except ImportError:
     HAVE_SGLANG_FUSED_EXPERTS = False

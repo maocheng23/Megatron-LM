@@ -37,6 +37,9 @@ try:
 except ImportError:
     HAVE_TE = False
 
+import os
+import logging
+logger = logging.getLogger(__name__)
 
 @dataclass
 class MoESubmodules:
@@ -352,13 +355,11 @@ class MoELayer(BaseMoELayer):
 
     def _sglang_forward(self, hidden_states: torch.Tensor):
         """Forward using SGLang's fused experts for true on-policy computation."""
-        import os
-        import logging
         # Compute shared experts
         shared_expert_output = self.shared_experts_compute(hidden_states)
 
         # Get routing (this also stores topk_weights and topk_ids in router)
-        logger = logging.getLogger(__name__)
+        
         logger.info("MOElayer _sglang_forward router forward")
         probs, routing_map = self.route(hidden_states)
 
@@ -383,12 +384,12 @@ class MoELayer(BaseMoELayer):
         w1, w2 = self._get_expert_weights_for_sglang()
 
         # === DEBUG ===
-        if os.environ.get("SLIME_DEBUG_LOGPROB_DIFF", "0") == "1":
+        if os.environ.get("DEBUG_ROUTER", "0") == "1":
             import torch.distributed as dist
             rank = dist.get_rank() if dist.is_initialized() else 0
-            print(f"[Megatron SGLang Forward][Rank {rank}] "
+            logger.info(f"[Megatron SGLang Forward][Rank {rank}] "
                   f"hidden_states: {hidden_states_2d.shape}, w1: {w1.shape}, w2: {w2.shape}")
-            print(f"[Megatron SGLang Forward][Rank {rank}] "
+            logger.info(f"[Megatron SGLang Forward][Rank {rank}] "
                   f"topk_ids: {topk_ids.shape}, topk_weights: {topk_weights.shape}")
         # === END DEBUG ===
 
