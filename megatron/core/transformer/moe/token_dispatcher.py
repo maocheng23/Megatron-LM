@@ -304,6 +304,7 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         self.local_probs = self.local_probs.T.contiguous().masked_select(
             self.local_map.T.contiguous()
         )
+
         self.routing_map = None
         return permuted_local_hidden_states, tokens_per_expert, self.local_probs
 

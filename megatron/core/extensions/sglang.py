@@ -43,6 +43,7 @@ from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
+    get_expert_data_parallel_rank,
     get_expert_model_parallel_rank,
     get_expert_model_parallel_world_size,
 )
@@ -60,18 +61,18 @@ logger = logging.getLogger(__name__)
 
 
 def _print_sglang_log(message: str, level: int = logging.INFO):
-    """Print SGLang log message on rank 0 in distributed training."""
+    """logger.info SGLang log message on rank 0 in distributed training."""
     log_single_rank(logger, level, message)
-    # Also print to stdout for visibility
+    # Also logger.info to stdout for visibility
     try:
         if torch.distributed.is_initialized():
             if torch.distributed.get_rank() == 0:
-                print(message, flush=True)
+                logger.info(message,  )
         else:
-            print(message, flush=True)
+            logger.info(message,  )
     except Exception:
         # Fallback if distributed is not available
-        print(message, flush=True)
+        logger.info(message,  )
 
 
 # =============================================================================
@@ -370,7 +371,7 @@ class SGLangLinear(MegatronModule):
             mm_output = torch.mm(x, weight_bf16.t())
             flinear_output = F.linear(x, weight_bf16, None)
             
-            print(
+            logger.info(
                 f"[DEBUG Megatron SGLangLinear #{SGLangLinear._linear_debug_count}] "
                 f"rank={rank}, tp_rank={tp_rank}, parallel_mode={self.parallel_mode}, "
                 f"orig_shape={orig_shape}, reshaped_shape={x.shape}, "
@@ -388,7 +389,7 @@ class SGLangLinear(MegatronModule):
                 f"flinear_output_pos91_sum={flinear_output[position].float().sum().item():.6f}, "
                 f"mm_first5={mm_output[position, :5].float().tolist()}, "
                 f"flinear_first5={flinear_output[position, :5].float().tolist()}",
-                flush=True
+                 
             )
 
         # Use batch-invariant GEMM with BF16 weight
@@ -546,13 +547,13 @@ class SGLangRowParallelLinear(SGLangLinear):
                     actual_group_size = self.tp_group.size() if hasattr(self.tp_group, 'size') else 'unknown'
                     position = 91 if output_before.shape[0] > 91 else 0
                     out_pos = output_before[position, 0, :] if output_before.dim() == 3 else output_before[position, :]
-                    print(
+                    logger.info(
                         f"[DEBUG Megatron RowParallel all_reduce #{SGLangRowParallelLinear._debug_count}] "
                         f"rank={rank}, tp_rank={tp_rank}, tp_size={self.tp_size}, group_size={actual_group_size}, "
                         f"layer_num={self.layer_number}, input_size={self.input_size}, output_size={self.output_size}, "
                         f"BEFORE: position={position}, sum={out_pos.float().sum().item():.6f}, "
                         f"first 5={out_pos.flatten()[:5].float().tolist()}",
-                        flush=True
+                         
                     )
             
             output = reduce_from_tensor_model_parallel_region(output_before, group=self.tp_group)
@@ -561,11 +562,11 @@ class SGLangRowParallelLinear(SGLangLinear):
             if os.environ.get('SLIME_DEBUG_LOGPROB_DIFF', '0') == '1':
                 if SGLangRowParallelLinear._debug_count <= 10:
                     out_pos_after = output[position, 0, :] if output.dim() == 3 else output[position, :]
-                    print(
+                    logger.info(
                         f"[DEBUG Megatron RowParallel all_reduce #{SGLangRowParallelLinear._debug_count}] "
                         f"AFTER: position={position}, sum={out_pos_after.float().sum().item():.6f}, "
                         f"first 5={out_pos_after.flatten()[:5].float().tolist()}",
-                        flush=True
+                         
                     )
         else:
             output = output_before
@@ -643,20 +644,19 @@ class SGLangGroupedLinear(MegatronModule):
             elif parallel_mode == "row":
                 local_input_size = divide(input_size, self.tp_size)
 
-        # Initialize weights for each expert
-        self.weights = nn.ParameterList([
-            nn.Parameter(
+        # Initialize weights for each expert using TE-compatible naming (weight0, weight1, etc.)
+        # This matches TEGroupedLinear's naming convention for checkpoint compatibility
+        self.use_bias = bias and not skip_bias_add
+        for i in range(num_gemms):
+            weight = nn.Parameter(
                 torch.empty(local_output_size, local_input_size, dtype=dtype, device=device)
             )
-            for _ in range(num_gemms)
-        ])
+            self.register_parameter(f'weight{i}', weight)
 
-        if config.perform_initialization and device != 'meta':
-            for weight in self.weights:
+            if config.perform_initialization and device != 'meta':
                 init_method(weight)
 
-        # Set TP attributes for weights (for weight update/checkpoint compatibility)
-        for weight in self.weights:
+            # Set TP attributes for weights (for weight update/checkpoint compatibility)
             if self.explicit_expert_comm and self.tp_size > 1:
                 setattr(weight, 'tensor_model_parallel', True)
                 setattr(weight, 'partition_dim', 0 if parallel_mode == "column" else 1)
@@ -666,14 +666,18 @@ class SGLangGroupedLinear(MegatronModule):
                 setattr(weight, 'partition_dim', -1)
                 setattr(weight, 'partition_stride', 1)
 
-        # Initialize biases
-        if bias and not skip_bias_add:
-            self.biases = nn.ParameterList([
-                nn.Parameter(torch.zeros(local_output_size, dtype=dtype, device=device))
-                for _ in range(num_gemms)
-            ])
-            # Set TP attributes for biases
-            for bias_param in self.biases:
+            # Set gradient attributes
+            weight.allreduce = not (is_expert and self.expert_parallel)
+
+        # Initialize biases using TE-compatible naming (bias0, bias1, etc.)
+        if self.use_bias:
+            for i in range(num_gemms):
+                bias_param = nn.Parameter(
+                    torch.zeros(local_output_size, dtype=dtype, device=device)
+                )
+                self.register_parameter(f'bias{i}', bias_param)
+
+                # Set TP attributes for biases
                 if self.explicit_expert_comm and parallel_mode == "column" and self.tp_size > 1:
                     setattr(bias_param, 'tensor_model_parallel', True)
                     setattr(bias_param, 'partition_dim', 0)
@@ -682,12 +686,6 @@ class SGLangGroupedLinear(MegatronModule):
                     setattr(bias_param, 'tensor_model_parallel', False)
                     setattr(bias_param, 'partition_dim', -1)
                     setattr(bias_param, 'partition_stride', 1)
-        else:
-            self.biases = None
-
-        # Set gradient attributes
-        for weight in self.weights:
-            weight.allreduce = not (is_expert and self.expert_parallel)
 
     def forward(self, x: Tensor, m_splits: List[int]) -> Tuple[Tensor, Optional[Tensor]]:
         """
@@ -705,14 +703,16 @@ class SGLangGroupedLinear(MegatronModule):
                 expert_input = x[offset:offset + num_tokens]
                 expert_input = expert_input.view(-1, expert_input.size(-1))
 
-                if self.biases is not None:
+                weight = getattr(self, f'weight{i}')
+                if self.use_bias:
+                    bias = getattr(self, f'bias{i}')
                     expert_output = sglang_addmm(
-                        self.biases[i].unsqueeze(0).expand(expert_input.size(0), -1),
+                        bias.unsqueeze(0).expand(expert_input.size(0), -1),
                         expert_input,
-                        self.weights[i].t(),
+                        weight.t(),
                     )
                 else:
-                    expert_output = sglang_mm(expert_input, self.weights[i].t())
+                    expert_output = sglang_mm(expert_input, weight.t())
 
                 outputs.append(expert_output)
             offset += num_tokens
@@ -722,22 +722,32 @@ class SGLangGroupedLinear(MegatronModule):
         else:
             output = x.new_empty(0, self.output_size)
 
-        if self.skip_bias_add and self.biases is not None:
+        if self.skip_bias_add and self.use_bias:
             # Return concatenated biases (same size as output)
             return output, None  # Bias handling for grouped is complex
         return output, None
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
-        """Sharded state dict for distributed checkpointing."""
+        """Sharded state dict for distributed checkpointing.
+
+        Matches TE's _sharded_state_dict_grouped format for compatibility with TEGroupedMLP.
+        Returns dict keys in format: {prefix}weight{idx}, {prefix}bias{idx}
+        """
+        from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
+
+        singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
         sharded_state_dict = {}
         num_global_experts = get_expert_model_parallel_world_size() * self.num_gemms
         local_expert_indices_offset = get_expert_model_parallel_rank() * self.num_gemms
         ep_axis = len(sharded_offsets)
 
         for gemm_idx in range(self.num_gemms):
-            state_dict = {f"{gemm_idx}.weight": self.weights[gemm_idx]}
-            if self.biases is not None:
-                state_dict[f"{gemm_idx}.bias"] = self.biases[gemm_idx]
+            global_expert_idx = local_expert_indices_offset + gemm_idx
+            # Create state dict with indexed keys (matching TE format)
+            # Use getattr to access weight{i} and bias{i} parameters
+            state_dict = {f"{gemm_idx}.weight": getattr(self, f'weight{gemm_idx}')}
+            if self.use_bias:
+                state_dict[f"{gemm_idx}.bias"] = getattr(self, f'bias{gemm_idx}')
 
             tp_axis_map = {}
             if self.parallel_mode == "column":
@@ -745,16 +755,38 @@ class SGLangGroupedLinear(MegatronModule):
             elif self.parallel_mode == "row":
                 tp_axis_map = {f"{gemm_idx}.weight": 1}
 
+            # Determine expert prefix for ShardedTensor.key (matches TE logic)
+            if singleton_local_shards:
+                expert_prefix = f"{global_expert_idx}.{prefix}"
+                new_sharded_offsets = sharded_offsets
+            else:
+                expert_prefix = prefix
+                new_sharded_offsets = (
+                    *sharded_offsets,
+                    (ep_axis, global_expert_idx, num_global_experts),
+                )
+
+            # Create sharded tensors with empty prefix (like TE)
             sub_sd = make_sharded_tensors_for_checkpoint(
                 state_dict,
-                "",
+                '',  # Empty prefix, will be set by replace_prefix_for_sharding
                 tp_axis_map,
-                (
-                    *sharded_offsets,
-                    (ep_axis, local_expert_indices_offset + gemm_idx, num_global_experts),
-                ),
+                new_sharded_offsets,
             )
-            sharded_state_dict.update(sub_sd)
+
+            # Update ShardedTensor.key from "{idx}." to expert_prefix (matching TE)
+            replace_prefix_for_sharding(sub_sd, f"{gemm_idx}.", expert_prefix)
+
+            # Add to result dict with TE-compatible keys: {prefix}weight{idx}, {prefix}bias{idx}
+            sharded_state_dict[f"{prefix}weight{gemm_idx}"] = sub_sd[f"{gemm_idx}.weight"]
+            if self.use_bias:
+                sharded_state_dict[f"{prefix}bias{gemm_idx}"] = sub_sd[f"{gemm_idx}.bias"]
+
+        # Adjust replica ids - replication along DP modulo EP (matching TE)
+        for k, sh_ten in sharded_state_dict.items():
+            replica_id = sh_ten.replica_id
+            if len(replica_id) == 3:
+                sh_ten.replica_id = (*replica_id[:2], get_expert_data_parallel_rank())
 
         return sharded_state_dict
 
@@ -1146,12 +1178,12 @@ class SGLangLayerNormColumnParallelLinear(MegatronModule):
                 tp_size = parallel_state.get_tensor_model_parallel_world_size() if parallel_state.is_initialized() else 1
                 position = 91 if x.shape[0] > 91 else 0
                 x_pos = x[position, 0, :] if x.dim() == 3 else x[position, :]
-                print(
+                logger.info(
                     f"[DEBUG Megatron FusedLN+Linear #{SGLangLayerNormColumnParallelLinear._fused_debug_count} INPUT] "
                     f"rank={rank}, tp_rank={tp_rank}, tp_size={tp_size}, "
                     f"position={position}, shape={x_pos.shape}, sum={x_pos.float().sum().item():.6f}, "
                     f"first 5={x_pos.flatten()[:5].float().tolist()}",
-                    flush=True
+                     
                 )
         
         normed = self.norm(x)
@@ -1161,12 +1193,12 @@ class SGLangLayerNormColumnParallelLinear(MegatronModule):
             if SGLangLayerNormColumnParallelLinear._fused_debug_count <= 2:
                 position = 91 if normed.shape[0] > 91 else 0
                 normed_pos = normed[position, 0, :] if normed.dim() == 3 else normed[position, :]
-                print(
+                logger.info(
                     f"[DEBUG Megatron FusedLN+Linear #{SGLangLayerNormColumnParallelLinear._fused_debug_count} AFTER NORM] "
                     f"rank={rank}, tp_rank={tp_rank}, "
                     f"position={position}, shape={normed_pos.shape}, sum={normed_pos.float().sum().item():.6f}, "
                     f"first 5={normed_pos.flatten()[:5].float().tolist()}",
-                    flush=True
+                     
                 )
         # Debug: compare weight with SGLang
         # Only log for count <= 2 (first 2 layers)
@@ -1174,7 +1206,7 @@ class SGLangLayerNormColumnParallelLinear(MegatronModule):
             if SGLangLayerNormColumnParallelLinear._fused_debug_count <= 2:
                 w = self.linear.weight
                 layer_num = getattr(self.linear, 'layer_number', 'N/A')
-                print(
+                logger.info(
                     f"[DEBUG Megatron FC1 WEIGHT] "
                     f"layer={layer_num}, call_idx={SGLangLayerNormColumnParallelLinear._fused_debug_count}, "
                     f"rank={rank}, tp_rank={tp_rank}, "
@@ -1182,19 +1214,19 @@ class SGLangLayerNormColumnParallelLinear(MegatronModule):
                     f"weight_sum={w.float().sum().item():.6f}, "
                     f"weight_first_row_first5={w[0, :5].float().tolist()}, "
                     f"weight_last_row_first5={w[-1, :5].float().tolist()}",
-                    flush=True
+                     
                 )
         
         linear_output, _ = self.linear(normed)
         if os.environ.get('SLIME_DEBUG_LOGPROB_DIFF', '0') == '1':
             if SGLangLayerNormColumnParallelLinear._fused_debug_count <= 2:
                 linear_output_pos = linear_output[position, 0, :] if linear_output.dim() == 3 else linear_output[position, :]
-                print(
+                logger.info(
                     f"[DEBUG Megatron FusedLN+Linear #{SGLangLayerNormColumnParallelLinear._fused_debug_count} AFTER LINEAR] "
                     f"rank={rank}, tp_rank={tp_rank}, "
                     f"position={position}, shape={linear_output_pos.shape}, sum={linear_output_pos.float().sum().item():.6f}, "
                     f"first 5={linear_output_pos.flatten()[:5].float().tolist()}",
-                    flush=True
+                     
                 )
         return linear_output, None
 
@@ -1527,14 +1559,14 @@ class SGLangFlashAttention(MegatronModule):
             rank = dist.get_rank() if dist.is_initialized() else 0
             tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
             # Log all layer numbers for debugging
-            print(f"[DEBUG] SGLangFlashAttention forward called for layer_number={self.layer_number}, rank={rank}", flush=True)
+            logger.info(f"[DEBUG] SGLangFlashAttention forward called for layer_number={self.layer_number}, rank={rank}",  )
             if self.layer_number <= 2 or self.layer_number == self.config.num_layers:
-                print(
+                logger.info(
                     f"[DEBUG Megatron SGLangFlashAttention Layer {self.layer_number} INPUT] rank={rank}, tp_rank={tp_rank}, \n"
                     f" position 91: Q shape={query[91,:, :].shape}, Q sum={query[91, :, :].float().sum().item():.6f}, Q first 5={query[91, :, :].flatten().float().tolist()[:5]} \n"
                     f"position 91: K shape={key[91,:, :].shape}, K sum={key[91, :, :].float().sum().item():.6f}, K first 5={key[91, :, :].flatten().float().tolist()[:5]} \n"
                     f"position 91: V shape={value[91,:, :].shape}, V sum={value[91, :, :].float().sum().item():.6f}, V first 5={value[91, :, :].flatten().float().tolist()[:5]}",
-                    flush=True
+                     
                 )
 
         # Check if using packed sequences (THD format)
@@ -1663,11 +1695,11 @@ class SGLangFlashAttention(MegatronModule):
                 postion = 91
                 output_temp = output[postion, :]
                 if self.layer_number <= 1 or self.layer_number == self.config.num_layers:
-                    print(
+                    logger.info(
                         f"[DEBUG Megatron FA3 RAW OUTPUT Layer {self.layer_number}] rank={rank}, tp_rank={tp_rank}, "
                         f"shape={output_temp.shape}, sum={output_temp.float().sum().item():.6f}, "
                         f"first 5={output_temp.flatten()[:5].float().tolist()}",
-                        flush=True
+                         
                     )
         else:
             # Fallback to _flash_attn_forward (WARNING: no backward support!)
@@ -1738,19 +1770,19 @@ class SGLangFlashAttention(MegatronModule):
             postion = 91
             output_temp = output[postion, :]
             if self.layer_number <= 2 or self.layer_number == self.config.num_layers:
-                print(
+                logger.info(
                     f"[DEBUG Megatron SGLangFlashAttention Layer {self.layer_number} Output] rank={rank}, tp_rank={tp_rank}, "
                     f"shape={output_temp.shape}, sum={output_temp.float().sum().item():.6f}, "
                     f"first 5={output_temp.flatten()[:5].float().tolist()}",
-                    flush=True
+                     
                 )
             # Log last layer FA3 attention output
             if hasattr(self.config, 'num_layers') and self.layer_number == self.config.num_layers:
-                print(
+                logger.info(
                     f"[DEBUG Megatron SGLangFlashAttention Layer {self.layer_number} (Last) Output] rank={rank}, tp_rank={tp_rank}, "
                     f"shape={output_temp.shape}, sum={output_temp.float().sum().item():.6f}, "
                     f"first 5={output_temp.flatten()[:5].float().tolist()}",
-                    flush=True
+                     
                 )
 
         return output
@@ -1875,7 +1907,7 @@ class SGLangSpecProvider(BackendSpecProvider):
                 "Please install flash-attn>=3.0.0 or set use_sglang_attention=False."
             )
 
-        # Print clear initialization message
+        # logger.info clear initialization message
         _print_sglang_log("=" * 80)
         _print_sglang_log("🔧 SGLANG KERNEL: Initializing SGLangSpecProvider")
         _print_sglang_log(f"   - use_sglang_attention: {use_sglang_attention}")
@@ -1906,11 +1938,11 @@ class SGLangSpecProvider(BackendSpecProvider):
 
     def layer_norm(self, rms_norm: bool = False, for_qk: bool = False) -> type:
         """LayerNorm or RMSNorm module.
-        
+
         IMPORTANT: Always use SGLang's LayerNorm implementations for true on-policy mode.
         This ensures numerical consistency between SGLang inference and Megatron training.
         Do NOT use fallback here as TransformerEngine's norms have different numerical behavior.
-        
+
         For Q/K layernorm (for_qk=True), always use RMSNorm as most LLMs (Qwen, LLaMA, etc.)
         use RMSNorm for query/key normalization, even when the main layernorm might be different.
         """
@@ -1918,7 +1950,11 @@ class SGLangSpecProvider(BackendSpecProvider):
         # This avoids bias parameters that would break checkpoint compatibility
         if for_qk or rms_norm:
             return SGLangRMSNorm
-        return SGLangLayerNorm
+        # Return SGLangNorm which will check config.normalization at instantiation time
+        # This ensures correct norm type (RMSNorm vs LayerNorm) based on model config
+        # Fixes MoE models like Qwen3-30B-A3B which use RMSNorm but pre_mlp_layernorm
+        # was getting SGLangLayerNorm (with bias) causing checkpoint mismatch
+        return SGLangNorm
 
     def core_attention(self) -> type:
         """Core attention module using Flash Attention 3."""

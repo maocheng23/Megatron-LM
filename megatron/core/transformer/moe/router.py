@@ -26,9 +26,14 @@ from megatron.core.transformer.moe.deterministic_router import (
     convert_topk_to_megatron_format,
     is_sglang_router_available,
 )
+from megatron.core.transformer.moe.true_on_policy_config import (
+    TrueOnPolicyConfig,
+    get_qwen3_moe_config,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 
-
+import logging
+logger = logging.getLogger(__name__)
 class Router(ABC, MegatronModule):
     """Base Router class"""
 
@@ -618,17 +623,27 @@ class TopKRouter(Router):
         if self.weight.device.type == 'cpu':
             self.weight.data = self.weight.data.to(device=input.device)
 
-        # Call SGLang's fused router (or fallback)
-        # This matches SGLang's FusedMoeRouter.forward_cuda() exactly
+        # Get true on-policy config (model-specific or default)
+        true_on_policy_config = self._get_true_on_policy_config()
+
+        # Call SGLang's router with model-specific config
+        # This matches SGLang's exact routing flow for the specified model
         topk_weights, topk_ids = fused_moe_router_deterministic(
             hidden_states=input_2d,
             router_weight=self.weight,
             topk=self.topk,
             moe_softcapping=self.config.moe_softcapping,
             correction_bias=self.expert_bias,  # SGLang calls this correction_bias
+            config=true_on_policy_config,
+            layer_id=getattr(self, 'layer_number', None),
         )
 
+        # Store topk values for SGLang fused experts (used in MoE layer)
+        self._sglang_topk_weights = topk_weights
+        self._sglang_topk_ids = topk_ids
+
         # === DEBUG: Router intermediate results ===
+        import os
         if os.environ.get("SLIME_DEBUG_LOGPROB_DIFF", "0") == "1":
             import torch.distributed as dist
             rank = dist.get_rank() if dist.is_initialized() else 0
@@ -636,13 +651,17 @@ class TopKRouter(Router):
             logits_debug = input_2d.float() @ self.weight.float().t()
             if self.config.moe_softcapping != 0:
                 logits_debug = torch.tanh(logits_debug / self.config.moe_softcapping) * self.config.moe_softcapping
-            print(f"[Megatron Router][Rank {rank}][Layer {getattr(self, 'layer_number', '?')}] "
+            logger.info(f"[Megatron Router][Rank {rank}][Layer {getattr(self, 'layer_number', '?')}] "
                   f"input shape: {input_2d.shape}, weight shape: {self.weight.shape}")
-            print(f"[Megatron Router][Rank {rank}][Layer {getattr(self, 'layer_number', '?')}] "
+            logger.info(f"[Megatron Router][Rank {rank}][Layer {getattr(self, 'layer_number', '?')}] "
+                  f"x[:2,:5]: {input_2d[:2, :5].tolist()}")
+            logger.info(f"[Megatron Router][Rank {rank}][Layer {getattr(self, 'layer_number', '?')}] "
+                  f"router_weight[:2,:5]: {self.weight[:2, :5].tolist()}")
+            logger.info(f"[Megatron Router][Rank {rank}][Layer {getattr(self, 'layer_number', '?')}] "
                   f"logits[:2,:8]:\n{logits_debug[:2, :8]}")
-            print(f"[Megatron Router][Rank {rank}][Layer {getattr(self, 'layer_number', '?')}] "
+            logger.info(f"[Megatron Router][Rank {rank}][Layer {getattr(self, 'layer_number', '?')}] "
                   f"topk_ids[:4]: {topk_ids[:4].tolist()}")
-            print(f"[Megatron Router][Rank {rank}][Layer {getattr(self, 'layer_number', '?')}] "
+            logger.info(f"[Megatron Router][Rank {rank}][Layer {getattr(self, 'layer_number', '?')}] "
                   f"topk_weights[:4]: {topk_weights[:4].tolist()}")
         # === END DEBUG ===
 
@@ -658,6 +677,12 @@ class TopKRouter(Router):
         self._apply_expert_bias(routing_map)
 
         return probs, routing_map
+
+    def _get_true_on_policy_config(self) -> TrueOnPolicyConfig:
+        """Get the true on-policy config (Qwen3-MoE)."""
+        if not hasattr(self, '_true_on_policy_config'):
+            self._true_on_policy_config = get_qwen3_moe_config()
+        return self._true_on_policy_config
 
     def _load_from_state_dict(self, *args, **kwargs):
         """Load the state dict of the router."""

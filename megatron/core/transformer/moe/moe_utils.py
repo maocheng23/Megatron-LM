@@ -36,6 +36,23 @@ try:
 except ImportError:
     HAVE_TE = False
 
+# Try to import SGLang's fused_experts for deterministic expert computation
+try:
+    from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts_impl
+    HAVE_SGLANG_FUSED_EXPERTS = True
+
+    # Initialize SGLang server args if not already set (needed for fused_experts_impl)
+    from sglang.srt.server_args import get_global_server_args, set_global_server_args_for_scheduler
+    try:
+        get_global_server_args()
+    except ValueError:
+        # Server args not set - create minimal mock for Megatron usage
+        class _MinimalServerArgs:
+            enable_deterministic_inference = False
+        set_global_server_args_for_scheduler(_MinimalServerArgs())
+except ImportError:
+    HAVE_SGLANG_FUSED_EXPERTS = False
+    fused_experts_impl = None
 
 # MOE logging
 _MOE_LAYER_WISE_LOGGING_TRACKER = {}
@@ -310,6 +327,56 @@ def permute(
     permuted_input = tokens.index_select(0, sorted_indices)
 
     return permuted_input, permuted_probs, sorted_indices
+
+
+def sglang_fused_experts(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    activation: str = "silu",
+    apply_router_weight_on_input: bool = False,
+):
+    """Call SGLang's fused_experts_impl for deterministic MoE computation.
+
+    This function wraps SGLang's fused expert implementation to provide identical
+    computation to SGLang inference, enabling true on-policy training.
+
+    Args:
+        hidden_states: Input tensor [num_tokens, hidden_size]
+        w1: Gate/up projection weights [num_experts, ffn_hidden_size, hidden_size]
+        w2: Down projection weights [num_experts, hidden_size, ffn_hidden_size//2]
+        topk_weights: Router weights [num_tokens, topk]
+        topk_ids: Expert indices [num_tokens, topk]
+        activation: Activation function name ("silu" or "gelu")
+        apply_router_weight_on_input: Whether to apply router weight on input
+
+    Returns:
+        output: Output tensor [num_tokens, hidden_size]
+    """
+    if not HAVE_SGLANG_FUSED_EXPERTS:
+        raise ImportError(
+            "SGLang's fused_experts_impl is required. Please install sglang."
+        )
+
+    # SGLang expects is_gated=True for SwiGLU-style activations
+    is_gated = True
+
+    # Call SGLang's fused experts (debug output is inside fused_experts_impl)
+    output = fused_experts_impl(
+        hidden_states=hidden_states.contiguous(),
+        w1=w1.contiguous(),
+        w2=w2.contiguous(),
+        topk_weights=topk_weights.contiguous(),
+        topk_ids=topk_ids.contiguous(),
+        inplace=False,
+        activation=activation,
+        is_gated=is_gated,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+    )
+
+    return output
 
 
 def unpermute(
