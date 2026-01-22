@@ -419,11 +419,11 @@ def sglang_fused_experts(
             #print(f"[moe_utils.py]  Expert {expert_id}: {count} tokens, local={is_local}")
         # Print format aligned with SGLang standard.py
         print(f"[moe_utils.py][Megatron EP Mapping][Rank {rank}][Layer {layer_number}] topk_ids_local.shape: {topk_ids_local.shape}, dtype: {topk_ids_local.dtype}")
-        print(f"[moe_utils.py][Megatron EP Mapping][Rank {rank}][Layer {layer_number}] topk_ids_local[0, :5]: {topk_ids_local[0, :min(5, topk_ids_local.shape[1])].tolist()}")
+        print(f"[moe_utils.py][Megatron EP Mapping][Rank {rank}][Layer {layer_number}] topk_ids_local[91, :5]: {topk_ids_local[91, :min(5, topk_ids_local.shape[1])].tolist()}")
         print(f"[moe_utils.py][Megatron EP Mapping][Rank {rank}][Layer {layer_number}] topk_weights.shape: {topk_weights.shape}, dtype: {topk_weights.dtype}")
-        print(f"[moe_utils.py][Megatron EP Mapping][Rank {rank}][Layer {layer_number}] topk_weights[0, :5]: {topk_weights[0, :min(5, topk_weights.shape[1])].tolist()}")
+        print(f"[moe_utils.py][Megatron EP Mapping][Rank {rank}][Layer {layer_number}] topk_weights[91, :5]: {topk_weights[91, :min(5, topk_weights.shape[1])].tolist()}")
         print(f"[moe_utils.py][Megatron EP Mapping][Rank {rank}][Layer {layer_number}] hidden_states.shape: {hidden_states.shape}, dtype: {hidden_states.dtype}")
-        print(f"[moe_utils.py][Megatron EP Mapping][Rank {rank}][Layer {layer_number}] hidden_states[0, :5]: {hidden_states[0, :5].tolist()}")
+        print(f"[moe_utils.py][Megatron EP Mapping][Rank {rank}][Layer {layer_number}] hidden_states[91, :5]: {hidden_states[91, :5].tolist()}")
         
         # Count tokens per local expert (after mapping)
         print(f"[moe_utils.py][Megatron EP Mapping][Rank {rank}][Layer {layer_number}] Token distribution (local expert ids):")
