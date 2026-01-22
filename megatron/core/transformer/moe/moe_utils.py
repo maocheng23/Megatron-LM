@@ -439,6 +439,17 @@ def sglang_fused_experts(
     # SGLang expects is_gated=True for SwiGLU-style activations
     is_gated = True
 
+    # Debug: compare expert input
+    if os.environ.get("DEBUG_MEGATRON_EP_MAPPING", "0") == "1" and layer_number <= 1:
+        import torch.distributed as dist
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        position = 91 if hidden_states.shape[0] > 91 else 0
+        print(f"[moe_utils.py][Megatron Expert Input][Rank {rank}][Layer {layer_number}] hidden_states.shape: {hidden_states.shape}, dtype: {hidden_states.dtype}")
+        print(f"[moe_utils.py][Megatron Expert Input][Rank {rank}][Layer {layer_number}] hidden_states[{position}, :5]: {hidden_states[position, :5].tolist()}")
+        print(f"[moe_utils.py][Megatron Expert Input][Rank {rank}][Layer {layer_number}] w1.shape: {w1.shape}, w2.shape: {w2.shape}")
+        print(f"[moe_utils.py][Megatron Expert Input][Rank {rank}][Layer {layer_number}] topk_ids_local.shape: {topk_ids_local.shape}, topk_ids_local[{position}]: {topk_ids_local[position].tolist()}")
+        print(f"[moe_utils.py][Megatron Expert Input][Rank {rank}][Layer {layer_number}] topk_weights.shape: {topk_weights.shape}, topk_weights[{position}]: {topk_weights[position].tolist()}")
+
     # Call SGLang's fused experts
     output = fused_experts_impl(
         hidden_states=hidden_states.contiguous(),
