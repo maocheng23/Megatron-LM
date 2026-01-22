@@ -451,7 +451,17 @@ def sglang_fused_experts(
         is_gated=is_gated,
         apply_router_weight_on_input=apply_router_weight_on_input,
         filter_expert=True,  # Skip experts with id=-1
+        layer_id=layer_number,  # Pass layer_number for debugging
     )
+
+    # Debug: compare expert output
+    if os.environ.get("DEBUG_MEGATRON_EP_MAPPING", "0") == "1" and layer_number <= 1:
+        import torch.distributed as dist
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        print(f"[moe_utils.py][Megatron Expert Output][Rank {rank}][Layer {layer_number}] output.shape: {output.shape}, dtype: {output.dtype}")
+        print(f"[moe_utils.py][Megatron Expert Output][Rank {rank}][Layer {layer_number}] output[0, :5]: {output[0, :5].tolist()}")
+        print(f"[moe_utils.py][Megatron Expert Output][Rank {rank}][Layer {layer_number}] output.norm(): {output.norm().item():.6f}")
+        print(f"[moe_utils.py][Megatron Expert Output][Rank {rank}][Layer {layer_number}] output.sum(): {output.sum().item():.6f}")
 
     return output
 
