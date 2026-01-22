@@ -627,6 +627,22 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
 
         attention_output, attention_output_bias = attention_output_with_bias
+        
+        # DEBUG: Attention output (before post_self_attn_layernorm)
+        import os
+        if os.environ.get("SLIME_DEBUG_ROUTER", "0") == "1" and self.layer_number == 1:
+            import torch.distributed as dist
+            from megatron.core import parallel_state
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            pos = 91
+            prefix = f"[transformer_layer.py][Megatron Decoder][Rank {rank}][Layer {self.layer_number}]"
+            attn_out = attention_output[pos, 0, :] if attention_output.dim() == 3 else attention_output[pos, :]
+            print(f"{prefix} Attention output (before post_attn_norm)[{pos},:5]: "
+                  f"{attn_out[:5].tolist()}, dtype: {attention_output.dtype}", flush=True)
+            if residual is not None:
+                res_val = residual[pos, 0, :] if residual.dim() == 3 else residual[pos, :]
+                print(f"{prefix} Residual[{pos},:5]: {res_val[:5].tolist()}", flush=True)
+        
         attention_output = self.post_self_attn_layernorm(attention_output)
         attention_output_with_bias = (attention_output, attention_output_bias)
 
@@ -744,6 +760,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     f"first 5={mlp_in.flatten()[:5].float().tolist()}",
                     flush=True
                 )
+
+        # DEBUG: After pre_mlp_layernorm (MoE input) - aligned with SGLang debug
+        if os.environ.get("SLIME_DEBUG_ROUTER", "0") == "1" and self.layer_number == 1:
+            import torch.distributed as dist
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            pos = 91
+            prefix = f"[transformer_layer.py][Megatron Decoder][Rank {rank}][Layer {self.layer_number}]"
+            mlp_in = pre_mlp_layernorm_output[pos, 0, :] if pre_mlp_layernorm_output.dim() == 3 else pre_mlp_layernorm_output[pos, :]
+            print(f"{prefix} After post_attn_norm (MoE input)[{pos},:5]: "
+                  f"{mlp_in[:5].tolist()}, dtype: {pre_mlp_layernorm_output.dtype}", flush=True)
 
         nvtx_range_push(suffix="mlp")
         # Potentially chunk the MLP computation during prefill to minimize the peak activation size
