@@ -354,24 +354,38 @@ class MoELayer(BaseMoELayer):
         return w1, w2
 
     def _sglang_forward(self, hidden_states: torch.Tensor):
-        """Forward using SGLang's fused experts for true on-policy computation."""
+        """Forward using SGLang's fused experts for true on-policy computation.
+        
+        This implements SGLang's EP backend=None mode:
+        - All tokens are processed on each EP rank
+        - Router computes topk for all tokens (same result on each rank)
+        - Expert computation only processes local experts (non-local experts skipped)
+        - Results are all-reduced across EP ranks
+        """
         # Compute shared experts
         shared_expert_output = self.shared_experts_compute(hidden_states)
 
         # Get routing (this also stores topk_weights and topk_ids in router)
-        
-        print("MOElayer _sglang_forward router forward")
         probs, routing_map = self.route(hidden_states)
 
         # Get topk values from router (stored during _sglang_router_forward)
         topk_weights = self.router._sglang_topk_weights
         topk_ids = self.router._sglang_topk_ids
-        print("MOElayer _sglang_forward topk_weights: %s", topk_weights.shape)
-        print("MOElayer _sglang_forward topk_ids: %s", topk_ids.shape)
-        # IMPORTANT: Convert topk_weights to hidden_states dtype to match SGLang
-        # SGLang does: routing_weights = routing_weights.to(hidden_states.dtype)
-        # before passing to FusedMoE experts
-        topk_weights = topk_weights.to(hidden_states.dtype)
+        
+        # Get EP info
+        ep_size = utils.get_pg_size(self.ep_group)
+        ep_rank = utils.get_pg_rank(self.ep_group)
+
+        # Debug print
+        if os.environ.get("DEBUG_MEGATRON_EP_MAPPING", "0") == "1" and self.layer_number <= 1:
+            import torch.distributed as dist
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            print(f"[moe_layer.py][Megatron _sglang_forward][Rank {rank}][Layer {self.layer_number}] EP config: ep_size={ep_size}, ep_rank={ep_rank}")
+            print(f"[moe_layer.py][Megatron _sglang_forward][Rank {rank}][Layer {self.layer_number}] num_local_experts={self.num_local_experts}, "
+                       f"num_moe_experts={self.config.num_moe_experts}")
+            print(f"[moe_layer.py][Megatron _sglang_forward][Rank {rank}][Layer {self.layer_number}] topk_ids shape: {topk_ids.shape}, "
+                       f"topk_weights shape: {topk_weights.shape}")
+            print(f"[moe_layer.py][Megatron _sglang_forward][Rank {rank}][Layer {self.layer_number}] topk_ids (first 5 tokens): {topk_ids[:5].tolist()}")
 
         # Reshape hidden_states if needed
         original_shape = hidden_states.shape
@@ -380,28 +394,42 @@ class MoELayer(BaseMoELayer):
         else:
             hidden_states_2d = hidden_states
 
-        # Get expert weights
+        # Get expert weights (only local experts)
         w1, w2 = self._get_expert_weights_for_sglang()
 
-        # === DEBUG ===
-        if os.environ.get("DEBUG_ROUTER", "0") == "1":
+        # Debug: verify weight shapes
+        if os.environ.get("DEBUG_MEGATRON_EP_MAPPING", "0") == "1" and self.layer_number <= 1:
             import torch.distributed as dist
             rank = dist.get_rank() if dist.is_initialized() else 0
-            logger.info(f"[Megatron SGLang Forward][Rank {rank}] "
-                  f"hidden_states: {hidden_states_2d.shape}, w1: {w1.shape}, w2: {w2.shape}")
-            logger.info(f"[Megatron SGLang Forward][Rank {rank}] "
-                  f"topk_ids: {topk_ids.shape}, topk_weights: {topk_weights.shape}")
-        # === END DEBUG ===
+            print(f"[moe_layer.py][Megatron _sglang_forward][Rank {rank}][Layer {self.layer_number}] w1 shape: {w1.shape}, w2 shape: {w2.shape}")
 
-        # Call SGLang's fused experts
+        # Call SGLang's fused experts with EP parameters
         output = sglang_fused_experts(
+            layer_number=self.layer_number,
             hidden_states=hidden_states_2d,
             w1=w1,
             w2=w2,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             activation="silu",  # Qwen uses SwiGLU
+            # EP parameters
+            num_experts=self.config.num_moe_experts,
+            num_local_experts=self.num_local_experts,
+            ep_rank=ep_rank,
+            ep_size=ep_size,
         )
+
+        # EP mode: all-reduce to sum contributions from all EP ranks
+        if ep_size > 1:
+            if os.environ.get("DEBUG_MEGATRON_EP_MAPPING", "0") == "1":
+                import torch.distributed as dist
+                rank = dist.get_rank() if dist.is_initialized() else 0
+                print(f"[moe_layer.py][Megatron _sglang_forward][Rank {rank}] Before all-reduce, output norm: {output.norm().item():.6f}")
+            
+            torch.distributed.all_reduce(output, group=self.ep_group)
+            
+            if os.environ.get("DEBUG_MEGATRON_EP_MAPPING", "0") == "1":
+                print(f"[moe_layer.py][Megatron _sglang_forward][Rank {rank}] After all-reduce, output norm: {output.norm().item():.6f}")
 
         # Reshape output if needed
         if len(original_shape) == 3:

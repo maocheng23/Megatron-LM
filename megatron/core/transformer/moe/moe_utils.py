@@ -1,11 +1,15 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import functools
+import logging
 import math
+import os
 from dataclasses import dataclass
 from typing import List, Optional, Union
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 from megatron.core import parallel_state
 from megatron.core.fp4_utils import get_fp4_align_size
@@ -49,7 +53,7 @@ try:
         # Server args not set - create minimal mock for Megatron usage
         class _MinimalServerArgs:
             enable_deterministic_inference = False
-            rl_on_policy_target = None
+            rl_on_policy_target = "fsdp_tp" if "--use-sglang-router" is set else None
         set_global_server_args_for_scheduler(_MinimalServerArgs())
 except ImportError:
     HAVE_SGLANG_FUSED_EXPERTS = False
@@ -331,6 +335,7 @@ def permute(
 
 
 def sglang_fused_experts(
+    layer_number: int,
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
@@ -338,6 +343,11 @@ def sglang_fused_experts(
     topk_ids: torch.Tensor,
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
+    # EP parameters (new)
+    num_experts: Optional[int] = None,
+    num_local_experts: Optional[int] = None,
+    ep_rank: int = 0,
+    ep_size: int = 1,
 ):
     """Call SGLang's fused_experts_impl for deterministic MoE computation.
 
@@ -346,12 +356,16 @@ def sglang_fused_experts(
 
     Args:
         hidden_states: Input tensor [num_tokens, hidden_size]
-        w1: Gate/up projection weights [num_experts, ffn_hidden_size, hidden_size]
-        w2: Down projection weights [num_experts, hidden_size, ffn_hidden_size//2]
+        w1: Gate/up projection weights [num_local_experts, ffn_hidden_size, hidden_size]
+        w2: Down projection weights [num_local_experts, hidden_size, ffn_hidden_size//2]
         topk_weights: Router weights [num_tokens, topk]
-        topk_ids: Expert indices [num_tokens, topk]
+        topk_ids: Expert indices [num_tokens, topk] (global expert ids)
         activation: Activation function name ("silu" or "gelu")
         apply_router_weight_on_input: Whether to apply router weight on input
+        num_experts: Total number of experts (global)
+        num_local_experts: Number of local experts on this rank
+        ep_rank: Expert parallel rank
+        ep_size: Expert parallel world size
 
     Returns:
         output: Output tensor [num_tokens, hidden_size]
@@ -361,20 +375,74 @@ def sglang_fused_experts(
             "SGLang's fused_experts_impl is required. Please install sglang."
         )
 
+    # EP mode: convert global expert ids to local expert ids
+    # This matches SGLang's StandardDispatcher behavior
+    local_expert_mapping = None
+    if ep_size > 1 and num_experts is not None and num_local_experts is not None:
+        # Create global -> local expert mapping
+        # Non-local experts are mapped to -1 (will be skipped by filter_expert=True)
+        local_expert_mapping = torch.full(
+            (num_experts,), -1, dtype=torch.int32, device=topk_ids.device
+        )
+        local_start = ep_rank * num_local_experts
+        local_expert_mapping[local_start : local_start + num_local_experts] = torch.arange(
+            0, num_local_experts, dtype=torch.int32, device=topk_ids.device
+        )
+        
+        # Convert topk_ids from global to local
+        topk_ids_local = local_expert_mapping[topk_ids.long()]
+    else:
+        topk_ids_local = topk_ids
+
+    # Debug print for EP token mapping
+    if os.environ.get("DEBUG_MEGATRON_EP_MAPPING", "0") == "1" and layer_number <= 1:
+        import torch.distributed as dist
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        num_tokens = topk_ids.shape[0]
+        topk = topk_ids.shape[1]
+        
+        print(f"[moe_utils.py][Megatron EP Mapping][Rank {rank}][Layer {layer_number}] EP config: ep_size={ep_size}, ep_rank={ep_rank}")
+        print(f"[moe_utils.py][Megatron EP Mapping][Rank {rank}][Layer {layer_number}] num_experts={num_experts}, num_local_experts={num_local_experts}")
+        print(f"[moe_utils.py][Megatron EP Mapping][Rank {rank}][Layer {layer_number}] num_tokens={num_tokens}, topk={topk}")
+        
+        if local_expert_mapping is not None:
+            local_start = ep_rank * num_local_experts
+            local_end = local_start + num_local_experts
+            print(f"[moe_utils.py][Megatron EP Mapping][Rank {rank}][Layer {layer_number}] Local expert range: [{local_start}, {local_end})")
+            print(f"[moe_utils.py][Megatron EP Mapping][Rank {rank}][Layer {layer_number}] local_expert_mapping: {local_expert_mapping.tolist()}")
+        
+        # Count tokens per expert (global ids)
+        print(f"[moe_utils.py][Megatron EP Mapping][Rank {rank}][Layer {layer_number}] Token distribution (global expert ids):")
+        for expert_id in range(num_experts if num_experts else w1.shape[0]):
+            count = (topk_ids == expert_id).sum().item()
+            is_local = local_expert_mapping is None or local_expert_mapping[expert_id].item() >= 0
+            print(f"[moe_utils.py]  Expert {expert_id}: {count} tokens, local={is_local}")
+        
+        # Count tokens per local expert (after mapping)
+        print(f"[moe_utils.py][Megatron EP Mapping][Rank {rank}] Token distribution (local expert ids):")
+        for local_id in range(-1, num_local_experts if num_local_experts else w1.shape[0]):
+            count = (topk_ids_local == local_id).sum().item()
+            print(f"[moe_utils.py]  Local ID {local_id}: {count} tokens" + (" (skipped)" if local_id == -1 else ""))
+
+    # Ensure correct dtypes
+    topk_ids_local = topk_ids_local.to(torch.int32)
+    topk_weights = topk_weights.to(torch.float32)
+
     # SGLang expects is_gated=True for SwiGLU-style activations
     is_gated = True
 
-    # Call SGLang's fused experts (debug output is inside fused_experts_impl)
+    # Call SGLang's fused experts
     output = fused_experts_impl(
         hidden_states=hidden_states.contiguous(),
         w1=w1.contiguous(),
         w2=w2.contiguous(),
         topk_weights=topk_weights.contiguous(),
-        topk_ids=topk_ids.contiguous(),
+        topk_ids=topk_ids_local.contiguous(),
         inplace=False,
         activation=activation,
         is_gated=is_gated,
         apply_router_weight_on_input=apply_router_weight_on_input,
+        filter_expert=True,  # Skip experts with id=-1
     )
 
     return output
