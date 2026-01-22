@@ -416,13 +416,14 @@ def sglang_fused_experts(
         for expert_id in range(num_experts if num_experts else w1.shape[0]):
             count = (topk_ids == expert_id).sum().item()
             is_local = local_expert_mapping is None or local_expert_mapping[expert_id].item() >= 0
-            print(f"[moe_utils.py]  Expert {expert_id}: {count} tokens, local={is_local}")
-        
+            #print(f"[moe_utils.py]  Expert {expert_id}: {count} tokens, local={is_local}")
+        print(f"[moe_utils.py] total len of tokens: {num_tokens},")
         # Count tokens per local expert (after mapping)
         print(f"[moe_utils.py][Megatron EP Mapping][Rank {rank}] Token distribution (local expert ids):")
         for local_id in range(-1, num_local_experts if num_local_experts else w1.shape[0]):
             count = (topk_ids_local == local_id).sum().item()
-            print(f"[moe_utils.py]  Local ID {local_id}: {count} tokens" + (" (skipped)" if local_id == -1 else ""))
+            if local_id == -1:
+                print(f"[moe_utils.py]  Local ID {local_id}: {count} tokens" + (" (skipped)" if local_id == -1 else ""))
 
     # Ensure correct dtypes
     topk_ids_local = topk_ids_local.to(torch.int32)
