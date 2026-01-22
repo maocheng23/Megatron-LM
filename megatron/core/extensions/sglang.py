@@ -767,11 +767,13 @@ class SGLangGroupedLinear(MegatronModule):
                 )
 
             # Create sharded tensors with empty prefix (like TE)
+            # IMPORTANT: Pass tp_group to use expert_tensor_parallel_group for MoE experts
             sub_sd = make_sharded_tensors_for_checkpoint(
                 state_dict,
                 '',  # Empty prefix, will be set by replace_prefix_for_sharding
                 tp_axis_map,
                 new_sharded_offsets,
+                tp_group=self.tp_group,  # Use expert TP group, not default TP group
             )
 
             # Update ShardedTensor.key from "{idx}." to expert_prefix (matching TE)
