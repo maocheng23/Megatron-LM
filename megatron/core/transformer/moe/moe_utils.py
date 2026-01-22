@@ -417,13 +417,20 @@ def sglang_fused_experts(
             count = (topk_ids == expert_id).sum().item()
             is_local = local_expert_mapping is None or local_expert_mapping[expert_id].item() >= 0
             #print(f"[moe_utils.py]  Expert {expert_id}: {count} tokens, local={is_local}")
-        print(f"[moe_utils.py] total len of tokens: {num_tokens},")
+        # Print format aligned with SGLang standard.py
+        print(f"[moe_utils.py][Megatron EP Mapping][Rank {rank}][Layer {layer_number}] topk_ids_local.shape: {topk_ids_local.shape}, dtype: {topk_ids_local.dtype}")
+        print(f"[moe_utils.py][Megatron EP Mapping][Rank {rank}][Layer {layer_number}] topk_ids_local[0, :5]: {topk_ids_local[0, :min(5, topk_ids_local.shape[1])].tolist()}")
+        print(f"[moe_utils.py][Megatron EP Mapping][Rank {rank}][Layer {layer_number}] topk_weights.shape: {topk_weights.shape}, dtype: {topk_weights.dtype}")
+        print(f"[moe_utils.py][Megatron EP Mapping][Rank {rank}][Layer {layer_number}] topk_weights[0, :5]: {topk_weights[0, :min(5, topk_weights.shape[1])].tolist()}")
+        print(f"[moe_utils.py][Megatron EP Mapping][Rank {rank}][Layer {layer_number}] hidden_states.shape: {hidden_states.shape}, dtype: {hidden_states.dtype}")
+        print(f"[moe_utils.py][Megatron EP Mapping][Rank {rank}][Layer {layer_number}] hidden_states[0, :5]: {hidden_states[0, :5].tolist()}")
+        
         # Count tokens per local expert (after mapping)
-        print(f"[moe_utils.py][Megatron EP Mapping][Rank {rank}] Token distribution (local expert ids):")
+        print(f"[moe_utils.py][Megatron EP Mapping][Rank {rank}][Layer {layer_number}] Token distribution (local expert ids):")
         for local_id in range(-1, num_local_experts if num_local_experts else w1.shape[0]):
             count = (topk_ids_local == local_id).sum().item()
             if local_id == -1:
-                print(f"[moe_utils.py]  Local ID {local_id}: {count} tokens" + (" (skipped)" if local_id == -1 else ""))
+                print(f"[moe_utils.py]  Local ID {local_id}: {count} tokens (skipped)")
 
     # Ensure correct dtypes
     topk_ids_local = topk_ids_local.to(torch.int32)
