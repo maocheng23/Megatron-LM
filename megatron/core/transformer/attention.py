@@ -1107,12 +1107,18 @@ class Attention(MegatronModule, ABC):
         if os.environ.get("SLIME_DEBUG_ATTN", "0") == "1" and self.layer_number == 1:
             import torch.distributed as dist
             from megatron.core import parallel_state
+            from megatron.core.parallel_state import get_pg_size
             rank = dist.get_rank() if dist.is_initialized() else 0
             tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
+            tp_size = parallel_state.get_tensor_model_parallel_world_size() if parallel_state.is_initialized() else 1
             pos = 91
-            prefix = f"[attention.py][Megatron][Rank {rank}][TP {tp_rank}][Layer {self.layer_number}]"
+            prefix = f"[attention.py][Megatron][Rank {rank}][TP {tp_rank}/{tp_size}][Layer {self.layer_number}]"
+            # Debug linear_proj weight
+            if hasattr(self.linear_proj, 'weight'):
+                print(f"{prefix} linear_proj weight shape: {self.linear_proj.weight.shape}", flush=True)
+                print(f"{prefix} linear_proj weight[0,:5]: {self.linear_proj.weight[0, :5].tolist()}", flush=True)
             output_val = output[pos, 0, :] if output.dim() == 3 else output[pos, :]
-            print(f"{prefix} Attention output (after o_proj)[{pos},:5]: {output_val[:5].tolist()}", flush=True)
+            print(f"{prefix} Attention output (after o_proj, after all-reduce)[{pos},:5]: {output_val[:5].tolist()}", flush=True)
             print(f"{prefix} Attention output norm: {output_val.float().norm().item():.6f}", flush=True)
 
         # Debug logging for o_proj output
