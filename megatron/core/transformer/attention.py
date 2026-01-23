@@ -824,7 +824,7 @@ class Attention(MegatronModule, ABC):
         
         # DEBUG: QKV output (after split, before RoPE)
         import os
-        if os.environ.get("SLIME_DEBUG_ATTN", "0") == "1" and self.layer_number == 1 and split_qkv:
+        if os.environ.get("SLIME_DEBUG_ATTN", "0") == "1" and self.layer_number <= 1 and split_qkv:
             import torch.distributed as dist
             from megatron.core import parallel_state
             rank = dist.get_rank() if dist.is_initialized() else 0
@@ -982,7 +982,7 @@ class Attention(MegatronModule, ABC):
         
         # DEBUG: Q, K after RoPE
         import os
-        if os.environ.get("SLIME_DEBUG_ATTN", "0") == "1" and self.layer_number == 1 and split_qkv:
+        if os.environ.get("SLIME_DEBUG_ATTN", "0") == "1" and self.layer_number <= 2 and split_qkv:
             import torch.distributed as dist
             from megatron.core import parallel_state
             rank = dist.get_rank() if dist.is_initialized() else 0
@@ -991,8 +991,6 @@ class Attention(MegatronModule, ABC):
             prefix = f"[attention.py][Megatron][Rank {rank}][TP {tp_rank}][Layer {self.layer_number}]"
             q_val = query[pos, 0, 0, :5] if query.dim() == 4 else query[pos, :5]
             k_val = key[pos, 0, 0, :5] if key.dim() == 4 else key[pos, :5]
-            print(f"{prefix} After RoPE query[{pos},0,0,:5]: {q_val.tolist()}", flush=True)
-            print(f"{prefix} After RoPE key[{pos},0,0,:5]: {k_val.tolist()}", flush=True)
             print(f"{prefix} After RoPE query norm: {query[pos].float().norm().item():.6f}", flush=True)
             print(f"{prefix} After RoPE key norm: {key[pos].float().norm().item():.6f}", flush=True)
 
@@ -1058,7 +1056,7 @@ class Attention(MegatronModule, ABC):
 
         # DEBUG: Core attention output (before output projection)
         import os
-        if os.environ.get("SLIME_DEBUG_ATTN", "0") == "1" and self.layer_number == 1:
+        if os.environ.get("SLIME_DEBUG_ATTN", "0") == "1" and self.layer_number <= 1:
             import torch.distributed as dist
             from megatron.core import parallel_state
             rank = dist.get_rank() if dist.is_initialized() else 0
@@ -1104,7 +1102,7 @@ class Attention(MegatronModule, ABC):
 
         # DEBUG: Attention output (after o_proj/linear_proj)
         import os
-        if os.environ.get("SLIME_DEBUG_ATTN", "0") == "1" and self.layer_number == 1:
+        if os.environ.get("SLIME_DEBUG_ATTN", "0") == "1" and self.layer_number <= 1:
             import torch
             import torch.distributed as dist
             from megatron.core import parallel_state
