@@ -1105,20 +1105,39 @@ class Attention(MegatronModule, ABC):
         # DEBUG: Attention output (after o_proj/linear_proj)
         import os
         if os.environ.get("SLIME_DEBUG_ATTN", "0") == "1" and self.layer_number == 1:
+            import torch
             import torch.distributed as dist
             from megatron.core import parallel_state
             rank = dist.get_rank() if dist.is_initialized() else 0
             tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
             tp_size = parallel_state.get_tensor_model_parallel_world_size() if parallel_state.is_initialized() else 1
-            pos = 91
+            pos = 0
             prefix = f"[attention.py][Megatron][Rank {rank}][TP {tp_rank}/{tp_size}][Layer {self.layer_number}]"
-            # Debug linear_proj weight
+            
+            # Debug linear_proj weight with sum
             if hasattr(self.linear_proj, 'weight'):
-                print(f"{prefix} linear_proj weight shape: {self.linear_proj.weight.shape}", flush=True)
-                print(f"{prefix} linear_proj weight[0,:5]: {self.linear_proj.weight[0, :5].tolist()}", flush=True)
+                weight = self.linear_proj.weight
+                print(f"{prefix} linear_proj weight shape: {weight.shape}", flush=True)
+                print(f"{prefix} linear_proj weight[0,:5]: {weight[0, :5].tolist()}", flush=True)
+                print(f"{prefix} linear_proj weight sum: {weight.float().sum().item():.6f}", flush=True)
+            
+            # Debug o_proj input (core_attn_out) with sum
+            core_pos = core_attn_out[pos, 0, :] if core_attn_out.dim() == 3 else core_attn_out[pos, :]
+            print(f"{prefix} o_proj input[{pos},:5]: {core_pos[:5].tolist()}", flush=True)
+            print(f"{prefix} o_proj input sum: {core_pos.float().sum().item():.6f}", flush=True)
+            
+            # Compute LOCAL result BEFORE all-reduce for comparison with SGLang
+            with torch.no_grad():
+                weight = self.linear_proj.weight
+                # F.linear does: output = input @ weight.T
+                local_output = torch.nn.functional.linear(core_pos.unsqueeze(0), weight).squeeze(0)
+                print(f"{prefix} Attention output (after o_proj, BEFORE all-reduce)[{pos},:5]: {local_output[:5].tolist()}", flush=True)
+                print(f"{prefix} Attention output sum (BEFORE all-reduce): {local_output.float().sum().item():.6f}", flush=True)
+            
+            # Debug output after all-reduce with sum
             output_val = output[pos, 0, :] if output.dim() == 3 else output[pos, :]
-            print(f"{prefix} Attention output (after o_proj, after all-reduce)[{pos},:5]: {output_val[:5].tolist()}", flush=True)
-            print(f"{prefix} Attention output norm: {output_val.float().norm().item():.6f}", flush=True)
+            print(f"{prefix} Attention output (after o_proj, AFTER all-reduce)[{pos},:5]: {output_val[:5].tolist()}", flush=True)
+            print(f"{prefix} Attention output sum (AFTER all-reduce): {output_val.float().sum().item():.6f}", flush=True)
 
         # Debug logging for o_proj output
         if os.environ.get('SLIME_DEBUG_LOGPROB_DIFF', '0') == '1':
