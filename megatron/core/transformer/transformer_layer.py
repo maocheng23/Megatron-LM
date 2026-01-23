@@ -594,6 +594,19 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         else:
             input_layernorm_output = self.input_layernorm(hidden_states)
 
+        # DEBUG: After input_layernorm (Attention input)
+        import os
+        if os.environ.get("SLIME_DEBUG_ATTN", "0") == "1" and self.layer_number == 1:
+            import torch.distributed as dist
+            from megatron.core import parallel_state
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
+            pos = 91
+            prefix = f"[transformer_layer.py][Megatron][Rank {rank}][TP {tp_rank}][Layer {self.layer_number}]"
+            ln_out = input_layernorm_output[pos, 0, :] if input_layernorm_output.dim() == 3 else input_layernorm_output[pos, :]
+            print(f"{prefix} After input_layernorm (Attn input)[{pos},:5]: {ln_out[:5].tolist()}", flush=True)
+            print(f"{prefix} After input_layernorm norm: {ln_out.float().norm().item():.6f}, sum: {ln_out.float().sum().item():.6f}", flush=True)
+
         using_fused_tp_inference_kernel = (not self.training) and (
             self.config.inference_fuse_tp_communication
         )

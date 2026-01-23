@@ -821,6 +821,24 @@ class Attention(MegatronModule, ABC):
             ), "attention_output_gate is not supported for unsplit mixed_qkv tensor."
             mixed_qkv, qkv_split_arg_list = qkv_output
         nvtx_range_pop(suffix="qkv")
+        
+        # DEBUG: QKV output (after split, before RoPE)
+        import os
+        if os.environ.get("SLIME_DEBUG_ATTN", "0") == "1" and self.layer_number == 1 and split_qkv:
+            import torch.distributed as dist
+            from megatron.core import parallel_state
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
+            pos = 91
+            prefix = f"[attention.py][Megatron][Rank {rank}][TP {tp_rank}][Layer {self.layer_number}]"
+            # query shape: [sq, b, ng, hn] or [sq, b, np, hn]
+            q_val = query[pos, 0, 0, :5] if query.dim() == 4 else query[pos, :5]
+            k_val = key[pos, 0, 0, :5] if key.dim() == 4 else key[pos, :5]
+            v_val = value[pos, 0, 0, :5] if value.dim() == 4 else value[pos, :5]
+            print(f"{prefix} QKV output (before RoPE) query.shape: {query.shape}", flush=True)
+            print(f"{prefix} query[{pos},0,0,:5]: {q_val.tolist()}", flush=True)
+            print(f"{prefix} key[{pos},0,0,:5]: {k_val.tolist()}", flush=True)
+            print(f"{prefix} value[{pos},0,0,:5]: {v_val.tolist()}", flush=True)
 
         # ===================================================
         # Adjust key, value, and rotary_pos_emb for inference
@@ -961,6 +979,22 @@ class Attention(MegatronModule, ABC):
             # otherwise, only relative positional embedding takes effect
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
         nvtx_range_pop(suffix="rotary_pos_emb")
+        
+        # DEBUG: Q, K after RoPE
+        import os
+        if os.environ.get("SLIME_DEBUG_ATTN", "0") == "1" and self.layer_number == 1 and split_qkv:
+            import torch.distributed as dist
+            from megatron.core import parallel_state
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
+            pos = 91
+            prefix = f"[attention.py][Megatron][Rank {rank}][TP {tp_rank}][Layer {self.layer_number}]"
+            q_val = query[pos, 0, 0, :5] if query.dim() == 4 else query[pos, :5]
+            k_val = key[pos, 0, 0, :5] if key.dim() == 4 else key[pos, :5]
+            print(f"{prefix} After RoPE query[{pos},0,0,:5]: {q_val.tolist()}", flush=True)
+            print(f"{prefix} After RoPE key[{pos},0,0,:5]: {k_val.tolist()}", flush=True)
+            print(f"{prefix} After RoPE query norm: {query[pos].float().norm().item():.6f}", flush=True)
+            print(f"{prefix} After RoPE key norm: {key[pos].float().norm().item():.6f}", flush=True)
 
         # ==================================
         # core attention computation
@@ -1022,6 +1056,20 @@ class Attention(MegatronModule, ABC):
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
         nvtx_range_pop(suffix="core_attention")
 
+        # DEBUG: Core attention output (before output projection)
+        import os
+        if os.environ.get("SLIME_DEBUG_ATTN", "0") == "1" and self.layer_number == 1:
+            import torch.distributed as dist
+            from megatron.core import parallel_state
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
+            pos = 91
+            prefix = f"[attention.py][Megatron][Rank {rank}][TP {tp_rank}][Layer {self.layer_number}]"
+            attn_out = core_attn_out[pos, 0, :] if core_attn_out.dim() == 3 else core_attn_out[pos, :]
+            print(f"{prefix} Core attention output shape: {core_attn_out.shape}", flush=True)
+            print(f"{prefix} Core attention output[{pos},:5]: {attn_out[:5].tolist()}", flush=True)
+            print(f"{prefix} Core attention output norm: {attn_out.float().norm().item():.6f}", flush=True)
+
         # Output gate
         if gate is not None:
             nvtx_range_push(suffix="output_gate")
@@ -1054,8 +1102,20 @@ class Attention(MegatronModule, ABC):
         output, bias = self.linear_proj(core_attn_out)
         nvtx_range_pop(suffix="linear_proj")
 
-        # Debug logging for o_proj output
+        # DEBUG: Attention output (after o_proj/linear_proj)
         import os
+        if os.environ.get("SLIME_DEBUG_ATTN", "0") == "1" and self.layer_number == 1:
+            import torch.distributed as dist
+            from megatron.core import parallel_state
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
+            pos = 91
+            prefix = f"[attention.py][Megatron][Rank {rank}][TP {tp_rank}][Layer {self.layer_number}]"
+            output_val = output[pos, 0, :] if output.dim() == 3 else output[pos, :]
+            print(f"{prefix} Attention output (after o_proj)[{pos},:5]: {output_val[:5].tolist()}", flush=True)
+            print(f"{prefix} Attention output norm: {output_val.float().norm().item():.6f}", flush=True)
+
+        # Debug logging for o_proj output
         if os.environ.get('SLIME_DEBUG_LOGPROB_DIFF', '0') == '1':
             import torch.distributed as dist
             from megatron.core import parallel_state
