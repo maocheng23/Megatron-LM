@@ -757,22 +757,23 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         else:
             pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
 
-        # Debug logging for MLP input (after pre_mlp_layernorm)
+        # Debug logging for MLP input (after pre_mlp_layernorm) - aligned with SGLang
         import os
-        if os.environ.get('SLIME_DEBUG_LOGPROB_DIFF', '0') == '1':
+        if os.environ.get('SLIME_DEBUG_ATTN', '0') == '1' and self.layer_number <= 2:
             import torch.distributed as dist
             from megatron.core import parallel_state
             rank = dist.get_rank() if dist.is_initialized() else 0
             tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
-            if self.layer_number <= 2:
-                position = 91
-                mlp_in = pre_mlp_layernorm_output[position, 0, :] if pre_mlp_layernorm_output.dim() == 3 else pre_mlp_layernorm_output[position, :]
-                print(
-                    f"[DEBUG Megatron Layer {self.layer_number} MLP INPUT (after pre_mlp_layernorm)] rank={rank}, tp_rank={tp_rank}, "
-                    f"position={position}, shape={mlp_in.shape}, sum={mlp_in.float().sum().item():.6f}, "
-                    f"first 5={mlp_in.flatten()[:5].float().tolist()}",
-                    flush=True
-                )
+            tp_size = parallel_state.get_tensor_model_parallel_world_size() if parallel_state.is_initialized() else 1
+            pos = 0
+            prefix = f"[transformer_layer.py][Megatron][TP {tp_rank}/{tp_size}][Layer {self.layer_number}]"
+            mlp_in = pre_mlp_layernorm_output[pos, 0, :] if pre_mlp_layernorm_output.dim() == 3 else pre_mlp_layernorm_output[pos, :]
+            print(f"{prefix} After prepare_mlp (all-reduce + LN) = MLP INPUT, hidden_states[{pos},:5]: {mlp_in[:5].tolist()}", flush=True)
+            print(f"{prefix} After prepare_mlp = MLP INPUT, hidden_states sum: {mlp_in.float().sum().item():.6f}", flush=True)
+            if residual is not None:
+                res_val = residual[pos, 0, :] if residual.dim() == 3 else residual[pos, :]
+                print(f"{prefix} After prepare_mlp, residual[{pos},:5]: {res_val[:5].tolist()}", flush=True)
+                print(f"{prefix} After prepare_mlp, residual sum: {res_val.float().sum().item():.6f}", flush=True)
 
         # DEBUG: After pre_mlp_layernorm (MoE input) - aligned with SGLang debug
         if os.environ.get("SLIME_DEBUG_ROUTER", "0") == "1" and self.layer_number == 1:
@@ -838,21 +839,19 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         mlp_output = self.post_mlp_layernorm(mlp_output)
         mlp_output_with_bias = (mlp_output, mlp_output_bias)
 
-        # Debug logging for MLP output (before final residual add)
+        # Debug logging for MLP output (before final residual add) - aligned with SGLang
         import os
-        if os.environ.get('SLIME_DEBUG_LOGPROB_DIFF', '0') == '1':
+        if os.environ.get('SLIME_DEBUG_ATTN', '0') == '1' and self.layer_number <= 2:
             import torch.distributed as dist
+            from megatron.core import parallel_state
             rank = dist.get_rank() if dist.is_initialized() else 0
             tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
-            if self.layer_number <= 2:
-                position = 91
-                mlp_output_pos = mlp_output[position, :]
-                print(
-                    f"[DEBUG Megatron Layer {self.layer_number} MLP OUTPUT (before final residual)] rank={rank}, tp_rank={tp_rank}, "
-                    f"position={position}, shape={mlp_output_pos.shape}, sum={mlp_output_pos.float().sum().item():.6f}, "
-                    f"first 5={mlp_output_pos.flatten()[:5].float().tolist()}",
-                    flush=True
-                )
+            tp_size = parallel_state.get_tensor_model_parallel_world_size() if parallel_state.is_initialized() else 1
+            pos = 0
+            prefix = f"[transformer_layer.py][Megatron][TP {tp_rank}/{tp_size}][Layer {self.layer_number}]"
+            mlp_output_pos = mlp_output[pos, 0, :] if mlp_output.dim() == 3 else mlp_output[pos, :]
+            print(f"{prefix} After MLP (before postprocess) = MLP OUTPUT, hidden_states[{pos},:5]: {mlp_output_pos[:5].tolist()}", flush=True)
+            print(f"{prefix} After MLP = MLP OUTPUT, hidden_states sum: {mlp_output_pos.float().sum().item():.6f}", flush=True)
 
         if self.recompute_pre_mlp_layernorm:
             # discard the output of the pre-mlp layernorm and register the recompute
@@ -920,21 +919,19 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
 
-        # Debug logging for final layer output (after MLP + residual)
+        # Debug logging for final layer output (after MLP + residual) - aligned with SGLang
         import os
-        if os.environ.get('SLIME_DEBUG_LOGPROB_DIFF', '0') == '1':
+        if os.environ.get('SLIME_DEBUG_ATTN', '0') == '1' and self.layer_number <= 2:
             import torch.distributed as dist
+            from megatron.core import parallel_state
             rank = dist.get_rank() if dist.is_initialized() else 0
             tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
-            if self.layer_number <= 2:
-                position = 91
-                output_pos = output[position, :]
-                print(
-                    f"[DEBUG Megatron Layer {self.layer_number} FINAL OUTPUT] rank={rank}, tp_rank={tp_rank}, "
-                    f"position={position}, shape={output_pos.shape}, sum={output_pos.float().sum().item():.6f}, "
-                    f"first 5={output_pos.flatten()[:5].float().tolist()}",
-                    flush=True
-                )
+            tp_size = parallel_state.get_tensor_model_parallel_world_size() if parallel_state.is_initialized() else 1
+            pos = 0
+            prefix = f"[transformer_layer.py][Megatron][TP {tp_rank}/{tp_size}][Layer {self.layer_number}]"
+            output_pos = output[pos, 0, :] if output.dim() == 3 else output[pos, :]
+            print(f"{prefix} After postprocess_layer = LAYER OUTPUT, hidden_states[{pos},:5]: {output_pos[:5].tolist()}", flush=True)
+            print(f"{prefix} After postprocess_layer = LAYER OUTPUT, hidden_states sum: {output_pos.float().sum().item():.6f}", flush=True)
 
         return output
 
