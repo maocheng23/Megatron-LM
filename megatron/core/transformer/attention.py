@@ -824,7 +824,7 @@ class Attention(MegatronModule, ABC):
         
         # DEBUG: QKV output (after split, before RoPE)
         import os
-        if os.environ.get("SLIME_DEBUG_ATTN", "0") == "1" and self.layer_number <= 1 and split_qkv:
+        if os.environ.get("SLIME_DEBUG_ATTN", "0") == "1" and self.layer_number <= 2 and split_qkv:
             import torch.distributed as dist
             from megatron.core import parallel_state
             rank = dist.get_rank() if dist.is_initialized() else 0
@@ -1056,7 +1056,7 @@ class Attention(MegatronModule, ABC):
 
         # DEBUG: Core attention output (before output projection)
         import os
-        if os.environ.get("SLIME_DEBUG_ATTN", "0") == "1" and self.layer_number <= 1:
+        if os.environ.get("SLIME_DEBUG_ATTN", "0") == "1" and self.layer_number <= 2:
             import torch.distributed as dist
             from megatron.core import parallel_state
             rank = dist.get_rank() if dist.is_initialized() else 0
@@ -1084,7 +1084,7 @@ class Attention(MegatronModule, ABC):
             from megatron.core import parallel_state
             rank = dist.get_rank() if dist.is_initialized() else 0
             tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
-            if self.layer_number <= 1:
+            if self.layer_number <= 2:
                 position = 91
                 # core_attn_out shape: [sq, b, hidden_size_per_partition]
                 # For batch=1, squeeze to get [hidden_size_per_partition]
@@ -1102,7 +1102,7 @@ class Attention(MegatronModule, ABC):
 
         # DEBUG: Attention output (after o_proj/linear_proj)
         import os
-        if os.environ.get("SLIME_DEBUG_ATTN", "0") == "1" and self.layer_number <= 1:
+        if os.environ.get("SLIME_DEBUG_ATTN", "0") == "1" and self.layer_number <= 2:
             import torch
             import torch.distributed as dist
             from megatron.core import parallel_state
@@ -1143,7 +1143,7 @@ class Attention(MegatronModule, ABC):
             from megatron.core import parallel_state
             rank = dist.get_rank() if dist.is_initialized() else 0
             tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
-            if self.layer_number <= 1:
+            if self.layer_number <= 2:
                 position = 91
                 # output shape: [sq, b, hidden_size]
                 # For batch=1, squeeze to get [hidden_size]
