@@ -681,7 +681,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             from megatron.core import parallel_state
             rank = dist.get_rank() if dist.is_initialized() else 0
             tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
-            if self.layer_number <= 1:
+            if self.layer_number <= 2:
                 position = 91
                 hs_pos = hidden_states[position, 0, :] if hidden_states.dim() == 3 else hidden_states[position, :]
                 print(
@@ -738,7 +738,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             from megatron.core import parallel_state
             rank = dist.get_rank() if dist.is_initialized() else 0
             tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
-            if self.layer_number <= 1:
+            if self.layer_number <= 2:
                 position = 91
                 mlp_in = residual[position, 0, :] if residual.dim() == 3 else residual[position, :]
                 print(
@@ -764,7 +764,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             from megatron.core import parallel_state
             rank = dist.get_rank() if dist.is_initialized() else 0
             tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
-            if self.layer_number <= 1:
+            if self.layer_number <= 2:
                 position = 91
                 mlp_in = pre_mlp_layernorm_output[position, 0, :] if pre_mlp_layernorm_output.dim() == 3 else pre_mlp_layernorm_output[position, :]
                 print(
@@ -844,7 +844,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             import torch.distributed as dist
             rank = dist.get_rank() if dist.is_initialized() else 0
             tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
-            if self.layer_number <= 1:
+            if self.layer_number <= 2:
                 position = 91
                 mlp_output_pos = mlp_output[position, :]
                 print(
@@ -926,7 +926,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             import torch.distributed as dist
             rank = dist.get_rank() if dist.is_initialized() else 0
             tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
-            if self.layer_number <= 1:
+            if self.layer_number <= 2:
                 position = 91
                 output_pos = output[position, :]
                 print(
