@@ -1,5 +1,6 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
+import os
 import torch
 
 from megatron.core.parallel_state import get_global_memory_buffer
@@ -19,6 +20,36 @@ except:
     dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
 
 
+def _tree_all_reduce_sum(x: torch.Tensor, group) -> torch.Tensor:
+    """
+    Deterministic all-reduce using all_gather + local tree sum.
+    This matches SGLang's tree_all_reduce_sum for true on-policy consistency.
+    
+    The sum order is fixed by the tree structure, ensuring deterministic results
+    regardless of NCCL internal implementation details.
+    """
+    world_size = group.size()
+    
+    if world_size & (world_size - 1) != 0:
+        raise ValueError(
+            "world_size must be the power of 2 in order to use tree_all_reduce_sum."
+        )
+    
+    # All-gather to collect data from all ranks
+    result = [torch.zeros_like(x) for _ in range(world_size)]
+    torch.distributed.all_gather(result, x.contiguous(), group=group)
+    
+    # Tree-structured sum for deterministic order
+    for level in range(1, world_size.bit_length()):
+        for left in range(0, world_size, 1 << level):
+            right = left + (1 << (level - 1))
+            result[left] += result[right]
+    
+    # Copy result back to input tensor (in-place semantics like torch.distributed.all_reduce)
+    x.copy_(result[0])
+    return x
+
+
 def _reduce(input_, group):
     """All-reduce the input tensor across model parallel group."""
     assert group is not None, "group should not be None"
@@ -27,7 +58,11 @@ def _reduce(input_, group):
     if group.size() == 1:
         return input_
 
-    # All-reduce.
+    # Use deterministic tree all-reduce for true on-policy mode
+    if os.environ.get("MEGATRON_USE_DETERMINISTIC_ALLREDUCE", "0") == "1":
+        return _tree_all_reduce_sum(input_, group)
+    
+    # Default: standard NCCL all-reduce
     torch.distributed.all_reduce(input_.contiguous(), group=group)
 
     return input_
