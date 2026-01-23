@@ -456,6 +456,20 @@ class MoELayer(BaseMoELayer):
         Returns:
             A tuple containing the output tensor and the MLP bias, if any.
         """
+        # DEBUG: MoE input
+        debug_moe = os.environ.get("SLIME_DEBUG_ATTN", "0") == "1" and self.layer_number == 1
+        if debug_moe:
+            import torch.distributed as dist
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            tp_rank = utils.get_pg_rank(self.tp_group)
+            tp_size = utils.get_pg_size(self.tp_group)
+            pos = 0
+            # Flatten to 2D for consistent logging
+            hs_2d = hidden_states.view(-1, hidden_states.shape[-1]) if len(hidden_states.shape) == 3 else hidden_states
+            prefix = f"[moe_layer.py][Megatron MoE][Rank {rank}][TP {tp_rank}/{tp_size}][Layer {self.layer_number}]"
+            print(f"{prefix} MoE INPUT hidden_states[{pos},:5]: {hs_2d[pos, :5].tolist()}")
+            print(f"{prefix} MoE INPUT hidden_states sum: {hs_2d[pos].float().sum().item():.6f}")
+
         if self.training and self.attn_tp_group.size() > 1 and not self.config.sequence_parallel:
             raise ValueError(
                 "During training, performance may degrade if MoE and tensor parallelism"
@@ -507,6 +521,13 @@ class MoELayer(BaseMoELayer):
                 outputs = tensor_parallel.checkpoint(custom_forward, False, hidden_states)
         else:
             outputs = custom_forward(hidden_states)
+
+        # DEBUG: MoE output
+        if debug_moe:
+            output_tensor = outputs[0] if isinstance(outputs, tuple) else outputs
+            out_2d = output_tensor.view(-1, output_tensor.shape[-1]) if len(output_tensor.shape) == 3 else output_tensor
+            print(f"{prefix} MoE OUTPUT[{pos},:5]: {out_2d[pos, :5].tolist()}")
+            print(f"{prefix} MoE OUTPUT sum: {out_2d[pos].float().sum().item():.6f}")
 
         return outputs
 
