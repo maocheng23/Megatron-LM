@@ -397,11 +397,25 @@ class MoELayer(BaseMoELayer):
         # Get expert weights (only local experts)
         w1, w2 = self._get_expert_weights_for_sglang()
 
-        # Debug: verify weight shapes
-        if os.environ.get("DEBUG_MEGATRON_EP_MAPPING", "0") == "1" and self.layer_number <= 1:
+        # Debug: verify weight shapes and values
+        debug_experts = os.environ.get("SLIME_DEBUG_ATTN", "0") == "1" and self.layer_number == 1
+        if debug_experts:
             import torch.distributed as dist
             rank = dist.get_rank() if dist.is_initialized() else 0
-            print(f"[moe_layer.py][Megatron _sglang_forward][Rank {rank}][Layer {self.layer_number}] w1 shape: {w1.shape}, w2 shape: {w2.shape}")
+            tp_rank = utils.get_pg_rank(self.tp_group)
+            tp_size = utils.get_pg_size(self.tp_group)
+            pos = 0
+            prefix = f"[moe_layer.py][Megatron MoE][Rank {rank}][TP {tp_rank}/{tp_size}][Layer {self.layer_number}]"
+            print(f"{prefix} w1.shape: {w1.shape}, w2.shape: {w2.shape}")
+            print(f"{prefix} w1[0,0,:5]: {w1[0, 0, :5].tolist()}")
+            print(f"{prefix} w1 sum: {w1.float().sum().item():.6f}")
+            print(f"{prefix} w2[0,0,:5]: {w2[0, 0, :5].tolist()}")
+            print(f"{prefix} w2 sum: {w2.float().sum().item():.6f}")
+            # Expert input
+            print(f"{prefix} Expert INPUT hidden_states_2d[{pos},:5]: {hidden_states_2d[pos, :5].tolist()}")
+            print(f"{prefix} Expert INPUT hidden_states_2d sum: {hidden_states_2d[pos].float().sum().item():.6f}")
+            print(f"{prefix} topk_weights[{pos},:]: {topk_weights[pos, :].tolist()}")
+            print(f"{prefix} topk_ids[{pos},:]: {topk_ids[pos, :].tolist()}")
 
         # Call SGLang's fused experts with EP parameters
         output = sglang_fused_experts(
@@ -419,17 +433,19 @@ class MoELayer(BaseMoELayer):
             ep_size=ep_size,
         )
 
+        # DEBUG: Expert output before all-reduce
+        if debug_experts:
+            print(f"{prefix} Expert OUTPUT (BEFORE EP all-reduce)[{pos},:5]: {output[pos, :5].tolist()}")
+            print(f"{prefix} Expert OUTPUT sum (BEFORE EP all-reduce): {output[pos].float().sum().item():.6f}")
+
         # EP mode: all-reduce to sum contributions from all EP ranks
         if ep_size > 1:
-            if os.environ.get("DEBUG_MEGATRON_EP_MAPPING", "0") == "1":
-                import torch.distributed as dist
-                rank = dist.get_rank() if dist.is_initialized() else 0
-                print(f"[moe_layer.py][Megatron _sglang_forward][Rank {rank}] Before all-reduce, output norm: {output.norm().item():.6f}")
-            
             torch.distributed.all_reduce(output, group=self.ep_group)
             
-            if os.environ.get("DEBUG_MEGATRON_EP_MAPPING", "0") == "1":
-                print(f"[moe_layer.py][Megatron _sglang_forward][Rank {rank}] After all-reduce, output norm: {output.norm().item():.6f}")
+            # DEBUG: Expert output after EP all-reduce
+            if debug_experts:
+                print(f"{prefix} Expert OUTPUT (AFTER EP all-reduce)[{pos},:5]: {output[pos, :5].tolist()}")
+                print(f"{prefix} Expert OUTPUT sum (AFTER EP all-reduce): {output[pos].float().sum().item():.6f}")
 
         # Reshape output if needed
         if len(original_shape) == 3:
