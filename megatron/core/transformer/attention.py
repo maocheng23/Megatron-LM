@@ -1107,7 +1107,6 @@ class Attention(MegatronModule, ABC):
         if os.environ.get("SLIME_DEBUG_ATTN", "0") == "1" and self.layer_number == 1:
             import torch.distributed as dist
             from megatron.core import parallel_state
-            from megatron.core.parallel_state import get_pg_size
             rank = dist.get_rank() if dist.is_initialized() else 0
             tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
             tp_size = parallel_state.get_tensor_model_parallel_world_size() if parallel_state.is_initialized() else 1
