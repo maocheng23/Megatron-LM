@@ -676,6 +676,18 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         
         # Debug logging for after residual add (before MLP)
         import os
+        if os.environ.get('SLIME_DEBUG_ATTN', '0') == '1' and self.layer_number <= 2:
+            import torch.distributed as dist
+            from megatron.core import parallel_state
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
+            tp_size = parallel_state.get_tensor_model_parallel_world_size() if parallel_state.is_initialized() else 1
+            pos = 0
+            prefix = f"[transformer_layer.py][Megatron][TP {tp_rank}/{tp_size}][Layer {self.layer_number}]"
+            hs_pos = hidden_states[pos, 0, :] if hidden_states.dim() == 3 else hidden_states[pos, :]
+            print(f"{prefix} Step2: After resadd (self_attn_bda)[{pos},:5]: {hs_pos[:5].tolist()}", flush=True)
+            print(f"{prefix} Step2: After resadd sum: {hs_pos.float().sum().item():.6f}", flush=True)
+        
         if os.environ.get('SLIME_DEBUG_LOGPROB_DIFF', '0') == '1':
             import torch.distributed as dist
             from megatron.core import parallel_state
@@ -748,6 +760,36 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     flush=True
                 )
                 
+        # DEBUG: Before pre_mlp_layernorm - trace steps for comparison with SGLang
+        import os
+        debug_layer = os.environ.get('SLIME_DEBUG_ATTN', '0') == '1' and self.layer_number <= 2
+        if debug_layer:
+            import torch.distributed as dist
+            from megatron.core import parallel_state
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
+            tp_size = parallel_state.get_tensor_model_parallel_world_size() if parallel_state.is_initialized() else 1
+            pos = 0
+            prefix = f"[transformer_layer.py][Megatron][TP {tp_rank}/{tp_size}][Layer {self.layer_number}]"
+            
+            hs_val = hidden_states[pos, 0, :] if hidden_states.dim() == 3 else hidden_states[pos, :]
+            res_val = residual[pos, 0, :] if residual.dim() == 3 else residual[pos, :]
+            
+            print(f"{prefix} hidden_states (attn+res, input to LN)[{pos},:5]: {hs_val[:5].tolist()}", flush=True)
+            print(f"{prefix} hidden_states sum: {hs_val.float().sum().item():.6f}", flush=True)
+            
+            # Manual layernorm to compare
+            hs_for_ln = hs_val.to(torch.float32)
+            variance = hs_for_ln.pow(2).mean()
+            eps = self.pre_mlp_layernorm.variance_epsilon if hasattr(self.pre_mlp_layernorm, 'variance_epsilon') else getattr(self.pre_mlp_layernorm, 'eps', 1e-6)
+            manual_normalized = hs_for_ln * torch.rsqrt(variance + eps)
+            if hasattr(self.pre_mlp_layernorm, 'weight'):
+                weight = self.pre_mlp_layernorm.weight.data
+                manual_ln_out = weight * manual_normalized.to(hidden_states.dtype)
+                print(f"{prefix} Manual LN output[:5]: {manual_ln_out[:5].tolist()}", flush=True)
+                print(f"{prefix} LN weight[:5]: {weight[:5].tolist()}", flush=True)
+            print(f"{prefix} LN epsilon: {eps}", flush=True)
+
         # Optional Layer norm post the cross-attention.
         if self.recompute_pre_mlp_layernorm:
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
