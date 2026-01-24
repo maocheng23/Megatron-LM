@@ -404,7 +404,7 @@ class MoELayer(BaseMoELayer):
             rank = dist.get_rank() if dist.is_initialized() else 0
             tp_rank = utils.get_pg_rank(self.tp_group)
             tp_size = utils.get_pg_size(self.tp_group)
-            pos = 0
+            pos = 91
             prefix = f"[moe_layer.py][Megatron MoE][Rank {rank}][TP {tp_rank}/{tp_size}][Layer {self.layer_number}]"
             print(f"{prefix} w1.shape: {w1.shape}, w2.shape: {w2.shape}")
             print(f"{prefix} w1[0,0,:5]: {w1[0, 0, :5].tolist()}")
