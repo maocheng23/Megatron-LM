@@ -656,6 +656,32 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 res_val = residual[pos, 0, :] if residual.dim() == 3 else residual[pos, :]
                 print(f"{prefix} Residual[{pos},:5]: {res_val[:5].tolist()}", flush=True)
         
+        # Debug logging BEFORE post_self_attn_layernorm - this is the TRUE Step1 (matches SGLang)
+        import os
+        if os.environ.get('SLIME_DEBUG_ATTN', '0') == '1' and self.layer_number <= 2:
+            import torch.distributed as dist
+            from megatron.core import parallel_state
+            tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
+            tp_size = parallel_state.get_tensor_model_parallel_world_size() if parallel_state.is_initialized() else 1
+            pos = 91
+            prefix = f"[transformer_layer.py][Megatron][TP {tp_rank}/{tp_size}][Layer {self.layer_number}]"
+            
+            # TRUE Step1: attention_output BEFORE post_self_attn_layernorm (matches SGLang's Step1)
+            attn_pos_raw = attention_output[pos, 0, :] if attention_output.dim() == 3 else attention_output[pos, :]
+            print(f"{prefix} Step1 (BEFORE post_self_attn_ln)[{pos},:5]: {attn_pos_raw[:5].tolist()}", flush=True)
+            print(f"{prefix} Step1 (BEFORE post_self_attn_ln) sum: {attn_pos_raw.float().sum().item():.6f}", flush=True)
+            
+            # Residual for TRUE Step2 calculation
+            res_pos_raw = residual[pos, 0, :] if residual.dim() == 3 else residual[pos, :]
+            print(f"{prefix} Residual[{pos},:5]: {res_pos_raw[:5].tolist()}", flush=True)
+            print(f"{prefix} Residual sum: {res_pos_raw.float().sum().item():.6f}", flush=True)
+            
+            # TRUE Step2: raw_attn + residual (bf16 + bf16) - This should match SGLang's Step2!
+            manual_step2_raw = attn_pos_raw + res_pos_raw
+            print(f"{prefix} Step2 (raw_attn + res)[{pos},:5]: {manual_step2_raw[:5].tolist()}", flush=True)
+            print(f"{prefix} Step2 (raw_attn + res) sum: {manual_step2_raw.float().sum().item():.6f}", flush=True)
+            print(f"{prefix} dtypes - attn: {attention_output.dtype}, res: {residual.dtype}", flush=True)
+        
         attention_output = self.post_self_attn_layernorm(attention_output)
         attention_output_with_bias = (attention_output, attention_output_bias)
 
@@ -674,19 +700,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 )
         nvtx_range_pop(suffix="self_attn_bda")
         
-        # Debug logging for after residual add (before MLP)
-        import os
+        # Debug logging AFTER self_attn_bda
         if os.environ.get('SLIME_DEBUG_ATTN', '0') == '1' and self.layer_number <= 2:
-            import torch.distributed as dist
-            from megatron.core import parallel_state
-            rank = dist.get_rank() if dist.is_initialized() else 0
             tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
             tp_size = parallel_state.get_tensor_model_parallel_world_size() if parallel_state.is_initialized() else 1
-            pos = 91  # SGLang pos=0 corresponds to Megatron pos=91 due to different tensor layouts
+            pos = 91
             prefix = f"[transformer_layer.py][Megatron][TP {tp_rank}/{tp_size}][Layer {self.layer_number}]"
             hs_pos = hidden_states[pos, 0, :] if hidden_states.dim() == 3 else hidden_states[pos, :]
-            print(f"{prefix} Step2: After resadd (self_attn_bda)[{pos},:5]: {hs_pos[:5].tolist()}", flush=True)
-            print(f"{prefix} Step2: After resadd sum: {hs_pos.float().sum().item():.6f}", flush=True)
+            print(f"{prefix} Step2 (actual bda result)[{pos},:5]: {hs_pos[:5].tolist()}", flush=True)
+            print(f"{prefix} Step2 (actual bda result) sum: {hs_pos.float().sum().item():.6f}", flush=True)
         
         if os.environ.get('SLIME_DEBUG_LOGPROB_DIFF', '0') == '1':
             import torch.distributed as dist
