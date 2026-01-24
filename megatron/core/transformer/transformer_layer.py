@@ -682,7 +682,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             rank = dist.get_rank() if dist.is_initialized() else 0
             tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
             tp_size = parallel_state.get_tensor_model_parallel_world_size() if parallel_state.is_initialized() else 1
-            pos = 0
+            pos = 91
             prefix = f"[transformer_layer.py][Megatron][TP {tp_rank}/{tp_size}][Layer {self.layer_number}]"
             hs_pos = hidden_states[pos, 0, :] if hidden_states.dim() == 3 else hidden_states[pos, :]
             print(f"{prefix} Step2: After resadd (self_attn_bda)[{pos},:5]: {hs_pos[:5].tolist()}", flush=True)
@@ -769,7 +769,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             rank = dist.get_rank() if dist.is_initialized() else 0
             tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
             tp_size = parallel_state.get_tensor_model_parallel_world_size() if parallel_state.is_initialized() else 1
-            pos = 0
+            pos = 91
             prefix = f"[transformer_layer.py][Megatron][TP {tp_rank}/{tp_size}][Layer {self.layer_number}]"
             
             hs_val = hidden_states[pos, 0, :] if hidden_states.dim() == 3 else hidden_states[pos, :]
@@ -807,7 +807,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             rank = dist.get_rank() if dist.is_initialized() else 0
             tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
             tp_size = parallel_state.get_tensor_model_parallel_world_size() if parallel_state.is_initialized() else 1
-            pos = 0
+            pos = 91
             prefix = f"[transformer_layer.py][Megatron][TP {tp_rank}/{tp_size}][Layer {self.layer_number}]"
             mlp_in = pre_mlp_layernorm_output[pos, 0, :] if pre_mlp_layernorm_output.dim() == 3 else pre_mlp_layernorm_output[pos, :]
             print(f"{prefix} After prepare_mlp (all-reduce + LN) = MLP INPUT, hidden_states[{pos},:5]: {mlp_in[:5].tolist()}", flush=True)
@@ -889,7 +889,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             rank = dist.get_rank() if dist.is_initialized() else 0
             tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
             tp_size = parallel_state.get_tensor_model_parallel_world_size() if parallel_state.is_initialized() else 1
-            pos = 0
+            pos = 91
             prefix = f"[transformer_layer.py][Megatron][TP {tp_rank}/{tp_size}][Layer {self.layer_number}]"
             mlp_output_pos = mlp_output[pos, 0, :] if mlp_output.dim() == 3 else mlp_output[pos, :]
             print(f"{prefix} After MLP (before postprocess) = MLP OUTPUT, hidden_states[{pos},:5]: {mlp_output_pos[:5].tolist()}", flush=True)
@@ -969,7 +969,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             rank = dist.get_rank() if dist.is_initialized() else 0
             tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
             tp_size = parallel_state.get_tensor_model_parallel_world_size() if parallel_state.is_initialized() else 1
-            pos = 0
+            pos = 91
             prefix = f"[transformer_layer.py][Megatron][TP {tp_rank}/{tp_size}][Layer {self.layer_number}]"
             output_pos = output[pos, 0, :] if output.dim() == 3 else output[pos, :]
             print(f"{prefix} After postprocess_layer = LAYER OUTPUT, hidden_states[{pos},:5]: {output_pos[:5].tolist()}", flush=True)
