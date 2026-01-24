@@ -675,6 +675,25 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         #   is called here to be future-proof and corner-case-proof.
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
 
+        # DEBUG: Embedding output (input to first transformer layer)
+        import os
+        if os.environ.get("SLIME_DEBUG_ATTN", "0") == "1" and self.pre_process:
+            import torch.distributed as dist
+            from megatron.core import parallel_state
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
+            tp_size = parallel_state.get_tensor_model_parallel_world_size() if parallel_state.is_initialized() else 1
+            pos = 0
+            prefix = f"[transformer_block.py][Megatron EMBEDDING][TP {tp_rank}/{tp_size}]"
+            # Handle both 3D (SBH) and 2D formats
+            if hidden_states.dim() == 3:
+                emb_out = hidden_states[pos, 0, :]
+            else:
+                emb_out = hidden_states[pos, :]
+            print(f"{prefix} Embedding output (first layer input)[{pos},:5]: {emb_out[:5].tolist()}", flush=True)
+            print(f"{prefix} Embedding output sum: {emb_out.float().sum().item():.6f}", flush=True)
+            print(f"{prefix} Embedding output shape: {hidden_states.shape}", flush=True)
+
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
         else:

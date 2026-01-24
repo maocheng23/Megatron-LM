@@ -1109,7 +1109,7 @@ class Attention(MegatronModule, ABC):
             rank = dist.get_rank() if dist.is_initialized() else 0
             tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
             tp_size = parallel_state.get_tensor_model_parallel_world_size() if parallel_state.is_initialized() else 1
-            pos = 0
+            pos = 91
             prefix = f"[attention.py][Megatron][Rank {rank}][TP {tp_rank}/{tp_size}][Layer {self.layer_number}]"
             
             # Debug linear_proj weight with sum
