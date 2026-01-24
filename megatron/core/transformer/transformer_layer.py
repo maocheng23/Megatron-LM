@@ -811,6 +811,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 print(f"{prefix} Manual LN output[:5]: {manual_ln_out[:5].tolist()}", flush=True)
                 print(f"{prefix} LN weight[:5]: {weight[:5].tolist()}", flush=True)
             print(f"{prefix} LN epsilon: {eps}", flush=True)
+            print(f"{prefix} Manual variance: {variance.item():.10f}", flush=True)
+            print(f"{prefix} Manual sqrt(variance): {torch.sqrt(variance).item():.10f}", flush=True)
+            print(f"{prefix} pre_mlp_layernorm type: {type(self.pre_mlp_layernorm).__name__}", flush=True)
+            # Check for variance_size_override
+            if hasattr(self.pre_mlp_layernorm, 'variance_size_override'):
+                print(f"{prefix} variance_size_override: {self.pre_mlp_layernorm.variance_size_override}", flush=True)
 
         # Optional Layer norm post the cross-attention.
         if self.recompute_pre_mlp_layernorm:
@@ -827,6 +833,23 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             import torch.distributed as dist
             from megatron.core import parallel_state
             rank = dist.get_rank() if dist.is_initialized() else 0
+            
+            # Reverse-engineer the variance used by actual LayerNorm
+            # output = weight * input / sqrt(variance + eps)
+            # sqrt(variance + eps) = weight * input / output
+            tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
+            tp_size = parallel_state.get_tensor_model_parallel_world_size() if parallel_state.is_initialized() else 1
+            pos = 91
+            prefix = f"[transformer_layer.py][Megatron][TP {tp_rank}/{tp_size}][Layer {self.layer_number}]"
+            input_val = hidden_states[pos, 0, :] if hidden_states.dim() == 3 else hidden_states[pos, :]
+            output_val = pre_mlp_layernorm_output[pos, 0, :] if pre_mlp_layernorm_output.dim() == 3 else pre_mlp_layernorm_output[pos, :]
+            weight = self.pre_mlp_layernorm.weight.data if hasattr(self.pre_mlp_layernorm, 'weight') else None
+            if weight is not None:
+                # For first element, compute implied sqrt(variance)
+                implied_sqrt_var = (weight[0].float() * input_val[0].float() / output_val[0].float()).item()
+                implied_var = implied_sqrt_var ** 2
+                print(f"{prefix} Actual LN - implied sqrt(variance): {implied_sqrt_var:.10f}", flush=True)
+                print(f"{prefix} Actual LN - implied variance: {implied_var:.10f}", flush=True)
             tp_rank = parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
             tp_size = parallel_state.get_tensor_model_parallel_world_size() if parallel_state.is_initialized() else 1
             pos = 91
