@@ -889,6 +889,12 @@ class SGLangRowParallelGroupedLinear(SGLangGroupedLinear):
 class SGLangRMSNorm(MegatronModule):
     """
     RMSNorm matching SGLang's FSDP-compatible numerical paths.
+    
+    When residual is provided (for MoE pre_mlp_layernorm), this matches SGLang's
+    RMSNorm.forward_native with fp32_residual=False:
+    1. x = x + residual (bf16 add)
+    2. residual = x.clone()
+    3. RMSNorm computation in FP32
     """
 
     def __init__(
@@ -901,6 +907,7 @@ class SGLangRMSNorm(MegatronModule):
 
         self.hidden_size = hidden_size
         self.eps = eps
+        self.variance_epsilon = eps  # Alias for compatibility
 
         if config.init_model_with_meta_device:
             device = 'meta'
@@ -912,13 +919,28 @@ class SGLangRMSNorm(MegatronModule):
             torch.ones(hidden_size, dtype=torch.float32, device=device)
         )
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, residual: Tensor = None):
         """Forward matching SGLang's forward_native with FSDP settings.
+        
+        Args:
+            x: Input tensor (attention output for MoE, or already-resadded for Dense)
+            residual: Optional residual tensor. When provided (MoE case), performs
+                     bf16 residual add inside LayerNorm to match SGLang exactly.
+        
+        Returns:
+            If residual is None: normalized tensor
+            If residual is provided: (normalized tensor, updated residual)
         """
         if not x.is_contiguous():
             x = x.contiguous()
         
-        orig_dtype = x.dtype  # Use input dtype (for Q/K norms and intermediate norms)
+        orig_dtype = x.dtype
+        
+        # If residual is provided, do resadd in bf16 (matching SGLang's fp32_residual=False)
+        if residual is not None:
+            x = x + residual  # bf16 add, matching SGLang
+            residual = x.clone()  # Update residual to resadd result, matching SGLang
+        
         x = x.to(torch.float32)
         
         # RMSNorm computation in FP32
@@ -928,6 +950,8 @@ class SGLangRMSNorm(MegatronModule):
         # cast_x_before_out_mul=True: weight * x.to(orig_dtype)
         x = self.weight * x.to(orig_dtype)
         
+        if residual is not None:
+            return x, residual
         return x
 
 

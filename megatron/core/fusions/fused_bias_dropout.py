@@ -106,6 +106,52 @@ def bias_dropout_add_fused_inference(
     return _bias_dropout_add_func(x_with_bias, residual, prob, False, False, None)
 
 
+def _bias_dropout_no_resadd_func(x_with_bias, residual, prob, training):
+    """Bias + Dropout only, NO residual add. Used for MoE SGLang mode.
+    
+    For MoE in SGLang mode, residual add happens inside pre_mlp_layernorm (SGLangRMSNorm)
+    to match SGLang's behavior exactly.
+    
+    Returns: (output, residual) tuple so residual can be passed to pre_mlp_layernorm.
+    """
+    x, bias = x_with_bias
+
+    inplace = (
+        not training
+        and not x.requires_grad
+        and not residual.requires_grad
+        and (bias is None or not bias.requires_grad)
+    )
+
+    if bias is not None:
+        if inplace:
+            x.add_(bias)
+        else:
+            x = x + bias
+    
+    out = torch.nn.functional.dropout(x, p=prob, training=training, inplace=inplace)
+    
+    # Return (output, residual) - residual is NOT added here, will be added in pre_mlp_layernorm
+    return out, residual
+
+
+def bias_dropout_no_resadd_unfused(training):
+    """Returns a function that does bias + dropout but NO residual add."""
+    def _bias_dropout_no_resadd(x_with_bias, residual, prob):
+        return _bias_dropout_no_resadd_func(x_with_bias, residual, prob, training)
+    return _bias_dropout_no_resadd
+
+
+def get_bias_dropout_add_no_resadd(training, fused, use_sglang=False, is_final_layer=False):
+    """Get bias+dropout function that does NOT add residual.
+    
+    Used for MoE SGLang mode where residual add happens inside pre_mlp_layernorm
+    to match SGLang's RMSNorm.forward_native behavior exactly.
+    """
+    # Always use unfused version for this case
+    return bias_dropout_no_resadd_unfused(training)
+
+
 def get_bias_dropout_add(training, fused, use_sglang=False, is_final_layer=False):
     if use_sglang:
         # For SGLang mode with fp32_residual=False (default in SGLang):
