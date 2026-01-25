@@ -436,18 +436,19 @@ class MoELayer(BaseMoELayer):
 
         # DEBUG: Expert output before all-reduce
         if debug_experts:
-            print(f"{prefix} Expert OUTPUT (BEFORE EP all-reduce)[{pos},:5]: {output[pos, :5].tolist()}")
-            print(f"{prefix} Expert OUTPUT sum (BEFORE EP all-reduce): {output[pos].float().sum().item():.6f}")
+            print(f"{prefix} Expert OUTPUT (BEFORE TP all-reduce)[{pos},:5]: {output[pos, :5].tolist()}")
+            print(f"{prefix} Expert OUTPUT sum (BEFORE TP all-reduce): {output[pos].float().sum().item():.6f}")
 
-        # EP mode: all-reduce to sum contributions from all EP ranks
-        # Use tree_all_reduce_sum for deterministic results (matches SGLang's tensor_model_parallel_tree_all_reduce)
-        if ep_size > 1:
-            output = _tree_all_reduce_sum(output, self.ep_group)
+        # MoE all-reduce: use TP group to match SGLang's tensor_model_parallel_tree_all_reduce
+        # SGLang uses get_tp_group() for MoE all-reduce, so we use attn_tp_group (which is pg_collection.tp)
+        tp_size = utils.get_pg_size(self.attn_tp_group)
+        if tp_size > 1:
+            output = _tree_all_reduce_sum(output, self.attn_tp_group)
             
-            # DEBUG: Expert output after EP all-reduce
+            # DEBUG: Expert output after TP all-reduce
             if debug_experts:
-                print(f"{prefix} Expert OUTPUT (AFTER EP all-reduce)[{pos},:5]: {output[pos, :5].tolist()}")
-                print(f"{prefix} Expert OUTPUT sum (AFTER EP all-reduce): {output[pos].float().sum().item():.6f}")
+                print(f"{prefix} Expert OUTPUT (AFTER TP all-reduce)[{pos},:5]: {output[pos, :5].tolist()}")
+                print(f"{prefix} Expert OUTPUT sum (AFTER TP all-reduce): {output[pos].float().sum().item():.6f}")
 
         # Reshape output if needed
         if len(original_shape) == 3:
