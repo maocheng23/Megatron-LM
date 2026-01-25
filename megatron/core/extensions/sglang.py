@@ -940,6 +940,8 @@ class SGLangRMSNorm(MegatronModule):
             torch.ones(hidden_size, dtype=torch.float32, device=device)
         )
 
+    _debug_count = 0  # Class-level counter
+    
     def forward(self, x: Tensor, residual: Tensor = None):
         """Forward matching SGLang's forward_native with FSDP settings.
         
@@ -952,24 +954,69 @@ class SGLangRMSNorm(MegatronModule):
             If residual is None: normalized tensor
             If residual is provided: (normalized tensor, updated residual)
         """
+        import os
+        debug = os.environ.get('SLIME_DEBUG_LOGPROB_DIFF', '0') == '1'
+        
         if not x.is_contiguous():
             x = x.contiguous()
         
         orig_dtype = x.dtype
+        pos = 91 if x.shape[0] > 91 else 0
+        
+        # Debug: log input
+        if debug and residual is not None:
+            SGLangRMSNorm._debug_count += 1
+            if SGLangRMSNorm._debug_count <= 5:
+                x_val = x[pos, :] if x.dim() == 2 else x[pos, 0, :]
+                res_val = residual[pos, :] if residual.dim() == 2 else residual[pos, 0, :]
+                print(f"[Megatron SGLangRMSNorm #{SGLangRMSNorm._debug_count}] "
+                      f"x.dtype={x.dtype}, residual.dtype={residual.dtype}, "
+                      f"weight.dtype={self.weight.dtype}", flush=True)
+                print(f"  Input x[{pos},:5]: {x_val[:5].tolist()}", flush=True)
+                print(f"  Input residual[{pos},:5]: {res_val[:5].tolist()}", flush=True)
         
         # If residual is provided, do resadd in bf16 (matching SGLang's fp32_residual=False)
         if residual is not None:
             x = x + residual  # bf16 add, matching SGLang
             residual = x.clone()  # Update residual to resadd result, matching SGLang
+            
+            # Debug: log after resadd
+            if debug and SGLangRMSNorm._debug_count <= 5:
+                x_val = x[pos, :] if x.dim() == 2 else x[pos, 0, :]
+                print(f"  After resadd (bf16) x[{pos},:5]: {x_val[:5].tolist()}", flush=True)
         
         x = x.to(torch.float32)
         
+        # Debug: log after FP32 conversion
+        if debug and residual is not None and SGLangRMSNorm._debug_count <= 5:
+            x_val = x[pos, :] if x.dim() == 2 else x[pos, 0, :]
+            print(f"  After to(fp32) x[{pos},:5]: {x_val[:5].tolist()}", flush=True)
+        
         # RMSNorm computation in FP32
         variance = x.pow(2).mean(dim=-1, keepdim=True)
+        
+        # Debug: log variance
+        if debug and residual is not None and SGLangRMSNorm._debug_count <= 5:
+            var_val = variance[pos, 0] if variance.dim() == 2 else variance[pos, 0, 0]
+            print(f"  Variance[{pos}]: {var_val.item()}", flush=True)
+        
         x = x * torch.rsqrt(variance + self.eps)
         
+        # Debug: log after rsqrt
+        if debug and residual is not None and SGLangRMSNorm._debug_count <= 5:
+            x_val = x[pos, :] if x.dim() == 2 else x[pos, 0, :]
+            print(f"  After rsqrt (fp32) x[{pos},:5]: {x_val[:5].tolist()}", flush=True)
+            print(f"  Weight[:5]: {self.weight[:5].tolist()}", flush=True)
+        
         # cast_x_before_out_mul=True: weight * x.to(orig_dtype)
+        # Match SGLang exactly - don't add extra dtype conversion
         x = self.weight * x.to(orig_dtype)
+        
+        # Debug: log final output
+        if debug and residual is not None and SGLangRMSNorm._debug_count <= 5:
+            x_val = x[pos, :] if x.dim() == 2 else x[pos, 0, :]
+            print(f"  Final output x[{pos},:5]: {x_val[:5].tolist()}", flush=True)
+            print(f"  Final output x.dtype: {x.dtype}", flush=True)
         
         if residual is not None:
             return x, residual
