@@ -831,6 +831,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Optional Layer norm post the cross-attention.
         # For MoE SGLang mode, pass residual to pre_mlp_layernorm to do resadd inside
         moe_residual = getattr(self, '_moe_pre_resadd_residual', None)
+        
+        # NOTE: For MoE SGLang true on-policy mode, tree_all_reduce is done inside 
+        # SGLangRowParallelLinear to match SGLang's numerical path exactly.
+        # Do NOT add additional all-reduce here as it would cause double all-reduce!
+        
         if self.recompute_pre_mlp_layernorm:
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
             if moe_residual is not None:

@@ -482,6 +482,10 @@ class SGLangRowParallelLinear(SGLangLinear):
     
     IMPORTANT: Row parallel linear requires all_reduce after GEMM to combine
     partial results from all TP ranks.
+    
+    For MoE true on-policy mode, set reduce_results=False to skip all-reduce here,
+    and let the all-reduce happen in transformer_layer._forward_mlp with tree_all_reduce
+    to match SGLang's numerical path exactly.
     """
 
     def __init__(
@@ -498,6 +502,7 @@ class SGLangRowParallelLinear(SGLangLinear):
         tp_comm_buffer_name: Optional[str] = None,
         layer_number: Optional[int] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        reduce_results: bool = True,
     ):
         if not input_is_parallel:
             raise ValueError("SGLang linear layers do not support input_is_parallel = False")
@@ -517,6 +522,11 @@ class SGLangRowParallelLinear(SGLangLinear):
             layer_number=layer_number,
             tp_group=tp_group,
         )
+        
+        # For MoE true on-policy mode, set reduce_results=False to match SGLang's
+        # numerical path where all-reduce happens after attention output, before
+        # pre_mlp_layernorm, using tree_all_reduce for numerical consistency.
+        self.reduce_results = reduce_results
 
     _debug_count = 0  # Class-level counter
     
@@ -525,6 +535,10 @@ class SGLangRowParallelLinear(SGLangLinear):
         
         Row parallel linear splits the input along the last dimension.
         Each rank computes a partial result, then all_reduce combines them.
+        
+        For SGLang true on-policy mode, uses tree_all_reduce instead of standard
+        NCCL all_reduce to match SGLang's tensor_model_parallel_tree_all_reduce
+        for numerical consistency.
         """
         import os
         
@@ -533,8 +547,9 @@ class SGLangRowParallelLinear(SGLangLinear):
         
         # CRITICAL: all_reduce to combine partial results from all TP ranks
         # Without this, each rank only has its partial computation
-        if self.tp_size > 1 and self.tp_group is not None:
-            from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
+        if self.reduce_results and self.tp_size > 1 and self.tp_group is not None:
+            # Check if we should use tree_all_reduce for SGLang true on-policy mode
+            use_tree_allreduce = getattr(self.config, 'use_sglang', False)
             
             # DEBUG: Detailed logging for all_reduce
             if os.environ.get('SLIME_DEBUG_LOGPROB_DIFF', '0') == '1':
@@ -550,13 +565,20 @@ class SGLangRowParallelLinear(SGLangLinear):
                     logger.info(
                         f"[DEBUG Megatron RowParallel all_reduce #{SGLangRowParallelLinear._debug_count}] "
                         f"rank={rank}, tp_rank={tp_rank}, tp_size={self.tp_size}, group_size={actual_group_size}, "
-                        f"layer_num={self.layer_number}, input_size={self.input_size}, output_size={self.output_size}, "
+                        f"layer_num={self.layer_number}, use_tree={use_tree_allreduce}, "
                         f"BEFORE: position={position}, sum={out_pos.float().sum().item():.6f}, "
                         f"first 5={out_pos.flatten()[:5].float().tolist()}",
-                         
                     )
             
-            output = reduce_from_tensor_model_parallel_region(output_before, group=self.tp_group)
+            if use_tree_allreduce:
+                # Use tree_all_reduce for SGLang true on-policy mode
+                # This matches SGLang's tensor_model_parallel_tree_all_reduce
+                from megatron.core.tensor_parallel.mappings import _tree_all_reduce_sum
+                output = _tree_all_reduce_sum(output_before, self.tp_group)
+            else:
+                # Standard NCCL all_reduce
+                from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
+                output = reduce_from_tensor_model_parallel_region(output_before, group=self.tp_group)
             
             # DEBUG: Log after all_reduce
             if os.environ.get('SLIME_DEBUG_LOGPROB_DIFF', '0') == '1':
@@ -566,7 +588,6 @@ class SGLangRowParallelLinear(SGLangLinear):
                         f"[DEBUG Megatron RowParallel all_reduce #{SGLangRowParallelLinear._debug_count}] "
                         f"AFTER: position={position}, sum={out_pos_after.float().sum().item():.6f}, "
                         f"first 5={out_pos_after.flatten()[:5].float().tolist()}",
-                         
                     )
         else:
             output = output_before
