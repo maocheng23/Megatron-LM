@@ -7,6 +7,7 @@ from typing import Optional, Union
 import torch
 
 from megatron.core import parallel_state, tensor_parallel, utils
+from megatron.core.tensor_parallel.mappings import _tree_all_reduce_sum
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
@@ -439,8 +440,9 @@ class MoELayer(BaseMoELayer):
             print(f"{prefix} Expert OUTPUT sum (BEFORE EP all-reduce): {output[pos].float().sum().item():.6f}")
 
         # EP mode: all-reduce to sum contributions from all EP ranks
+        # Use tree_all_reduce_sum for deterministic results (matches SGLang's tensor_model_parallel_tree_all_reduce)
         if ep_size > 1:
-            torch.distributed.all_reduce(output, group=self.ep_group)
+            output = _tree_all_reduce_sum(output, self.ep_group)
             
             # DEBUG: Expert output after EP all-reduce
             if debug_experts:
