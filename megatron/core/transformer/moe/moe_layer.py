@@ -479,7 +479,7 @@ class MoELayer(BaseMoELayer):
             rank = dist.get_rank() if dist.is_initialized() else 0
             tp_rank = utils.get_pg_rank(self.tp_group)
             tp_size = utils.get_pg_size(self.tp_group)
-            pos = 0
+            pos = 91
             # Flatten to 2D for consistent logging
             hs_2d = hidden_states.view(-1, hidden_states.shape[-1]) if len(hidden_states.shape) == 3 else hidden_states
             prefix = f"[moe_layer.py][Megatron MoE][Rank {rank}][TP {tp_rank}/{tp_size}][Layer {self.layer_number}]"
