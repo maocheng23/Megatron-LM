@@ -495,11 +495,11 @@ class MoELayer(BaseMoELayer):
             print(f"{prefix} MoE INPUT hidden_states[{pos},:5]: {hs_2d[pos, :5].tolist()}")
             print(f"{prefix} MoE INPUT hidden_states sum: {hs_2d[pos].float().sum().item():.6f}")
 
-        if self.training and self.attn_tp_group.size() > 1 and not self.config.sequence_parallel:
-            raise ValueError(
-                "During training, performance may degrade if MoE and tensor parallelism"
-                "are enabled without also enabling sequence parallelism."
-            )
+        # if self.training and self.attn_tp_group.size() > 1 and not self.config.sequence_parallel:
+        #     raise ValueError(
+        #         "During training, performance may degrade if MoE and tensor parallelism"
+        #         "are enabled without also enabling sequence parallelism."
+        #     )
 
         # Use SGLang fused experts when use_sglang_router is enabled
         use_sglang_experts = (
