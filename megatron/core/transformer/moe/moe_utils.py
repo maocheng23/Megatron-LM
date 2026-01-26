@@ -433,8 +433,11 @@ def sglang_fused_experts(
                 print(f"[moe_utils.py]  Local ID {local_id}: {count} tokens (skipped)")
 
     # Ensure correct dtypes
+    # Note: Keep topk_weights in original dtype to match SGLang's behavior
+    # SGLang's qwen3_moe.py does: routing_weights = routing_weights.to(hidden_states.dtype)
+    # So we should NOT force topk_weights to float32 for true on-policy consistency
     topk_ids_local = topk_ids_local.to(torch.int32)
-    topk_weights = topk_weights.to(torch.float32)
+    # topk_weights = topk_weights.to(torch.float32)  # Removed to match SGLang
 
     # SGLang expects is_gated=True for SwiGLU-style activations
     is_gated = True

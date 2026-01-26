@@ -411,18 +411,20 @@ class MoELayer(BaseMoELayer):
             
             # Expert input
             print(f"{prefix} ===== EXPERT INPUT =====")
-            print(f"{prefix} hidden_states.shape: {hidden_states_2d.shape}")
+            print(f"{prefix} hidden_states.shape: {hidden_states_2d.shape}, dtype: {hidden_states_2d.dtype}")
             print(f"{prefix} hidden_states[{pos},:5]: {hidden_states_2d[pos, :5].tolist()}")
             print(f"{prefix} hidden_states[{pos}] sum: {hidden_states_2d[pos].float().sum().item():.6f}")
             print(f"{prefix} hidden_states[{pos}] std: {hidden_states_2d[pos].float().std().item():.6f}")
             print(f"{prefix} hidden_states ALL sum: {hidden_states_2d.float().sum().item():.6f}")
             print(f"{prefix} hidden_states ALL std: {hidden_states_2d.float().std().item():.6f}")
+            print(f"{prefix} topk_weights.dtype: {topk_weights.dtype}, topk_ids.dtype: {topk_ids.dtype}")
             print(f"{prefix} topk_weights[{pos},:]: {topk_weights[pos, :].tolist()}")
             print(f"{prefix} topk_ids[{pos},:]: {topk_ids[pos, :].tolist()}")
             
             # Expert weights (w1 = gate_up, w2 = down)
             print(f"{prefix} ===== EXPERT WEIGHTS =====")
-            print(f"{prefix} w1.shape: {w1.shape}, w2.shape: {w2.shape}")
+            print(f"{prefix} w1.shape: {w1.shape}, dtype: {w1.dtype}")
+            print(f"{prefix} w2.shape: {w2.shape}, dtype: {w2.dtype}")
             print(f"{prefix} w1[0,0,:5]: {w1[0, 0, :5].tolist()}")
             print(f"{prefix} w1 sum: {w1.float().sum().item():.6f}")
             print(f"{prefix} w1 std: {w1.float().std().item():.6f}")
@@ -449,10 +451,16 @@ class MoELayer(BaseMoELayer):
         # DEBUG: Expert output before all-reduce
         if debug_experts:
             print(f"{prefix} ===== EXPERT OUTPUT (BEFORE all-reduce) =====")
-            print(f"{prefix} output.shape: {output.shape}")
+            print(f"{prefix} output.shape: {output.shape}, dtype: {output.dtype}")
             print(f"{prefix} output[{pos},:5]: {output[pos, :5].tolist()}")
             print(f"{prefix} output[{pos}] sum: {output[pos].float().sum().item():.6f}")
+            print(f"{prefix} output[{pos}] mean: {output[pos].float().mean().item():.6f}")
             print(f"{prefix} output[{pos}] std: {output[pos].float().std().item():.6f}")
+            print(f"{prefix} output[{pos}] max: {output[pos].float().max().item():.6f}")
+            print(f"{prefix} output[{pos}] min: {output[pos].float().min().item():.6f}")
+            print(f"{prefix} output[{pos}] nonzero count: {(output[pos] != 0).sum().item()}")
+            # Print last 5 elements to see if difference is at the end
+            print(f"{prefix} output[{pos},-5:]: {output[pos, -5:].tolist()}")
             print(f"{prefix} output ALL sum: {output.float().sum().item():.6f}")
             print(f"{prefix} output ALL std: {output.float().std().item():.6f}")
 
