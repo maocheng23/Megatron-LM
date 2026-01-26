@@ -46,14 +46,17 @@ try:
     HAVE_SGLANG_FUSED_EXPERTS = True
 
     # Initialize SGLang server args if not already set (needed for fused_experts_impl)
+    # Only set deterministic mode if MEGATRON_TRUE_ON_POLICY=1 is set
     from sglang.srt.server_args import get_global_server_args, set_global_server_args_for_scheduler
     try:
         get_global_server_args()
     except ValueError:
         # Server args not set - create minimal mock for Megatron usage
+        use_deterministic = os.environ.get("MEGATRON_USE_DETERMINISTIC_ALLREDUCE", "0") == "1"
+        print("MEGATRON_USE_DETERMINISTIC_ALLREDUCE: ", use_deterministic)
         class _MinimalServerArgs:
-            enable_deterministic_inference = False
-            rl_on_policy_target = "fsdp_tp" if "--use-sglang-router" is set else None
+            enable_deterministic_inference = use_deterministic
+            rl_on_policy_target = "fsdp_tp" if use_deterministic else None
         set_global_server_args_for_scheduler(_MinimalServerArgs())
 except ImportError:
     HAVE_SGLANG_FUSED_EXPERTS = False
