@@ -443,7 +443,7 @@ class MoELayer(BaseMoELayer):
         # SGLang uses get_tp_group() for MoE all-reduce, so we use attn_tp_group (which is pg_collection.tp)
         tp_size = utils.get_pg_size(self.attn_tp_group)
         if tp_size > 1:
-            output = _tree_all_reduce_sum(output, self.attn_tp_group)
+            output = _tree_all_reduce_sum(output, self.attn_tp_group, layer_id=self.layer_number)
             
             # DEBUG: Expert output after TP all-reduce
             if debug_experts:

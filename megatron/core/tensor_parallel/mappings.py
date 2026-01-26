@@ -20,7 +20,7 @@ except:
     dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
 
 
-def _tree_all_reduce_sum(x: torch.Tensor, group) -> torch.Tensor:
+def _tree_all_reduce_sum(x: torch.Tensor, group, layer_id: int = -1) -> torch.Tensor:
     """
     Deterministic all-reduce using all_gather + local tree sum.
     This matches SGLang's tree_all_reduce_sum for true on-policy consistency.
@@ -35,16 +35,41 @@ def _tree_all_reduce_sum(x: torch.Tensor, group) -> torch.Tensor:
             "world_size must be the power of 2 in order to use tree_all_reduce_sum."
         )
     
+    # DEBUG: detailed tree all-reduce logging (only for layer 0 or 1)
+    debug_tree = os.environ.get("SLIME_DEBUG_TREE_ALLREDUCE", "0") == "1" and layer_id in (0, 1)
+    if debug_tree:
+        global_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        group_rank = torch.distributed.get_rank(group)
+        pos = 0
+        x_2d = x.view(-1, x.shape[-1]) if len(x.shape) > 2 else x
+        prefix = f"[mappings.py][Megatron tree_allreduce][Layer {layer_id}][GlobalRank {global_rank}][GroupRank {group_rank}/{world_size}]"
+        print(f"{prefix} INPUT x[{pos},:5]: {x_2d[pos, :5].tolist()}")
+        print(f"{prefix} INPUT x[{pos}] sum: {x_2d[pos].float().sum().item():.6f}")
+    
     # All-gather to collect data from all ranks
     # NOTE: Do NOT use .contiguous() here to match SGLang's tree_all_reduce_sum exactly
     result = [torch.zeros_like(x) for _ in range(world_size)]
     torch.distributed.all_gather(result, x, group=group)
+    
+    if debug_tree:
+        for i in range(world_size):
+            r_2d = result[i].view(-1, result[i].shape[-1]) if len(result[i].shape) > 2 else result[i]
+            print(f"{prefix} AFTER all_gather: result[{i}][{pos},:5]: {r_2d[pos, :5].tolist()}")
+            print(f"{prefix} AFTER all_gather: result[{i}][{pos}] sum: {r_2d[pos].float().sum().item():.6f}")
     
     # Tree-structured sum for deterministic order
     for level in range(1, world_size.bit_length()):
         for left in range(0, world_size, 1 << level):
             right = left + (1 << (level - 1))
             result[left] += result[right]
+            if debug_tree:
+                r_2d = result[left].view(-1, result[left].shape[-1]) if len(result[left].shape) > 2 else result[left]
+                print(f"{prefix} Tree sum level={level}, left={left}+right={right}: result[{left}][{pos}] sum: {r_2d[pos].float().sum().item():.6f}")
+    
+    if debug_tree:
+        final_2d = result[0].view(-1, result[0].shape[-1]) if len(result[0].shape) > 2 else result[0]
+        print(f"{prefix} FINAL result[0][{pos},:5]: {final_2d[pos, :5].tolist()}")
+        print(f"{prefix} FINAL result[0][{pos}] sum: {final_2d[pos].float().sum().item():.6f}")
     
     # Copy result back to input tensor (in-place semantics like torch.distributed.all_reduce)
     x.copy_(result[0])
