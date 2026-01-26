@@ -36,8 +36,9 @@ def _tree_all_reduce_sum(x: torch.Tensor, group) -> torch.Tensor:
         )
     
     # All-gather to collect data from all ranks
+    # NOTE: Do NOT use .contiguous() here to match SGLang's tree_all_reduce_sum exactly
     result = [torch.zeros_like(x) for _ in range(world_size)]
-    torch.distributed.all_gather(result, x.contiguous(), group=group)
+    torch.distributed.all_gather(result, x, group=group)
     
     # Tree-structured sum for deterministic order
     for level in range(1, world_size.bit_length()):
