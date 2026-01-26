@@ -40,7 +40,7 @@ def _tree_all_reduce_sum(x: torch.Tensor, group, layer_id: int = -1) -> torch.Te
     if debug_tree:
         global_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         group_rank = torch.distributed.get_rank(group)
-        pos = 0
+        pos = 91  # Match the position used in moe_layer.py debug logging
         x_2d = x.view(-1, x.shape[-1]) if len(x.shape) > 2 else x
         prefix = f"[mappings.py][Megatron tree_allreduce][Layer {layer_id}][GlobalRank {global_rank}][GroupRank {group_rank}/{world_size}]"
         print(f"{prefix} INPUT x[{pos},:5]: {x_2d[pos, :5].tolist()}")
