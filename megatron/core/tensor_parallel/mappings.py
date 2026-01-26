@@ -20,13 +20,15 @@ except:
     dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
 
 
-def _tree_all_reduce_sum(x: torch.Tensor, group, layer_id: int = -1) -> torch.Tensor:
+def _tree_all_reduce_sum_impl(x: torch.Tensor, group, layer_id: int = -1) -> torch.Tensor:
     """
-    Deterministic all-reduce using all_gather + local tree sum.
+    Internal implementation of deterministic all-reduce using all_gather + local tree sum.
     This matches SGLang's tree_all_reduce_sum for true on-policy consistency.
     
     The sum order is fixed by the tree structure, ensuring deterministic results
     regardless of NCCL internal implementation details.
+    
+    NOTE: This is a pure function that does NOT modify the input tensor.
     """
     world_size = group.size()
     
@@ -61,7 +63,7 @@ def _tree_all_reduce_sum(x: torch.Tensor, group, layer_id: int = -1) -> torch.Te
     for level in range(1, world_size.bit_length()):
         for left in range(0, world_size, 1 << level):
             right = left + (1 << (level - 1))
-            result[left] += result[right]
+            result[left] = result[left] + result[right]  # Non-in-place to preserve autograd
             if debug_tree:
                 r_2d = result[left].view(-1, result[left].shape[-1]) if len(result[left].shape) > 2 else result[left]
                 print(f"{prefix} Tree sum level={level}, left={left}+right={right}: result[{left}][{pos}] sum: {r_2d[pos].float().sum().item():.6f}")
@@ -71,9 +73,56 @@ def _tree_all_reduce_sum(x: torch.Tensor, group, layer_id: int = -1) -> torch.Te
         print(f"{prefix} FINAL result[0][{pos},:5]: {final_2d[pos, :5].tolist()}")
         print(f"{prefix} FINAL result[0][{pos}] sum: {final_2d[pos].float().sum().item():.6f}")
     
-    # Copy result back to input tensor (in-place semantics like torch.distributed.all_reduce)
-    x.copy_(result[0])
-    return x
+    return result[0]
+
+
+class _TreeAllReduceSum(torch.autograd.Function):
+    """
+    Autograd function for deterministic tree all-reduce sum.
+    
+    Forward: Performs all-gather + tree sum for deterministic results
+    Backward: Gradient passes through as-is (identity) since each rank's 
+              contribution is independent
+    """
+    
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, group, layer_id: int = -1):
+        ctx.group = group
+        ctx.layer_id = layer_id
+        # Use no_grad to avoid tracking intermediate operations
+        with torch.no_grad():
+            result = _tree_all_reduce_sum_impl(x, group, layer_id)
+        # Return a new tensor that requires grad if input does
+        return result.clone().requires_grad_(x.requires_grad)
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        """
+        For all-reduce sum: y = x0 + x1 + x2 + x3 (each rank gets same y)
+        The gradient dy/dx_i = 1 for each rank's contribution.
+        
+        However, since each rank only has its own x_i, and we need to 
+        backprop through the sum, the gradient is simply passed through.
+        This is because in the forward pass, each rank contributes its x_i
+        to the sum, and in backward, each rank receives the full gradient.
+        """
+        return grad_output, None, None
+
+
+def _tree_all_reduce_sum(x: torch.Tensor, group, layer_id: int = -1) -> torch.Tensor:
+    """
+    Deterministic all-reduce using all_gather + local tree sum.
+    This matches SGLang's tree_all_reduce_sum for true on-policy consistency.
+    
+    This version properly supports autograd for training.
+    """
+    world_size = group.size()
+    
+    # Skip if world_size is 1
+    if world_size == 1:
+        return x
+    
+    return _TreeAllReduceSum.apply(x, group, layer_id)
 
 
 def _reduce(input_, group):

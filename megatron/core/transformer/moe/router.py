@@ -674,7 +674,8 @@ class TopKRouter(Router):
         routing_weights, selected_experts = torch.topk(
             routing_weights, self.topk, dim=-1
         )
-        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        # Use non-in-place operation to preserve gradient computation
+        routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
         routing_weights = routing_weights.to(input_2d.dtype)
 
         topk_weights = routing_weights

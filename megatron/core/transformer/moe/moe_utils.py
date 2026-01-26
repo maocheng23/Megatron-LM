@@ -368,7 +368,7 @@ class FusedExpertsFunction(torch.autograd.Function):
             )
         
         # Mark output as requiring grad if inputs do
-        return output.clone().requires_grad_(hidden_states.requires_grad or w1.requires_grad or w2.requires_grad)
+        return output.clone().requires_grad_(hidden_states.requires_grad or w1.requires_grad or w2.requires_grad or topk_weights.requires_grad)
     
     @staticmethod
     def backward(ctx, grad_output):
@@ -384,7 +384,12 @@ class FusedExpertsFunction(torch.autograd.Function):
         grad_hidden_states = torch.zeros_like(hidden_states) if hidden_states.requires_grad else None
         grad_w1 = torch.zeros_like(w1) if w1.requires_grad else None
         grad_w2 = torch.zeros_like(w2) if w2.requires_grad else None
-        grad_topk_weights = None  # Router weights gradient (optional)
+        # Initialize grad_topk_weights for router gradient
+        grad_topk_weights = torch.zeros_like(topk_weights) if topk_weights.requires_grad else None
+        
+        # Store expert outputs for grad_topk_weights calculation
+        # expert_outputs[expert_id] = dict mapping token_index -> expert_output_vector
+        expert_outputs_cache = {}
         
         # Process each expert
         for expert_id in range(num_experts):
@@ -412,6 +417,14 @@ class FusedExpertsFunction(torch.autograd.Function):
                 raise ValueError(f"Unsupported activation: {activation}")
             
             intermediate = gate * up
+            
+            # Compute expert output (before weighting) for grad_topk_weights
+            # expert_output = linear(intermediate, expert_w2)
+            expert_output = torch.nn.functional.linear(intermediate, expert_w2)
+            
+            # Cache for grad_topk_weights computation
+            if grad_topk_weights is not None:
+                expert_outputs_cache[expert_id] = (token_indices, expert_output)
             
             # Compute weighted grad_output for this expert
             expert_grad_output = torch.zeros(len(token_indices), hidden_size, 
@@ -465,6 +478,26 @@ class FusedExpertsFunction(torch.autograd.Function):
             
             if grad_w1 is not None:
                 grad_w1[expert_id] += grad_gate_up.T.to(grad_w1.dtype) @ expert_input.to(grad_w1.dtype)
+        
+        # Compute grad_topk_weights
+        # output[i] = sum_k(topk_weights[i,k] * expert_k(input[i]))
+        # d(output[i]) / d(topk_weights[i,k]) = expert_k(input[i])
+        # grad_topk_weights[i,k] = sum_j(grad_output[i,j] * expert_output_k[i,j])
+        #                       = (grad_output[i] · expert_output_k[i])
+        if grad_topk_weights is not None:
+            for expert_id, (token_indices, expert_output) in expert_outputs_cache.items():
+                mask = (topk_ids == expert_id)
+                for slot in range(topk):
+                    slot_mask = mask[token_indices, slot]
+                    if slot_mask.any():
+                        slot_token_indices = token_indices[slot_mask]
+                        local_indices = slot_mask.nonzero(as_tuple=True)[0]
+                        # grad_topk_weights[token_idx, slot] = dot(grad_output[token_idx], expert_output[local_idx])
+                        expert_out_selected = expert_output[local_indices]  # [num_selected, hidden_size]
+                        grad_out_selected = grad_output[slot_token_indices]  # [num_selected, hidden_size]
+                        # Element-wise multiply and sum over hidden dimension
+                        grad_weights = (grad_out_selected * expert_out_selected).sum(dim=-1)  # [num_selected]
+                        grad_topk_weights[slot_token_indices, slot] += grad_weights.to(grad_topk_weights.dtype)
         
         return grad_hidden_states, grad_w1, grad_w2, grad_topk_weights, None, None, None
 
