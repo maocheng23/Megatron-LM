@@ -406,31 +406,19 @@ class MoELayer(BaseMoELayer):
             rank = dist.get_rank() if dist.is_initialized() else 0
             tp_rank = utils.get_pg_rank(self.tp_group)
             tp_size = utils.get_pg_size(self.tp_group)
-            pos = 91  # Match SGLang's pos = 0
-            prefix = f"[moe_layer.py][Megatron MoE][Rank {rank}][TP {tp_rank}/{tp_size}][Layer {self.layer_number}]"
-            
-            # Expert input
-            print(f"{prefix} ===== EXPERT INPUT =====")
-            print(f"{prefix} hidden_states.shape: {hidden_states_2d.shape}, dtype: {hidden_states_2d.dtype}")
-            print(f"{prefix} hidden_states[{pos},:5]: {hidden_states_2d[pos, :5].tolist()}")
-            print(f"{prefix} hidden_states[{pos}] sum: {hidden_states_2d[pos].float().sum().item():.6f}")
-            print(f"{prefix} hidden_states[{pos}] std: {hidden_states_2d[pos].float().std().item():.6f}")
-            print(f"{prefix} hidden_states ALL sum: {hidden_states_2d.float().sum().item():.6f}")
-            print(f"{prefix} hidden_states ALL std: {hidden_states_2d.float().std().item():.6f}")
-            print(f"{prefix} topk_weights.dtype: {topk_weights.dtype}, topk_ids.dtype: {topk_ids.dtype}")
-            print(f"{prefix} topk_weights[{pos},:]: {topk_weights[pos, :].tolist()}")
-            print(f"{prefix} topk_ids[{pos},:]: {topk_ids[pos, :].tolist()}")
-            
-            # Expert weights (w1 = gate_up, w2 = down)
-            print(f"{prefix} ===== EXPERT WEIGHTS =====")
-            print(f"{prefix} w1.shape: {w1.shape}, dtype: {w1.dtype}")
-            print(f"{prefix} w2.shape: {w2.shape}, dtype: {w2.dtype}")
-            print(f"{prefix} w1[0,0,:5]: {w1[0, 0, :5].tolist()}")
-            print(f"{prefix} w1 sum: {w1.float().sum().item():.6f}")
-            print(f"{prefix} w1 std: {w1.float().std().item():.6f}")
-            print(f"{prefix} w2[0,0,:5]: {w2[0, 0, :5].tolist()}")
-            print(f"{prefix} w2 sum: {w2.float().sum().item():.6f}")
-            print(f"{prefix} w2 std: {w2.float().std().item():.6f}")
+            pos = 91  # Match SGLang's pos
+            prefix = f"[moe_layer.py][Megatron MoE][TP {tp_rank}/{tp_size}][Layer {self.layer_number}]"
+            hs = hidden_states_2d
+            tw, ti = topk_weights, topk_ids
+            print(f"{prefix} ===== EXPERT INPUT ===== shape={hs.shape}, dtype={hs.dtype}, "
+                  f"hs[{pos},:5]={hs[pos, :5].tolist()}, hs[{pos}] sum={hs[pos].float().sum().item():.6f}, std={hs[pos].float().std().item():.6f}, "
+                  f"ALL sum={hs.float().sum().item():.6f}, ALL std={hs.float().std().item():.6f}, "
+                  f"topk_weights.dtype={tw.dtype}, topk_ids.dtype={ti.dtype}, "
+                  f"weights[{pos}]={tw[pos, :].tolist()}, ids[{pos}]={ti[pos, :].tolist()}")
+            print(f"{prefix} ===== EXPERT WEIGHTS ===== w1.shape={w1.shape}, w1.dtype={w1.dtype}, w1[0,0,:5]={w1[0, 0, :5].tolist()}, "
+                  f"w1 sum={w1.float().sum().item():.6f}, w1 std={w1.float().std().item():.6f}, "
+                  f"w2.shape={w2.shape}, w2[0,0,:5]={w2[0, 0, :5].tolist()}, "
+                  f"w2 sum={w2.float().sum().item():.6f}, w2 std={w2.float().std().item():.6f}")
 
         # Call SGLang's fused experts with EP parameters
         output = sglang_fused_experts(
@@ -450,19 +438,13 @@ class MoELayer(BaseMoELayer):
 
         # DEBUG: Expert output before all-reduce
         if debug_experts:
-            print(f"{prefix} ===== EXPERT OUTPUT (BEFORE all-reduce) =====")
-            print(f"{prefix} output.shape: {output.shape}, dtype: {output.dtype}")
-            print(f"{prefix} output[{pos},:5]: {output[pos, :5].tolist()}")
-            print(f"{prefix} output[{pos}] sum: {output[pos].float().sum().item():.6f}")
-            print(f"{prefix} output[{pos}] mean: {output[pos].float().mean().item():.6f}")
-            print(f"{prefix} output[{pos}] std: {output[pos].float().std().item():.6f}")
-            print(f"{prefix} output[{pos}] max: {output[pos].float().max().item():.6f}")
-            print(f"{prefix} output[{pos}] min: {output[pos].float().min().item():.6f}")
-            print(f"{prefix} output[{pos}] nonzero count: {(output[pos] != 0).sum().item()}")
-            # Print last 5 elements to see if difference is at the end
-            print(f"{prefix} output[{pos},-5:]: {output[pos, -5:].tolist()}")
-            print(f"{prefix} output ALL sum: {output.float().sum().item():.6f}")
-            print(f"{prefix} output ALL std: {output.float().std().item():.6f}")
+            out = output
+            print(f"{prefix} ===== EXPERT OUTPUT (BEFORE all-reduce) ===== shape={out.shape}, dtype={out.dtype}, "
+                  f"out[{pos},:5]={out[pos, :5].tolist()}, out[{pos},-5:]={out[pos, -5:].tolist()}, "
+                  f"sum={out[pos].float().sum().item():.6f}, mean={out[pos].float().mean().item():.6f}, "
+                  f"std={out[pos].float().std().item():.6f}, max={out[pos].float().max().item():.6f}, "
+                  f"min={out[pos].float().min().item():.6f}, nonzero={int((out[pos] != 0).sum().item())}, "
+                  f"ALL sum={out.float().sum().item():.6f}, ALL std={out.float().std().item():.6f}")
 
         # MoE all-reduce: use TP group to match SGLang's tensor_model_parallel_tree_all_reduce
         # SGLang uses get_tp_group() for MoE all-reduce, so we use attn_tp_group (which is pg_collection.tp)
@@ -472,8 +454,7 @@ class MoELayer(BaseMoELayer):
             
             # DEBUG: Expert output after TP all-reduce
             if debug_experts:
-                print(f"{prefix} Expert OUTPUT (AFTER TP all-reduce)[{pos},:5]: {output[pos, :5].tolist()}")
-                print(f"{prefix} Expert OUTPUT sum (AFTER TP all-reduce): {output[pos].float().sum().item():.6f}")
+                print(f"{prefix} ===== EXPERT OUTPUT (AFTER all-reduce) ===== out[{pos},:5]={output[pos, :5].tolist()}, sum={output[pos].float().sum().item():.6f}")
 
         # Reshape output if needed
         if len(original_shape) == 3:
