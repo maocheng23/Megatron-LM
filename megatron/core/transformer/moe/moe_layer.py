@@ -400,7 +400,7 @@ class MoELayer(BaseMoELayer):
 
         # Debug: verify weight shapes and values
         # Note: Megatron layer_number=1 corresponds to SGLang layer_id=0
-        debug_experts = os.environ.get("SLIME_DEBUG_ATTN", "0") == "1" and self.layer_number == 1
+        debug_experts = os.environ.get("SLIME_DEBUG_ATTN", "0") == "1" and self.layer_number == 1 and utils.get_pg_rank(self.tp_group) == 1
         if debug_experts:
             import torch.distributed as dist
             rank = dist.get_rank() if dist.is_initialized() else 0
