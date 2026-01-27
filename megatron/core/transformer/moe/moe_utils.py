@@ -639,7 +639,7 @@ class FusedExpertsFunction(torch.autograd.Function):
                               f"sum={grad_hidden_states.sum().item():.6e}, norm={grad_hidden_states.norm().item():.6e}")
                     
                     # CRITICAL DEBUG: Verify all ranks have identical grad_hidden_states after all-reduce
-                    if os.environ.get("DEBUG_GRAD_SYNC", "0") == "1":
+                    if os.environ.get("DEBUG_GRAD_SYNC", "0") == "1" and layer_id <= 1:
                         local_sum = torch.tensor([grad_hidden_states.sum().item()], device=grad_hidden_states.device)
                         all_sums = [torch.zeros_like(local_sum) for _ in range(ep_world_size)]
                         torch.distributed.all_gather(all_sums, local_sum, group=ep_group)
