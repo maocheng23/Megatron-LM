@@ -588,12 +588,12 @@ class FusedExpertsFunction(torch.autograd.Function):
                         torch.distributed.all_reduce(grad_topk_weights, group=ep_group)
                     
                     # Debug: log after all-reduce
-                    if os.environ.get("DEBUG_GRAD_ALLREDUCE", "0") == "1":
+                    if os.environ.get("DEBUG_GRAD_ALLREDUCE", "0") == "1" and layer_id <= 1:
                         print(f"[FusedExpertsFunction][Rank {rank}] AFTER grad_topk_weights all-reduce: "
                               f"sum={grad_topk_weights.sum().item():.6e}, norm={grad_topk_weights.norm().item():.6e}")
                     
                     # CRITICAL DEBUG: Verify all ranks have identical grad_topk_weights after all-reduce
-                    if os.environ.get("DEBUG_GRAD_SYNC", "0") == "1":
+                    if os.environ.get("DEBUG_GRAD_SYNC", "0") == "1" and layer_id <= 1:
                         # All-gather the sum from all ranks to verify they're identical
                         local_sum = torch.tensor([grad_topk_weights.sum().item()], device=grad_topk_weights.device)
                         all_sums = [torch.zeros_like(local_sum) for _ in range(ep_world_size)]
