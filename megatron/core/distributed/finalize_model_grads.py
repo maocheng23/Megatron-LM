@@ -326,10 +326,27 @@ def _allreduce_non_tensor_model_parallel_grads(
     params_avg = []
     grads_avg = []
 
+    # DEBUG: Check if router params have average_gradients_across_tp_domain set
+    import os
+    debug_router_grad = os.environ.get("DEBUG_ROUTER_GRAD_SYNC", "0") == "1"
+    
     for model_chunk in model:
         ddp_config = model_chunk.ddp_config
         for name, param in get_attr_wrapped_model(model_chunk, 'named_parameters')():
             if param.requires_grad:
+                # DEBUG: Log router params
+                if debug_router_grad and "router" in name.lower():
+                    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                    has_avg_flag = getattr(param, "average_gradients_across_tp_domain", False)
+                    has_sp_flag = getattr(param, "sequence_parallel", False)
+                    grad_attr = _get_main_grad_attr(param)
+                    has_grad = getattr(param, grad_attr) is not None
+                    if rank == 0:
+                        print(f"[finalize_model_grads][DEBUG] Router param '{name}': "
+                              f"average_gradients_across_tp_domain={has_avg_flag}, "
+                              f"sequence_parallel={has_sp_flag}, "
+                              f"grad_attr={grad_attr}, has_grad={has_grad}", flush=True)
+                
                 # Check if this param needs average reduction (average_gradients_across_tp_domain)
                 if getattr(param, "average_gradients_across_tp_domain", False):
                     grad_attr = _get_main_grad_attr(param)
@@ -357,6 +374,13 @@ def _allreduce_non_tensor_model_parallel_grads(
                         grad = _unshard_if_dtensor(grad)
                         grads_sum.append(grad.data)
 
+    # DEBUG: Log how many params will be all-reduced
+    if debug_router_grad:
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        if rank == 0:
+            print(f"[finalize_model_grads][DEBUG] params_sum count: {len(params_sum)}, "
+                  f"params_avg count: {len(params_avg)}, tp_group_size: {get_pg_size(tp_group)}", flush=True)
+    
     # Loop grads and perform correct all-reduce
     for params, grads, all_reduce_op in zip(
         [params_sum, params_avg],
