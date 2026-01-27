@@ -16,6 +16,7 @@ from megatron.core.fp4_utils import get_fp4_align_size
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import get_cuda_rng_tracker, get_expert_parallel_rng_tracker_name
+from megatron.core.tensor_parallel.mappings import _tree_all_reduce_sum
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -342,14 +343,23 @@ class FusedExpertsFunction(torch.autograd.Function):
     
     Forward: Uses SGLang's fused_experts_impl (triton kernel) for bitwise identical results
     Backward: Uses pure PyTorch operations for gradient computation
+    
+    IMPORTANT: In EP mode, grad_topk_weights is all-reduced across EP ranks so the router
+    receives complete gradients from all experts.
     """
     
     @staticmethod
-    def forward(ctx, hidden_states, w1, w2, topk_weights, topk_ids, activation, layer_id):
-        """Forward pass using SGLang's triton kernel."""
+    def forward(ctx, hidden_states, w1, w2, topk_weights, topk_ids, activation, layer_id, ep_group):
+        """Forward pass using SGLang's triton kernel.
+        
+        Args:
+            ep_group: Expert parallel process group for all-reducing grad_topk_weights.
+                      Can be None if EP size is 1.
+        """
         # Save tensors for backward
         ctx.save_for_backward(hidden_states, w1, w2, topk_weights, topk_ids)
         ctx.activation = activation
+        ctx.ep_group = ep_group
         
         # Use SGLang's fused_experts_impl for bitwise identical forward
         with torch.no_grad():
@@ -372,28 +382,68 @@ class FusedExpertsFunction(torch.autograd.Function):
     
     @staticmethod
     def backward(ctx, grad_output):
-        """Backward pass using pure PyTorch operations."""
+        """Backward pass using pure PyTorch operations.
+        
+        IMPORTANT: In EP mode, each rank only computes grad_topk_weights for its local experts.
+        We all-reduce grad_topk_weights across EP ranks so the router receives complete gradients.
+        """
         hidden_states, w1, w2, topk_weights, topk_ids = ctx.saved_tensors
         activation = ctx.activation
+        ep_group = ctx.ep_group
+        
+        # Debug: verify backward is being called and EP group info
+        if os.environ.get("DEBUG_GRAD_ALLREDUCE", "0") == "1":
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            if ep_group is not None:
+                ep_size = torch.distributed.get_world_size(ep_group)
+                ep_rank = torch.distributed.get_rank(ep_group)
+                print(f"[FusedExpertsFunction.backward][Rank {rank}] CALLED! "
+                      f"ep_group={ep_group}, ep_size={ep_size}, ep_rank={ep_rank}, "
+                      f"grad_output.shape={grad_output.shape}, "
+                      f"topk_weights.requires_grad={topk_weights.requires_grad}, "
+                      f"hidden_states.requires_grad={hidden_states.requires_grad}")
+            else:
+                print(f"[FusedExpertsFunction.backward][Rank {rank}] CALLED! "
+                      f"ep_group=None, grad_output.shape={grad_output.shape}, "
+                      f"topk_weights.requires_grad={topk_weights.requires_grad}")
         
         num_tokens, hidden_size = hidden_states.shape
-        num_experts, ffn_hidden_size, _ = w1.shape
+        num_local_experts, ffn_hidden_size, _ = w1.shape  # In EP mode, w1 only has local experts!
         topk = topk_ids.shape[1]
+        
+        # Get EP info to compute global expert IDs
+        if ep_group is not None:
+            ep_world_size = torch.distributed.get_world_size(ep_group)
+            ep_rank = torch.distributed.get_rank(ep_group)
+        else:
+            ep_world_size = 1
+            ep_rank = 0
         
         # Initialize gradients
         grad_hidden_states = torch.zeros_like(hidden_states) if hidden_states.requires_grad else None
         grad_w1 = torch.zeros_like(w1) if w1.requires_grad else None
         grad_w2 = torch.zeros_like(w2) if w2.requires_grad else None
         # Initialize grad_topk_weights for router gradient
-        grad_topk_weights = torch.zeros_like(topk_weights) if topk_weights.requires_grad else None
+        # NOTE: Set DISABLE_ROUTER_GRAD=1 to disable router gradient computation for debugging
+        # This helps isolate whether the router gradient computation is causing divergence
+        if os.environ.get("DISABLE_ROUTER_GRAD", "0") == "1":
+            grad_topk_weights = None  # Disable router gradient for debugging
+        else:
+            grad_topk_weights = torch.zeros_like(topk_weights) if topk_weights.requires_grad else None
         
         # Store expert outputs for grad_topk_weights calculation
         # expert_outputs[expert_id] = dict mapping token_index -> expert_output_vector
         expert_outputs_cache = {}
         
-        # Process each expert
-        for expert_id in range(num_experts):
-            mask = (topk_ids == expert_id)
+        # Process each LOCAL expert
+        # IMPORTANT: topk_ids saved in ctx.save_for_backward is LOCAL expert IDs (from topk_ids_local)!
+        # In EP mode, topk_ids_local contains:
+        # - 0, 1, ..., num_local_experts-1 for tokens that selected this rank's experts
+        # - -1 for tokens that selected other ranks' experts
+        # So we match against LOCAL expert ID, not global!
+        for local_expert_id in range(num_local_experts):
+            # Match against LOCAL expert ID (topk_ids contains local IDs!)
+            mask = (topk_ids == local_expert_id)
             if not mask.any():
                 continue
             
@@ -402,8 +452,8 @@ class FusedExpertsFunction(torch.autograd.Function):
                 continue
             
             expert_input = hidden_states[token_indices]
-            expert_w1 = w1[expert_id]
-            expert_w2 = w2[expert_id]
+            expert_w1 = w1[local_expert_id]  # Use local ID to index into local weights
+            expert_w2 = w2[local_expert_id]
             
             # Forward pass (recompute for backward)
             gate_up = torch.nn.functional.linear(expert_input, expert_w1)
@@ -422,9 +472,9 @@ class FusedExpertsFunction(torch.autograd.Function):
             # expert_output = linear(intermediate, expert_w2)
             expert_output = torch.nn.functional.linear(intermediate, expert_w2)
             
-            # Cache for grad_topk_weights computation
+            # Cache for grad_topk_weights computation (use local ID as key)
             if grad_topk_weights is not None:
-                expert_outputs_cache[expert_id] = (token_indices, expert_output)
+                expert_outputs_cache[local_expert_id] = (token_indices, expert_output)
             
             # Compute weighted grad_output for this expert
             expert_grad_output = torch.zeros(len(token_indices), hidden_size, 
@@ -445,7 +495,7 @@ class FusedExpertsFunction(torch.autograd.Function):
             # grad_w2 = grad_expert_output.T @ intermediate
             grad_intermediate = expert_grad_output @ expert_w2.to(expert_grad_output.dtype)
             if grad_w2 is not None:
-                grad_w2[expert_id] += expert_grad_output.T.to(grad_w2.dtype) @ intermediate.to(grad_w2.dtype)
+                grad_w2[local_expert_id] += expert_grad_output.T.to(grad_w2.dtype) @ intermediate.to(grad_w2.dtype)
             
             # Backward through element-wise multiply: intermediate = gate * up
             grad_gate = grad_intermediate * up
@@ -477,7 +527,7 @@ class FusedExpertsFunction(torch.autograd.Function):
                 grad_hidden_states[token_indices] += grad_expert_input.to(grad_hidden_states.dtype)
             
             if grad_w1 is not None:
-                grad_w1[expert_id] += grad_gate_up.T.to(grad_w1.dtype) @ expert_input.to(grad_w1.dtype)
+                grad_w1[local_expert_id] += grad_gate_up.T.to(grad_w1.dtype) @ expert_input.to(grad_w1.dtype)
         
         # Compute grad_topk_weights
         # output[i] = sum_k(topk_weights[i,k] * expert_k(input[i]))
@@ -485,8 +535,8 @@ class FusedExpertsFunction(torch.autograd.Function):
         # grad_topk_weights[i,k] = sum_j(grad_output[i,j] * expert_output_k[i,j])
         #                       = (grad_output[i] · expert_output_k[i])
         if grad_topk_weights is not None:
-            for expert_id, (token_indices, expert_output) in expert_outputs_cache.items():
-                mask = (topk_ids == expert_id)
+            for local_expert_id, (token_indices, expert_output) in expert_outputs_cache.items():
+                mask = (topk_ids == local_expert_id)  # Match against LOCAL expert ID!
                 for slot in range(topk):
                     slot_mask = mask[token_indices, slot]
                     if slot_mask.any():
@@ -498,8 +548,109 @@ class FusedExpertsFunction(torch.autograd.Function):
                         # Element-wise multiply and sum over hidden dimension
                         grad_weights = (grad_out_selected * expert_out_selected).sum(dim=-1)  # [num_selected]
                         grad_topk_weights[slot_token_indices, slot] += grad_weights.to(grad_topk_weights.dtype)
+            
+            # CRITICAL: All-reduce grad_topk_weights across EP ranks
+            # Each rank only computes gradients for its local experts. Without all-reduce,
+            # the router would receive partial gradients and weights would diverge across ranks.
+            # NOTE: We use SUM all-reduce because each rank computes a PARTIAL gradient
+            # (only for tokens that selected its local experts). The sum gives the total gradient.
+            # This is NOT like data parallel where we average - here we sum because each rank
+            # has a disjoint contribution.
+            if ep_group is not None:
+                ep_world_size = torch.distributed.get_world_size(ep_group)
+                ep_rank_in_group = torch.distributed.get_rank(ep_group)
+                
+                # ALWAYS log all-reduce status (not just with debug flag)
+                if os.environ.get("DEBUG_GRAD_SYNC", "0") == "1":
+                    rank = torch.distributed.get_rank()
+                    print(f"[FusedExpertsFunction][Rank {rank}] ep_group info: "
+                          f"ep_world_size={ep_world_size}, ep_rank_in_group={ep_rank_in_group}, "
+                          f"will_allreduce={ep_world_size > 1}")
+                
+                if ep_world_size > 1:
+                    # Debug: log before all-reduce
+                    if os.environ.get("DEBUG_GRAD_ALLREDUCE", "0") == "1":
+                        rank = torch.distributed.get_rank()
+                        print(f"[FusedExpertsFunction][Rank {rank}] BEFORE grad_topk_weights all-reduce: "
+                              f"sum={grad_topk_weights.sum().item():.6e}, norm={grad_topk_weights.norm().item():.6e}")
+                    
+                    # CRITICAL: Use deterministic tree all-reduce to match forward pass
+                    # Standard NCCL all-reduce can cause non-determinism due to floating-point
+                    # accumulation order differences, leading to router weight divergence across ranks
+                    if os.environ.get("MEGATRON_USE_DETERMINISTIC_ALLREDUCE", "0") == "1":
+                        grad_topk_weights_reduced = _tree_all_reduce_sum(grad_topk_weights, ep_group)
+                        grad_topk_weights.copy_(grad_topk_weights_reduced)
+                    else:
+                        torch.distributed.all_reduce(grad_topk_weights, group=ep_group)
+                    
+                    # Debug: log after all-reduce
+                    if os.environ.get("DEBUG_GRAD_ALLREDUCE", "0") == "1":
+                        print(f"[FusedExpertsFunction][Rank {rank}] AFTER grad_topk_weights all-reduce: "
+                              f"sum={grad_topk_weights.sum().item():.6e}, norm={grad_topk_weights.norm().item():.6e}")
+                    
+                    # CRITICAL DEBUG: Verify all ranks have identical grad_topk_weights after all-reduce
+                    if os.environ.get("DEBUG_GRAD_SYNC", "0") == "1":
+                        # All-gather the sum from all ranks to verify they're identical
+                        local_sum = torch.tensor([grad_topk_weights.sum().item()], device=grad_topk_weights.device)
+                        all_sums = [torch.zeros_like(local_sum) for _ in range(ep_world_size)]
+                        torch.distributed.all_gather(all_sums, local_sum, group=ep_group)
+                        sums = [s.item() for s in all_sums]
+                        max_diff = max(sums) - min(sums)
+                        if rank == 0:
+                            print(f"[FusedExpertsFunction][DEBUG_GRAD_SYNC] grad_topk_weights sums across ranks: {sums}")
+                            print(f"[FusedExpertsFunction][DEBUG_GRAD_SYNC] max_diff={max_diff:.6e}")
+                            if max_diff > 1e-6:
+                                print(f"[FusedExpertsFunction][DEBUG_GRAD_SYNC] WARNING: grad_topk_weights DIFFERS across ranks!")
+            else:
+                if os.environ.get("DEBUG_GRAD_ALLREDUCE", "0") == "1":
+                    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                    print(f"[FusedExpertsFunction][Rank {rank}] WARNING: ep_group is None, skipping grad_topk_weights all-reduce!")
         
-        return grad_hidden_states, grad_w1, grad_w2, grad_topk_weights, None, None, None
+        # CRITICAL: All-reduce grad_hidden_states across EP ranks
+        # Each rank only computes gradients from its local experts. The full gradient
+        # is the sum of contributions from all experts across all ranks.
+        if grad_hidden_states is not None:
+            if ep_group is not None:
+                ep_world_size = torch.distributed.get_world_size(ep_group)
+                if ep_world_size > 1:
+                    # Debug: log before all-reduce
+                    if os.environ.get("DEBUG_GRAD_ALLREDUCE", "0") == "1":
+                        rank = torch.distributed.get_rank()
+                        print(f"[FusedExpertsFunction][Rank {rank}] BEFORE grad_hidden_states all-reduce: "
+                              f"sum={grad_hidden_states.sum().item():.6e}, norm={grad_hidden_states.norm().item():.6e}")
+                    
+                    # CRITICAL: Use deterministic tree all-reduce to match forward pass
+                    # This ensures gradient accumulation order is consistent across ranks
+                    if os.environ.get("MEGATRON_USE_DETERMINISTIC_ALLREDUCE", "0") == "1":
+                        grad_hidden_states_reduced = _tree_all_reduce_sum(grad_hidden_states, ep_group)
+                        grad_hidden_states.copy_(grad_hidden_states_reduced)
+                    else:
+                        torch.distributed.all_reduce(grad_hidden_states, group=ep_group)
+                    
+                    # Debug: log after all-reduce
+                    if os.environ.get("DEBUG_GRAD_ALLREDUCE", "0") == "1":
+                        print(f"[FusedExpertsFunction][Rank {rank}] AFTER grad_hidden_states all-reduce: "
+                              f"sum={grad_hidden_states.sum().item():.6e}, norm={grad_hidden_states.norm().item():.6e}")
+                    
+                    # CRITICAL DEBUG: Verify all ranks have identical grad_hidden_states after all-reduce
+                    if os.environ.get("DEBUG_GRAD_SYNC", "0") == "1":
+                        local_sum = torch.tensor([grad_hidden_states.sum().item()], device=grad_hidden_states.device)
+                        all_sums = [torch.zeros_like(local_sum) for _ in range(ep_world_size)]
+                        torch.distributed.all_gather(all_sums, local_sum, group=ep_group)
+                        sums = [s.item() for s in all_sums]
+                        max_diff = max(sums) - min(sums)
+                        if rank == 0:
+                            print(f"[FusedExpertsFunction][DEBUG_GRAD_SYNC] grad_hidden_states sums across ranks: {sums}")
+                            print(f"[FusedExpertsFunction][DEBUG_GRAD_SYNC] max_diff={max_diff:.6e}")
+                            if max_diff > 1e-6:
+                                print(f"[FusedExpertsFunction][DEBUG_GRAD_SYNC] WARNING: grad_hidden_states DIFFERS across ranks!")
+            else:
+                if os.environ.get("DEBUG_GRAD_ALLREDUCE", "0") == "1":
+                    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                    print(f"[FusedExpertsFunction][Rank {rank}] WARNING: ep_group is None, skipping grad_hidden_states all-reduce!")
+        
+        # Return gradients for all inputs (None for non-tensor inputs)
+        return grad_hidden_states, grad_w1, grad_w2, grad_topk_weights, None, None, None, None
 
 
 def sglang_fused_experts(
@@ -516,6 +667,7 @@ def sglang_fused_experts(
     num_local_experts: Optional[int] = None,
     ep_rank: int = 0,
     ep_size: int = 1,
+    ep_group = None,
 ):
     """Call fused experts implementation for deterministic MoE computation.
 
@@ -534,6 +686,7 @@ def sglang_fused_experts(
         num_local_experts: Number of local experts on this rank
         ep_rank: Expert parallel rank
         ep_size: Expert parallel world size
+        ep_group: Expert parallel process group for all-reducing grad_topk_weights
 
     Returns:
         output: Output tensor [num_tokens, hidden_size]
@@ -590,8 +743,18 @@ def sglang_fused_experts(
         print(f"[moe_utils.py][Megatron Expert Input][Rank {rank}][Layer {layer_number}] topk_ids_local.shape: {topk_ids_local.shape}, topk_ids_local[{position}]: {topk_ids_local[position].tolist()}")
         print(f"[moe_utils.py][Megatron Expert Input][Rank {rank}][Layer {layer_number}] topk_weights.shape: {topk_weights.shape}, topk_weights[{position}]: {topk_weights[position].tolist()}")
 
+    # Debug: check if topk_weights requires grad
+    if os.environ.get("DEBUG_GRAD_ALLREDUCE", "0") == "1" and layer_number <= 1:
+        import torch.distributed as dist
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        print(f"[sglang_fused_experts][Rank {rank}][Layer {layer_number}] "
+              f"topk_weights.requires_grad={topk_weights.requires_grad}, "
+              f"hidden_states.requires_grad={hidden_states.requires_grad}, "
+              f"ep_group={ep_group}, ep_size={ep_size}")
+    
     # Use custom autograd function: forward uses triton kernel (bitwise identical),
     # backward uses PyTorch operations for gradient computation
+    # Pass ep_group so grad_topk_weights can be all-reduced across EP ranks
     output = FusedExpertsFunction.apply(
         hidden_states.contiguous(),
         w1.contiguous(),
@@ -600,6 +763,7 @@ def sglang_fused_experts(
         topk_ids_local.contiguous(),
         activation,
         layer_number,
+        ep_group,
     )
 
     # Debug: compare expert output

@@ -376,6 +376,18 @@ class MoELayer(BaseMoELayer):
         # Get EP info
         ep_size = utils.get_pg_size(self.ep_group)
         ep_rank = utils.get_pg_rank(self.ep_group)
+        
+        # Debug: verify EP group and TP group consistency
+        if os.environ.get("DEBUG_GRAD_ALLREDUCE", "0") == "1" and self.layer_number <= 1:
+            import torch.distributed as dist
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            tp_size = utils.get_pg_size(self.attn_tp_group)
+            tp_rank = utils.get_pg_rank(self.attn_tp_group)
+            print(f"[moe_layer._sglang_forward][Rank {rank}][Layer {self.layer_number}] "
+                  f"ep_group={self.ep_group}, ep_size={ep_size}, ep_rank={ep_rank}, "
+                  f"attn_tp_group={self.attn_tp_group}, tp_size={tp_size}, tp_rank={tp_rank}, "
+                  f"(EP_size==TP_size: {ep_size == tp_size}), "
+                  f"USING attn_tp_group for BOTH forward and backward all-reduce")
 
         # Debug print
         if os.environ.get("DEBUG_MEGATRON_EP_MAPPING", "0") == "1" and self.layer_number <= 1:
@@ -434,6 +446,7 @@ class MoELayer(BaseMoELayer):
             num_local_experts=self.num_local_experts,
             ep_rank=ep_rank,
             ep_size=ep_size,
+            ep_group=self.attn_tp_group,  # Use TP group for gradient all-reduce to match forward all-reduce
         )
 
         # DEBUG: Expert output before all-reduce
