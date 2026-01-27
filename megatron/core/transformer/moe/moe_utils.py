@@ -16,7 +16,7 @@ from megatron.core.fp4_utils import get_fp4_align_size
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import get_cuda_rng_tracker, get_expert_parallel_rng_tracker_name
-from megatron.core.tensor_parallel.mappings import _tree_all_reduce_sum
+from megatron.core.tensor_parallel.mappings import _tree_all_reduce_sum, _tree_all_reduce_sum_impl
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -360,6 +360,7 @@ class FusedExpertsFunction(torch.autograd.Function):
         ctx.save_for_backward(hidden_states, w1, w2, topk_weights, topk_ids)
         ctx.activation = activation
         ctx.ep_group = ep_group
+        ctx.layer_id = layer_id
         
         # Use SGLang's fused_experts_impl for bitwise identical forward
         with torch.no_grad():
@@ -390,6 +391,7 @@ class FusedExpertsFunction(torch.autograd.Function):
         hidden_states, w1, w2, topk_weights, topk_ids = ctx.saved_tensors
         activation = ctx.activation
         ep_group = ctx.ep_group
+        layer_id = ctx.layer_id
         
         # Debug: verify backward is being called and EP group info
         if os.environ.get("DEBUG_GRAD_ALLREDUCE", "0") == "1":
@@ -397,13 +399,13 @@ class FusedExpertsFunction(torch.autograd.Function):
             if ep_group is not None:
                 ep_size = torch.distributed.get_world_size(ep_group)
                 ep_rank = torch.distributed.get_rank(ep_group)
-                print(f"[FusedExpertsFunction.backward][Rank {rank}] CALLED! "
+                print(f"[FusedExpertsFunction.backward][Rank {rank}][Layer {layer_id}] CALLED! "
                       f"ep_group={ep_group}, ep_size={ep_size}, ep_rank={ep_rank}, "
                       f"grad_output.shape={grad_output.shape}, "
                       f"topk_weights.requires_grad={topk_weights.requires_grad}, "
                       f"hidden_states.requires_grad={hidden_states.requires_grad}")
             else:
-                print(f"[FusedExpertsFunction.backward][Rank {rank}] CALLED! "
+                print(f"[FusedExpertsFunction.backward][Rank {rank}][Layer {layer_id}] CALLED! "
                       f"ep_group=None, grad_output.shape={grad_output.shape}, "
                       f"topk_weights.requires_grad={topk_weights.requires_grad}")
         
@@ -577,8 +579,10 @@ class FusedExpertsFunction(torch.autograd.Function):
                     # CRITICAL: Use deterministic tree all-reduce to match forward pass
                     # Standard NCCL all-reduce can cause non-determinism due to floating-point
                     # accumulation order differences, leading to router weight divergence across ranks
+                    # NOTE: Use _tree_all_reduce_sum_impl directly (not _tree_all_reduce_sum) because
+                    # we're in backward context and don't need autograd support
                     if os.environ.get("MEGATRON_USE_DETERMINISTIC_ALLREDUCE", "0") == "1":
-                        grad_topk_weights_reduced = _tree_all_reduce_sum(grad_topk_weights, ep_group)
+                        grad_topk_weights_reduced = _tree_all_reduce_sum_impl(grad_topk_weights, ep_group)
                         grad_topk_weights.copy_(grad_topk_weights_reduced)
                     else:
                         torch.distributed.all_reduce(grad_topk_weights, group=ep_group)
@@ -597,10 +601,10 @@ class FusedExpertsFunction(torch.autograd.Function):
                         sums = [s.item() for s in all_sums]
                         max_diff = max(sums) - min(sums)
                         if rank == 0:
-                            print(f"[FusedExpertsFunction][DEBUG_GRAD_SYNC] grad_topk_weights sums across ranks: {sums}")
-                            print(f"[FusedExpertsFunction][DEBUG_GRAD_SYNC] max_diff={max_diff:.6e}")
+                            print(f"[FusedExpertsFunction][DEBUG_GRAD_SYNC][Layer {layer_id}] grad_topk_weights sums across ranks: {sums}")
+                            print(f"[FusedExpertsFunction][DEBUG_GRAD_SYNC][Layer {layer_id}] max_diff={max_diff:.6e}")
                             if max_diff > 1e-6:
-                                print(f"[FusedExpertsFunction][DEBUG_GRAD_SYNC] WARNING: grad_topk_weights DIFFERS across ranks!")
+                                print(f"[FusedExpertsFunction][DEBUG_GRAD_SYNC][Layer {layer_id}] WARNING: grad_topk_weights DIFFERS across ranks!")
             else:
                 if os.environ.get("DEBUG_GRAD_ALLREDUCE", "0") == "1":
                     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
@@ -621,8 +625,10 @@ class FusedExpertsFunction(torch.autograd.Function):
                     
                     # CRITICAL: Use deterministic tree all-reduce to match forward pass
                     # This ensures gradient accumulation order is consistent across ranks
+                    # NOTE: Use _tree_all_reduce_sum_impl directly (not _tree_all_reduce_sum) because
+                    # we're in backward context and don't need autograd support
                     if os.environ.get("MEGATRON_USE_DETERMINISTIC_ALLREDUCE", "0") == "1":
-                        grad_hidden_states_reduced = _tree_all_reduce_sum(grad_hidden_states, ep_group)
+                        grad_hidden_states_reduced = _tree_all_reduce_sum_impl(grad_hidden_states, ep_group)
                         grad_hidden_states.copy_(grad_hidden_states_reduced)
                     else:
                         torch.distributed.all_reduce(grad_hidden_states, group=ep_group)
@@ -640,10 +646,10 @@ class FusedExpertsFunction(torch.autograd.Function):
                         sums = [s.item() for s in all_sums]
                         max_diff = max(sums) - min(sums)
                         if rank == 0:
-                            print(f"[FusedExpertsFunction][DEBUG_GRAD_SYNC] grad_hidden_states sums across ranks: {sums}")
-                            print(f"[FusedExpertsFunction][DEBUG_GRAD_SYNC] max_diff={max_diff:.6e}")
+                            print(f"[FusedExpertsFunction][DEBUG_GRAD_SYNC][Layer {layer_id}] grad_hidden_states sums across ranks: {sums}")
+                            print(f"[FusedExpertsFunction][DEBUG_GRAD_SYNC][Layer {layer_id}] max_diff={max_diff:.6e}")
                             if max_diff > 1e-6:
-                                print(f"[FusedExpertsFunction][DEBUG_GRAD_SYNC] WARNING: grad_hidden_states DIFFERS across ranks!")
+                                print(f"[FusedExpertsFunction][DEBUG_GRAD_SYNC][Layer {layer_id}] WARNING: grad_hidden_states DIFFERS across ranks!")
             else:
                 if os.environ.get("DEBUG_GRAD_ALLREDUCE", "0") == "1":
                     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
