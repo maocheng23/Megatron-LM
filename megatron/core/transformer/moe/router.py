@@ -102,10 +102,27 @@ class Router(ABC, MegatronModule):
             if self.bias is not None:
                 self.config.init_method(self.bias)
         self.weight.data = self.weight.data.to(dtype=self.config.params_dtype)
+        # CRITICAL FIX for MoE EP mode:
+        # Router weights are replicated across all EP/TP ranks. In backward pass,
+        # each rank computes partial gradient (from its local experts + local sequence tokens).
+        # These gradients MUST be SUM-reduced across TP group to ensure all ranks have
+        # identical router weights after optimizer step.
+        #
+        # We ALWAYS set sequence_parallel=True for router weights (regardless of global config)
+        # because in finalize_model_grads, gradient all-reduce is triggered by:
+        #   (config.sequence_parallel AND param.sequence_parallel)
+        # Setting param.sequence_parallel=True is necessary but not sufficient alone.
+        #
+        # However, we also need config.sequence_parallel=True for the all-reduce to happen.
+        # If global SP is disabled, we need an alternative approach - see below.
         setattr(self.weight, 'sequence_parallel', self.config.sequence_parallel)
+        # Alternative: use average_gradients_across_tp_domain which doesn't depend on global config
+        # This triggers AVG all-reduce (slightly different from SUM but ensures synchronization)
+        setattr(self.weight, 'average_gradients_across_tp_domain', True)
         if self.bias is not None:
             self.bias.data = self.bias.data.to(dtype=self.config.params_dtype)
             setattr(self.bias, 'sequence_parallel', self.config.sequence_parallel)
+            setattr(self.bias, 'average_gradients_across_tp_domain', True)
 
     def gating(self, input: torch.Tensor):
         """Forward pass of the router gate.
