@@ -382,6 +382,11 @@ def _allreduce_non_tensor_model_parallel_grads(
                   f"params_avg count: {len(params_avg)}, tp_group_size: {get_pg_size(tp_group)}", flush=True)
     
     # Loop grads and perform correct all-reduce
+    # CRITICAL: Use deterministic tree all-reduce when MEGATRON_USE_DETERMINISTIC_ALLREDUCE=1
+    # to ensure numerical consistency across ranks for true on-policy training
+    import os
+    use_deterministic = os.environ.get("MEGATRON_USE_DETERMINISTIC_ALLREDUCE", "0") == "1"
+    
     for params, grads, all_reduce_op in zip(
         [params_sum, params_avg],
         [grads_sum, grads_avg],
@@ -389,7 +394,19 @@ def _allreduce_non_tensor_model_parallel_grads(
     ):
         if grads:
             coalesced = _flatten_dense_tensors(grads)
-            torch.distributed.all_reduce(coalesced, op=all_reduce_op, group=tp_group)
+            
+            if use_deterministic:
+                # Use deterministic tree all-reduce for true on-policy consistency
+                from megatron.core.tensor_parallel.mappings import _tree_all_reduce_sum_impl
+                # For SUM: use tree all-reduce directly
+                # For AVG: use tree all-reduce then divide by world size
+                coalesced_reduced = _tree_all_reduce_sum_impl(coalesced, tp_group)
+                if all_reduce_op == torch.distributed.ReduceOp.AVG:
+                    coalesced_reduced = coalesced_reduced / get_pg_size(tp_group)
+                coalesced.copy_(coalesced_reduced)
+            else:
+                torch.distributed.all_reduce(coalesced, op=all_reduce_op, group=tp_group)
+            
             for param, buf, synced in zip(
                 params, grads, _unflatten_dense_tensors(coalesced, grads)
             ):
