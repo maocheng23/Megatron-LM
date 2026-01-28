@@ -190,7 +190,7 @@ def _get_param_groups(
             "only target layer MoE experts will be added to optimizer param groups.",
         )
 
-    layer_id_re = re.compile(r"(?:^|\\.)layers\\.(\\d+)\\.")
+    layer_id_re = re.compile(r"(?:^|\.)layers\.(\d+)\.")
     warned_missing_layer_id = False
 
     # Check if we should also include router weights for the target layer
@@ -211,9 +211,16 @@ def _get_param_groups(
         #  to the new API.
         config_overrides = get_standard_config_overrides()
 
+    # Debug: track which parameters are added to optimizer
+    debug_optimizer_params = os.environ.get("DEBUG_OPTIMIZER_PARAMS", "0") == "1"
+    params_added_to_optimizer = []
+    
     for model_chunk in model_chunks:
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
+                if debug_optimizer_params and "layers.47" in name and "experts" in name:
+                    log_single_rank(logger, logging.WARNING,
+                        f"[DEBUG] SKIPPED (requires_grad=False): {name}")
                 continue
             if target_layers_set is not None:
                 if optimize_mode == "entire_layer":
@@ -221,10 +228,20 @@ def _get_param_groups(
                     match = layer_id_re.search(name)
                     if match is None:
                         # Skip non-layer params (embedding, lm_head, etc.)
+                        if debug_optimizer_params and "layers.47" in name:
+                            log_single_rank(logger, logging.WARNING,
+                                f"[DEBUG] SKIPPED (no layer match): {name}")
                         continue
-                    if int(match.group(1)) not in target_layers_set:
+                    layer_id_parsed = int(match.group(1))
+                    if layer_id_parsed not in target_layers_set:
+                        if debug_optimizer_params and "layers.47" in name:
+                            log_single_rank(logger, logging.WARNING,
+                                f"[DEBUG] SKIPPED (layer {layer_id_parsed} not in {sorted(target_layers_set)}): {name}")
                         continue
                     # Include this parameter (it's from one of the target layers)
+                    if debug_optimizer_params and "layers.47" in name and "experts" in name:
+                        log_single_rank(logger, logging.WARNING,
+                            f"[DEBUG] INCLUDED in optimizer: {name}, layer={layer_id_parsed}")
                 else:
                     # MoE-only mode: Keep only target-layer experts (and optionally router)
                     is_expert_param = ".mlp.experts." in name
@@ -232,6 +249,9 @@ def _get_param_groups(
                     
                     # Skip if not an expert or router param (when router is enabled)
                     if not is_expert_param and not (include_router and is_router_param):
+                        if debug_optimizer_params and "layers.47" in name:
+                            log_single_rank(logger, logging.WARNING,
+                                f"[DEBUG] SKIPPED (not expert/router): {name}")
                         continue
                     
                     match = layer_id_re.search(name)
@@ -246,8 +266,16 @@ def _get_param_groups(
                             )
                             warned_missing_layer_id = True
                         continue
-                    if int(match.group(1)) not in target_layers_set:
+                    layer_id_parsed = int(match.group(1))
+                    if layer_id_parsed not in target_layers_set:
+                        if debug_optimizer_params and "layers.47" in name:
+                            log_single_rank(logger, logging.WARNING,
+                                f"[DEBUG] SKIPPED (layer {layer_id_parsed} not in {sorted(target_layers_set)}): {name}")
                         continue
+                    # Include this parameter
+                    if debug_optimizer_params and "layers.47" in name and "experts" in name:
+                        log_single_rank(logger, logging.WARNING,
+                            f"[DEBUG] INCLUDED in optimizer (MoE-only): {name}, layer={layer_id_parsed}")
 
             uses_default_config = False
             # Get optimizer config overrides for this parameter.
