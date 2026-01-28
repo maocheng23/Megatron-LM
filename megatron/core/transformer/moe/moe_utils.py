@@ -615,8 +615,15 @@ class FusedExpertsFunction(torch.autograd.Function):
         # CRITICAL: All-reduce grad_hidden_states across EP ranks
         # Each rank only computes gradients from its local experts. The full gradient
         # is the sum of contributions from all experts across all ranks.
+        # NOTE: Set DISABLE_HIDDEN_GRAD_ALLREDUCE=1 to disable this all-reduce for debugging.
+        # This will cause INCORRECT upstream gradients but helps isolate divergence sources.
         if grad_hidden_states is not None:
-            if ep_group is not None:
+            if os.environ.get("DISABLE_HIDDEN_GRAD_ALLREDUCE", "0") == "1":
+                # Skip all-reduce for debugging - upstream weights will get wrong gradients!
+                if os.environ.get("DEBUG_GRAD_ALLREDUCE", "0") == "1":
+                    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                    print(f"[FusedExpertsFunction][Rank {rank}] SKIP grad_hidden_states all-reduce (DISABLE_HIDDEN_GRAD_ALLREDUCE=1)")
+            elif ep_group is not None:
                 ep_world_size = torch.distributed.get_world_size(ep_group)
                 if ep_world_size > 1:
                     # Debug: log before all-reduce
