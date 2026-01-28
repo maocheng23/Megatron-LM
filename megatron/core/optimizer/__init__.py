@@ -1,6 +1,8 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import copy
 import logging
+import os
+import re
 import warnings
 from dataclasses import astuple
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -126,6 +128,31 @@ def _get_param_groups(
     # Map (pg_overrides, is_expert_parallel) to params.
     params_map = {}
 
+    only_optimize_layer = os.environ.get("ONLY_OPTIMIZE_LAYER_EXPERTS")
+    only_optimize_layer_source = "ONLY_OPTIMIZE_LAYER_EXPERTS"
+    if only_optimize_layer is None:
+        # Allow reusing ONLY_UPDATE_LAYER_EXPERTS for convenience in debug runs.
+        only_optimize_layer = os.environ.get("ONLY_UPDATE_LAYER_EXPERTS")
+        only_optimize_layer_source = "ONLY_UPDATE_LAYER_EXPERTS"
+
+    target_layer = None
+    if only_optimize_layer is not None:
+        try:
+            target_layer = int(only_optimize_layer)
+        except ValueError as exc:
+            raise ValueError(
+                f"{only_optimize_layer_source} must be an int layer id, got {only_optimize_layer!r}"
+            ) from exc
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            f"[DEBUG] {only_optimize_layer_source}={target_layer}: "
+            "only target layer MoE experts will be added to optimizer param groups.",
+        )
+
+    layer_id_re = re.compile(r"(?:^|\\.)layers\\.(\\d+)\\.")
+    warned_missing_layer_id = False
+
     if config_overrides is None:
         # TODO remove this default behavior eventually.
         #  This is only needed for backwards compatibility with the old config overrides API where
@@ -138,6 +165,24 @@ def _get_param_groups(
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
                 continue
+            if target_layer is not None:
+                # Keep only target-layer experts when debugging optimizer updates.
+                if ".mlp.experts." not in name:
+                    continue
+                match = layer_id_re.search(name)
+                if match is None:
+                    if not warned_missing_layer_id:
+                        log_single_rank(
+                            logger,
+                            logging.WARNING,
+                            f"[DEBUG] {only_optimize_layer_source} is set but "
+                            f"could not parse layer id from param name: {name}. "
+                            "Skipping unmatched parameters.",
+                        )
+                        warned_missing_layer_id = True
+                    continue
+                if int(match.group(1)) != target_layer:
+                    continue
 
             uses_default_config = False
             # Get optimizer config overrides for this parameter.
