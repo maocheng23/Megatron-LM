@@ -675,25 +675,40 @@ class FusedExpertsFunction(torch.autograd.Function):
         # - Router doesn't update
         # - Upstream layers don't update (grad_hidden_states zeroed)
         #
-        # ONLY_UPDATE_ENTIRE_LAYER=<layer_id>: Updates the ENTIRE layer (attention + MoE + layernorm)
-        # - For target layer: grad_hidden_states is NOT zeroed (so attention gets gradient)
+        # ONLY_UPDATE_ENTIRE_LAYER=<layer_spec>: Updates ENTIRE layers (attention + MoE + layernorm)
+        # Supports: single "47", comma-separated "46,47", or range "40-47"
+        # - For target layers: grad_hidden_states is NOT zeroed (so attention gets gradient)
         # - For non-target layers: grad_hidden_states is zeroed
         
         only_update_entire_layer = os.environ.get("ONLY_UPDATE_ENTIRE_LAYER", None)
         only_update_layer = os.environ.get("ONLY_UPDATE_LAYER_EXPERTS", None)
         
-        # Determine target layer and mode
-        target_layer = None
+        def parse_layer_spec(spec_str):
+            """Parse layer specification: '47', '46,47', '40-47', or '40-47,0'"""
+            layers = set()
+            for part in spec_str.split(','):
+                part = part.strip()
+                if '-' in part:
+                    start, end = part.split('-')
+                    layers.update(range(int(start), int(end) + 1))
+                else:
+                    layers.add(int(part))
+            return layers
+        
+        # Determine target layers and mode
+        target_layers_set = None
         entire_layer_mode = False
         if only_update_entire_layer is not None:
-            target_layer = int(only_update_entire_layer)
+            target_layers_set = parse_layer_spec(only_update_entire_layer)
             entire_layer_mode = True
         elif only_update_layer is not None:
-            target_layer = int(only_update_layer)
+            target_layers_set = {int(only_update_layer)}
             entire_layer_mode = False
         
-        if target_layer is not None:
-            if layer_id != target_layer:
+        if target_layers_set is not None:
+            is_target_layer = (layer_id in target_layers_set)
+            
+            if not is_target_layer:
                 # Zero out expert gradients for non-target layers
                 if grad_w1 is not None:
                     grad_w1.zero_()
@@ -703,15 +718,17 @@ class FusedExpertsFunction(torch.autograd.Function):
                     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
                     mode_str = "ONLY_UPDATE_ENTIRE_LAYER" if entire_layer_mode else "ONLY_UPDATE_LAYER_EXPERTS"
                     print(f"[FusedExpertsFunction][Rank {rank}][Layer {layer_id}] "
-                          f"ZEROING expert gradients ({mode_str}={target_layer})")
+                          f"ZEROING expert gradients ({mode_str}={sorted(target_layers_set)})")
 
             # Decide whether to zero grad_hidden_states
             # - MoE-only mode: zero for ALL layers (prevent upstream layers from updating)
             # - Entire-layer mode: zero only for NON-target layers (target layer's attention needs gradient)
+            #   Also zero for the LOWEST target layer to prevent gradient flowing to upstream layers
             should_zero_hidden_grad = False
             if entire_layer_mode:
-                # Only zero for non-target layers
-                should_zero_hidden_grad = (layer_id != target_layer)
+                min_target_layer = min(target_layers_set)
+                # Zero for non-target layers OR for the lowest target layer (to truncate upstream)
+                should_zero_hidden_grad = (not is_target_layer) or (layer_id == min_target_layer)
             else:
                 # MoE-only mode: zero for all layers
                 should_zero_hidden_grad = True

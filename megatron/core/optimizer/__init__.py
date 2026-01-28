@@ -129,6 +129,7 @@ def _get_param_groups(
     params_map = {}
 
     # Check for ONLY_UPDATE_ENTIRE_LAYER first (updates entire layer: attention + MoE + layernorm)
+    # Supports: single layer (e.g., "47"), comma-separated (e.g., "46,47"), or range (e.g., "40-47")
     only_update_entire_layer = os.environ.get("ONLY_UPDATE_ENTIRE_LAYER")
     
     only_optimize_layer = os.environ.get("ONLY_OPTIMIZE_LAYER_EXPERTS")
@@ -138,29 +139,45 @@ def _get_param_groups(
         only_optimize_layer = os.environ.get("ONLY_UPDATE_LAYER_EXPERTS")
         only_optimize_layer_source = "ONLY_UPDATE_LAYER_EXPERTS"
 
-    target_layer = None
-    target_entire_layer = None
+    target_layer = None  # For backward compatibility (single layer)
+    target_layers_set = None  # Set of layer IDs for multi-layer support
     optimize_mode = None  # "moe_only", "entire_layer", or None
+    
+    def parse_layer_spec(spec_str):
+        """Parse layer specification: '47', '46,47', '40-47', or '40-47,0'"""
+        layers = set()
+        for part in spec_str.split(','):
+            part = part.strip()
+            if '-' in part:
+                # Range: "40-47"
+                start, end = part.split('-')
+                layers.update(range(int(start), int(end) + 1))
+            else:
+                # Single layer
+                layers.add(int(part))
+        return layers
     
     # ONLY_UPDATE_ENTIRE_LAYER takes precedence
     if only_update_entire_layer is not None:
         try:
-            target_entire_layer = int(only_update_entire_layer)
-            target_layer = target_entire_layer  # For compatibility
+            target_layers_set = parse_layer_spec(only_update_entire_layer)
+            target_layer = min(target_layers_set)  # For backward compatibility
             optimize_mode = "entire_layer"
         except ValueError as exc:
             raise ValueError(
-                f"ONLY_UPDATE_ENTIRE_LAYER must be an int layer id, got {only_update_entire_layer!r}"
+                f"ONLY_UPDATE_ENTIRE_LAYER must be layer spec (e.g., '47', '46,47', '40-47'), "
+                f"got {only_update_entire_layer!r}"
             ) from exc
         log_single_rank(
             logger,
             logging.WARNING,
-            f"[DEBUG] ONLY_UPDATE_ENTIRE_LAYER={target_entire_layer}: "
-            "ALL parameters from this layer (attention + MoE + layernorm) will be added to optimizer.",
+            f"[DEBUG] ONLY_UPDATE_ENTIRE_LAYER={sorted(target_layers_set)}: "
+            f"ALL parameters from these {len(target_layers_set)} layers will be added to optimizer.",
         )
     elif only_optimize_layer is not None:
         try:
             target_layer = int(only_optimize_layer)
+            target_layers_set = {target_layer}
             optimize_mode = "moe_only"
         except ValueError as exc:
             raise ValueError(
@@ -198,16 +215,16 @@ def _get_param_groups(
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
                 continue
-            if target_layer is not None:
+            if target_layers_set is not None:
                 if optimize_mode == "entire_layer":
-                    # Keep ALL parameters from the target layer (attention + MoE + layernorm)
+                    # Keep ALL parameters from the target layers (attention + MoE + layernorm)
                     match = layer_id_re.search(name)
                     if match is None:
                         # Skip non-layer params (embedding, lm_head, etc.)
                         continue
-                    if int(match.group(1)) != target_layer:
+                    if int(match.group(1)) not in target_layers_set:
                         continue
-                    # Include this parameter (it's from the target layer)
+                    # Include this parameter (it's from one of the target layers)
                 else:
                     # MoE-only mode: Keep only target-layer experts (and optionally router)
                     is_expert_param = ".mlp.experts." in name
@@ -229,7 +246,7 @@ def _get_param_groups(
                             )
                             warned_missing_layer_id = True
                         continue
-                    if int(match.group(1)) != target_layer:
+                    if int(match.group(1)) not in target_layers_set:
                         continue
 
             uses_default_config = False
