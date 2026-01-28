@@ -153,6 +153,16 @@ def _get_param_groups(
     layer_id_re = re.compile(r"(?:^|\\.)layers\\.(\\d+)\\.")
     warned_missing_layer_id = False
 
+    # Check if we should also include router weights for the target layer
+    include_router = os.environ.get("INCLUDE_TARGET_LAYER_ROUTER", "0") == "1"
+    if target_layer is not None and include_router:
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            f"[DEBUG] INCLUDE_TARGET_LAYER_ROUTER=1: "
+            f"also including router (gate) weights for layer {target_layer}.",
+        )
+
     if config_overrides is None:
         # TODO remove this default behavior eventually.
         #  This is only needed for backwards compatibility with the old config overrides API where
@@ -166,9 +176,14 @@ def _get_param_groups(
             if not param.requires_grad:
                 continue
             if target_layer is not None:
-                # Keep only target-layer experts when debugging optimizer updates.
-                if ".mlp.experts." not in name:
+                # Keep only target-layer experts (and optionally router) when debugging optimizer updates.
+                is_expert_param = ".mlp.experts." in name
+                is_router_param = ".mlp.gate." in name or ".mlp.router." in name
+                
+                # Skip if not an expert or router param (when router is enabled)
+                if not is_expert_param and not (include_router and is_router_param):
                     continue
+                
                 match = layer_id_re.search(name)
                 if match is None:
                     if not warned_missing_layer_id:
