@@ -647,6 +647,7 @@ class FusedExpertsFunction(torch.autograd.Function):
                         torch.distributed.all_gather(all_sums, local_sum, group=ep_group)
                         sums = [s.item() for s in all_sums]
                         max_diff = max(sums) - min(sums)
+                        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
                         if rank == 0:
                             print(f"[FusedExpertsFunction][DEBUG_GRAD_SYNC][Layer {layer_id}] grad_hidden_states sums across ranks: {sums}")
                             print(f"[FusedExpertsFunction][DEBUG_GRAD_SYNC][Layer {layer_id}] max_diff={max_diff:.6e}")
