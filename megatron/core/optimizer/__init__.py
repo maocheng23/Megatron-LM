@@ -128,6 +128,9 @@ def _get_param_groups(
     # Map (pg_overrides, is_expert_parallel) to params.
     params_map = {}
 
+    # Check for ONLY_UPDATE_ENTIRE_LAYER first (updates entire layer: attention + MoE + layernorm)
+    only_update_entire_layer = os.environ.get("ONLY_UPDATE_ENTIRE_LAYER")
+    
     only_optimize_layer = os.environ.get("ONLY_OPTIMIZE_LAYER_EXPERTS")
     only_optimize_layer_source = "ONLY_OPTIMIZE_LAYER_EXPERTS"
     if only_optimize_layer is None:
@@ -136,9 +139,29 @@ def _get_param_groups(
         only_optimize_layer_source = "ONLY_UPDATE_LAYER_EXPERTS"
 
     target_layer = None
-    if only_optimize_layer is not None:
+    target_entire_layer = None
+    optimize_mode = None  # "moe_only", "entire_layer", or None
+    
+    # ONLY_UPDATE_ENTIRE_LAYER takes precedence
+    if only_update_entire_layer is not None:
+        try:
+            target_entire_layer = int(only_update_entire_layer)
+            target_layer = target_entire_layer  # For compatibility
+            optimize_mode = "entire_layer"
+        except ValueError as exc:
+            raise ValueError(
+                f"ONLY_UPDATE_ENTIRE_LAYER must be an int layer id, got {only_update_entire_layer!r}"
+            ) from exc
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            f"[DEBUG] ONLY_UPDATE_ENTIRE_LAYER={target_entire_layer}: "
+            "ALL parameters from this layer (attention + MoE + layernorm) will be added to optimizer.",
+        )
+    elif only_optimize_layer is not None:
         try:
             target_layer = int(only_optimize_layer)
+            optimize_mode = "moe_only"
         except ValueError as exc:
             raise ValueError(
                 f"{only_optimize_layer_source} must be an int layer id, got {only_optimize_layer!r}"
@@ -155,7 +178,7 @@ def _get_param_groups(
 
     # Check if we should also include router weights for the target layer
     include_router = os.environ.get("INCLUDE_TARGET_LAYER_ROUTER", "0") == "1"
-    if target_layer is not None and include_router:
+    if target_layer is not None and include_router and optimize_mode == "moe_only":
         log_single_rank(
             logger,
             logging.WARNING,
@@ -176,28 +199,38 @@ def _get_param_groups(
             if not param.requires_grad:
                 continue
             if target_layer is not None:
-                # Keep only target-layer experts (and optionally router) when debugging optimizer updates.
-                is_expert_param = ".mlp.experts." in name
-                is_router_param = ".mlp.gate." in name or ".mlp.router." in name
-                
-                # Skip if not an expert or router param (when router is enabled)
-                if not is_expert_param and not (include_router and is_router_param):
-                    continue
-                
-                match = layer_id_re.search(name)
-                if match is None:
-                    if not warned_missing_layer_id:
-                        log_single_rank(
-                            logger,
-                            logging.WARNING,
-                            f"[DEBUG] {only_optimize_layer_source} is set but "
-                            f"could not parse layer id from param name: {name}. "
-                            "Skipping unmatched parameters.",
-                        )
-                        warned_missing_layer_id = True
-                    continue
-                if int(match.group(1)) != target_layer:
-                    continue
+                if optimize_mode == "entire_layer":
+                    # Keep ALL parameters from the target layer (attention + MoE + layernorm)
+                    match = layer_id_re.search(name)
+                    if match is None:
+                        # Skip non-layer params (embedding, lm_head, etc.)
+                        continue
+                    if int(match.group(1)) != target_layer:
+                        continue
+                    # Include this parameter (it's from the target layer)
+                else:
+                    # MoE-only mode: Keep only target-layer experts (and optionally router)
+                    is_expert_param = ".mlp.experts." in name
+                    is_router_param = ".mlp.gate." in name or ".mlp.router." in name
+                    
+                    # Skip if not an expert or router param (when router is enabled)
+                    if not is_expert_param and not (include_router and is_router_param):
+                        continue
+                    
+                    match = layer_id_re.search(name)
+                    if match is None:
+                        if not warned_missing_layer_id:
+                            log_single_rank(
+                                logger,
+                                logging.WARNING,
+                                f"[DEBUG] {only_optimize_layer_source} is set but "
+                                f"could not parse layer id from param name: {name}. "
+                                "Skipping unmatched parameters.",
+                            )
+                            warned_missing_layer_id = True
+                        continue
+                    if int(match.group(1)) != target_layer:
+                        continue
 
             uses_default_config = False
             # Get optimizer config overrides for this parameter.

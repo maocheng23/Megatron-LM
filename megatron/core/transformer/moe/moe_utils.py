@@ -674,9 +674,25 @@ class FusedExpertsFunction(torch.autograd.Function):
         # - Only the specified layer's experts update
         # - Router doesn't update
         # - Upstream layers don't update (grad_hidden_states zeroed)
+        #
+        # ONLY_UPDATE_ENTIRE_LAYER=<layer_id>: Updates the ENTIRE layer (attention + MoE + layernorm)
+        # - For target layer: grad_hidden_states is NOT zeroed (so attention gets gradient)
+        # - For non-target layers: grad_hidden_states is zeroed
+        
+        only_update_entire_layer = os.environ.get("ONLY_UPDATE_ENTIRE_LAYER", None)
         only_update_layer = os.environ.get("ONLY_UPDATE_LAYER_EXPERTS", None)
-        if only_update_layer is not None:
+        
+        # Determine target layer and mode
+        target_layer = None
+        entire_layer_mode = False
+        if only_update_entire_layer is not None:
+            target_layer = int(only_update_entire_layer)
+            entire_layer_mode = True
+        elif only_update_layer is not None:
             target_layer = int(only_update_layer)
+            entire_layer_mode = False
+        
+        if target_layer is not None:
             if layer_id != target_layer:
                 # Zero out expert gradients for non-target layers
                 if grad_w1 is not None:
@@ -685,17 +701,27 @@ class FusedExpertsFunction(torch.autograd.Function):
                     grad_w2.zero_()
                 if os.environ.get("DEBUG_GRAD_ALLREDUCE", "0") == "1":
                     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                    mode_str = "ONLY_UPDATE_ENTIRE_LAYER" if entire_layer_mode else "ONLY_UPDATE_LAYER_EXPERTS"
                     print(f"[FusedExpertsFunction][Rank {rank}][Layer {layer_id}] "
-                          f"ZEROING expert gradients (ONLY_UPDATE_LAYER_EXPERTS={target_layer})")
+                          f"ZEROING expert gradients ({mode_str}={target_layer})")
 
-            # Also zero grad_hidden_states for ALL layers when isolating expert update
-            # This prevents upstream layers (attention, layernorm, embedding) from updating
-            if grad_hidden_states is not None:
+            # Decide whether to zero grad_hidden_states
+            # - MoE-only mode: zero for ALL layers (prevent upstream layers from updating)
+            # - Entire-layer mode: zero only for NON-target layers (target layer's attention needs gradient)
+            should_zero_hidden_grad = False
+            if entire_layer_mode:
+                # Only zero for non-target layers
+                should_zero_hidden_grad = (layer_id != target_layer)
+            else:
+                # MoE-only mode: zero for all layers
+                should_zero_hidden_grad = True
+            
+            if should_zero_hidden_grad and grad_hidden_states is not None:
                 grad_hidden_states.zero_()
                 if os.environ.get("DEBUG_GRAD_ALLREDUCE", "0") == "1":
                     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
                     print(f"[FusedExpertsFunction][Rank {rank}][Layer {layer_id}] "
-                          f"ZEROING grad_hidden_states (isolating expert update)")
+                          f"ZEROING grad_hidden_states (isolating layer update)")
 
         # Return gradients for all inputs (None for non-tensor inputs)
         return grad_hidden_states, grad_w1, grad_w2, grad_topk_weights, None, None, None, None
