@@ -116,9 +116,6 @@ class Router(ABC, MegatronModule):
         # However, we also need config.sequence_parallel=True for the all-reduce to happen.
         # If global SP is disabled, we need an alternative approach - see below.
         setattr(self.weight, 'sequence_parallel', self.config.sequence_parallel)
-        # Alternative: use average_gradients_across_tp_domain which doesn't depend on global config
-        # This triggers AVG all-reduce (slightly different from SUM but ensures synchronization)
-        setattr(self.weight, 'average_gradients_across_tp_domain', True)
         if self.bias is not None:
             self.bias.data = self.bias.data.to(dtype=self.config.params_dtype)
             setattr(self.bias, 'sequence_parallel', self.config.sequence_parallel)
