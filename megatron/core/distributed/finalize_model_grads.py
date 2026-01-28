@@ -387,6 +387,12 @@ def _allreduce_non_tensor_model_parallel_grads(
     import os
     use_deterministic = os.environ.get("MEGATRON_USE_DETERMINISTIC_ALLREDUCE", "0") == "1"
     
+    # DEBUG: Log once per step
+    if debug_router_grad:
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        if rank == 0:
+            print(f"[finalize_model_grads][DEBUG] use_deterministic={use_deterministic}", flush=True)
+    
     for params, grads, all_reduce_op in zip(
         [params_sum, params_avg],
         [grads_sum, grads_avg],
