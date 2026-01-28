@@ -593,6 +593,8 @@ class FusedExpertsFunction(torch.autograd.Function):
                               f"sum={grad_topk_weights.sum().item():.6e}, norm={grad_topk_weights.norm().item():.6e}")
                     
                     # CRITICAL DEBUG: Verify all ranks have identical grad_topk_weights after all-reduce
+                    # NOTE: Sums can be all zeros on some steps (e.g. pipeline fill/drain, or when
+                    # grad_output into this layer is zero); non-zero when gradient flows normally.
                     if os.environ.get("DEBUG_GRAD_SYNC", "0") == "1" and layer_id <= 1:
                         # All-gather the sum from all ranks to verify they're identical
                         local_sum = torch.tensor([grad_topk_weights.sum().item()], device=grad_topk_weights.device)
