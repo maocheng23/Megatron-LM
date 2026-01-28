@@ -665,6 +665,38 @@ class FusedExpertsFunction(torch.autograd.Function):
                     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
                     print(f"[FusedExpertsFunction][Rank {rank}] WARNING: ep_group is None, skipping grad_hidden_states all-reduce!")
         
+        # DEBUG: Only update experts for a specific layer
+        # Set ONLY_UPDATE_LAYER_EXPERTS=<layer_id> to only update that layer's experts
+        # This helps isolate expert weight sync issues by testing with a single layer
+        # For last layer: set to (num_layers - 1), e.g., ONLY_UPDATE_LAYER_EXPERTS=27 for 28 layers
+        #
+        # Combined with DISABLE_ROUTER_GRAD=1, this ensures:
+        # - Only the specified layer's experts update
+        # - Router doesn't update
+        # - Upstream layers don't update (grad_hidden_states zeroed)
+        only_update_layer = os.environ.get("ONLY_UPDATE_LAYER_EXPERTS", None)
+        if only_update_layer is not None:
+            target_layer = int(only_update_layer)
+            if layer_id != target_layer:
+                # Zero out expert gradients for non-target layers
+                if grad_w1 is not None:
+                    grad_w1.zero_()
+                if grad_w2 is not None:
+                    grad_w2.zero_()
+                if os.environ.get("DEBUG_GRAD_ALLREDUCE", "0") == "1":
+                    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                    print(f"[FusedExpertsFunction][Rank {rank}][Layer {layer_id}] "
+                          f"ZEROING expert gradients (ONLY_UPDATE_LAYER_EXPERTS={target_layer})")
+
+            # Also zero grad_hidden_states for ALL layers when isolating expert update
+            # This prevents upstream layers (attention, layernorm, embedding) from updating
+            if grad_hidden_states is not None:
+                grad_hidden_states.zero_()
+                if os.environ.get("DEBUG_GRAD_ALLREDUCE", "0") == "1":
+                    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                    print(f"[FusedExpertsFunction][Rank {rank}][Layer {layer_id}] "
+                          f"ZEROING grad_hidden_states (isolating expert update)")
+
         # Return gradients for all inputs (None for non-tensor inputs)
         return grad_hidden_states, grad_w1, grad_w2, grad_topk_weights, None, None, None, None
 
