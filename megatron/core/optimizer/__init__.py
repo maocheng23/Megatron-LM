@@ -239,7 +239,7 @@ def _get_param_groups(
                                 f"[DEBUG] SKIPPED (layer {layer_id_parsed} not in {sorted(target_layers_set)}): {name}")
                         continue
                     print(f"[DEBUG] INCLUDED in optimizer: {name}, layer={layer_id_parsed}")
-                    raise Exception("HAVE optimizer params!!!!")
+                    #raise Exception(f"HAVE optimizer params!!!!")
                     # Include this parameter (it's from one of the target layers)
                     if debug_optimizer_params and "layers.47" in name and "experts" in name:
                         log_single_rank(logger, logging.WARNING,
