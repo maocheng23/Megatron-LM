@@ -443,10 +443,28 @@ class FusedExpertsFunction(torch.autograd.Function):
         # - 0, 1, ..., num_local_experts-1 for tokens that selected this rank's experts
         # - -1 for tokens that selected other ranks' experts
         # So we match against LOCAL expert ID, not global!
+        
+        # DEBUG: Check topk_ids distribution in backward
+        if os.environ.get("DEBUG_EXPERT_GRAD", "0") == "1":
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            unique_ids, counts = topk_ids.unique(return_counts=True)
+            print(f"[FusedExpertsFunction.backward][Rank {rank}][Layer {layer_id}] topk_ids distribution:")
+            print(f"  unique_ids: {unique_ids.tolist()}, counts: {counts.tolist()}")
+            print(f"  num_local_experts: {num_local_experts}, topk_ids.shape: {topk_ids.shape}")
+            local_expert_count = (topk_ids >= 0).sum().item()
+            remote_expert_count = (topk_ids == -1).sum().item()
+            print(f"  local_expert_selections: {local_expert_count}, remote_expert_selections: {remote_expert_count}")
+        
         for local_expert_id in range(num_local_experts):
             # Match against LOCAL expert ID (topk_ids contains local IDs!)
             mask = (topk_ids == local_expert_id)
             if not mask.any():
+                # DEBUG: Log skipped experts
+                if os.environ.get("DEBUG_EXPERT_GRAD", "0") == "1":
+                    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                    if local_expert_id < 3:  # Only log first few to reduce noise
+                        print(f"[FusedExpertsFunction.backward][Rank {rank}][Layer {layer_id}] "
+                              f"Skipping local_expert_id={local_expert_id} (no tokens selected it)")
                 continue
             
             token_indices = mask.any(dim=1).nonzero(as_tuple=True)[0]
@@ -739,6 +757,20 @@ class FusedExpertsFunction(torch.autograd.Function):
                     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
                     print(f"[FusedExpertsFunction][Rank {rank}][Layer {layer_id}] "
                           f"ZEROING grad_hidden_states (isolating layer update)")
+
+        # DEBUG: Check final gradient values before returning
+        if os.environ.get("DEBUG_EXPERT_GRAD", "0") == "1":
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            grad_w1_norm = grad_w1.norm().item() if grad_w1 is not None else 0
+            grad_w2_norm = grad_w2.norm().item() if grad_w2 is not None else 0
+            grad_topk_norm = grad_topk_weights.norm().item() if grad_topk_weights is not None else 0
+            print(f"[FusedExpertsFunction.backward][Rank {rank}][Layer {layer_id}] FINAL gradients:")
+            print(f"  grad_w1_norm: {grad_w1_norm:.10e}, grad_w2_norm: {grad_w2_norm:.10e}")
+            print(f"  grad_topk_weights_norm: {grad_topk_norm:.10e}")
+            if grad_w1 is not None and grad_w1_norm > 0:
+                # Print per-expert gradient norms
+                for i in range(min(3, grad_w1.shape[0])):
+                    print(f"  grad_w1[{i}] norm: {grad_w1[i].norm().item():.10e}")
 
         # Return gradients for all inputs (None for non-tensor inputs)
         return grad_hidden_states, grad_w1, grad_w2, grad_topk_weights, None, None, None, None
