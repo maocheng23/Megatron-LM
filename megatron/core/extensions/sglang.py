@@ -423,6 +423,10 @@ class SGLangColumnParallelLinear(SGLangLinear):
 
     Equivalent to KitchenColumnParallelLinear.
     Splits output dimension across TP ranks.
+    
+    IMPORTANT: Column parallel linear requires all-reduce of grad_input in backward.
+    This is achieved by using copy_to_tensor_model_parallel_region before the matmul,
+    which has identity forward but all-reduce backward.
     """
 
     def __init__(
@@ -464,6 +468,22 @@ class SGLangColumnParallelLinear(SGLangLinear):
         )
 
         self.stride = stride
+
+    def forward(self, x: Tensor) -> Tuple[Tensor, Optional[Tensor]]:
+        """Forward pass with proper TP communication.
+        
+        Uses copy_to_tensor_model_parallel_region to ensure grad_input is
+        all-reduced in backward pass. This is critical for correct TP gradients.
+        """
+        from megatron.core.tensor_parallel.mappings import copy_to_tensor_model_parallel_region
+        
+        # CRITICAL: Apply copy_to_tensor_model_parallel_region before matmul
+        # This ensures grad_input is all-reduced in backward
+        if self.tp_size > 1 and self.tp_group is not None:
+            x = copy_to_tensor_model_parallel_region(x, group=self.tp_group)
+        
+        # Call parent's forward for the actual matmul
+        return super().forward(x)
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 0, bias sharded."""
@@ -815,7 +835,11 @@ class SGLangGroupedLinear(MegatronModule):
 
 
 class SGLangColumnParallelGroupedLinear(SGLangGroupedLinear):
-    """Column-parallel grouped linear for MoE."""
+    """Column-parallel grouped linear for MoE.
+    
+    IMPORTANT: Column parallel grouped linear requires all-reduce of grad_input 
+    in backward. This is achieved by using copy_to_tensor_model_parallel_region.
+    """
 
     def __init__(
         self,
@@ -846,6 +870,23 @@ class SGLangColumnParallelGroupedLinear(SGLangGroupedLinear):
             layer_number=layer_number,
             tp_group=tp_group,
         )
+
+    def forward(self, x: Tensor, m_splits: List[int]) -> Tuple[Tensor, Optional[Tensor]]:
+        """Forward pass with proper TP communication for MoE.
+        
+        Uses copy_to_tensor_model_parallel_region to ensure grad_input is
+        all-reduced in backward pass when using TP for experts.
+        """
+        from megatron.core.tensor_parallel.mappings import copy_to_tensor_model_parallel_region
+        
+        # CRITICAL: Apply copy_to_tensor_model_parallel_region before matmul
+        # This ensures grad_input is all-reduced in backward
+        # Only needed when using TP for experts (explicit_expert_comm=True)
+        if self.tp_size > 1 and self.tp_group is not None and self.explicit_expert_comm:
+            x = copy_to_tensor_model_parallel_region(x, group=self.tp_group)
+        
+        # Call parent's forward for the actual grouped matmul
+        return super().forward(x, m_splits)
 
 
 class SGLangRowParallelGroupedLinear(SGLangGroupedLinear):
