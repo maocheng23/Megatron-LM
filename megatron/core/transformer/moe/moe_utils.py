@@ -666,7 +666,7 @@ class FusedExpertsFunction(torch.autograd.Function):
                               f"sum={grad_hidden_states.sum().item():.6e}, norm={grad_hidden_states.norm().item():.6e}")
                     
                     # CRITICAL DEBUG: Verify all ranks have identical grad_hidden_states after all-reduce
-                    if os.environ.get("DEBUG_GRAD_SYNC", "0") == "1" and layer_id <= 1:
+                    if os.environ.get("DEBUG_GRAD_SYNC", "0") == "1" and layer_id in [46, 47]:
                         local_sum = torch.tensor([grad_hidden_states.sum().item()], device=grad_hidden_states.device)
                         all_sums = [torch.zeros_like(local_sum) for _ in range(ep_world_size)]
                         torch.distributed.all_gather(all_sums, local_sum, group=ep_group)
@@ -764,9 +764,11 @@ class FusedExpertsFunction(torch.autograd.Function):
             grad_w1_norm = grad_w1.norm().item() if grad_w1 is not None else 0
             grad_w2_norm = grad_w2.norm().item() if grad_w2 is not None else 0
             grad_topk_norm = grad_topk_weights.norm().item() if grad_topk_weights is not None else 0
+            grad_hidden_norm = grad_hidden_states.norm().item() if grad_hidden_states is not None else 0
             print(f"[FusedExpertsFunction.backward][Rank {rank}][Layer {layer_id}] FINAL gradients:")
             print(f"  grad_w1_norm: {grad_w1_norm:.10e}, grad_w2_norm: {grad_w2_norm:.10e}")
             print(f"  grad_topk_weights_norm: {grad_topk_norm:.10e}")
+            print(f"  grad_hidden_states_norm: {grad_hidden_norm:.10e} (this will flow to layer {layer_id-1})")
             if grad_w1 is not None and grad_w1_norm > 0:
                 # Print per-expert gradient norms
                 for i in range(min(3, grad_w1.shape[0])):
