@@ -318,6 +318,24 @@ def _get_param_groups(
                 params_key.append(key)
     # Need to pick one of the param_override_tuples to use for the param group.
     param_groups = []
+    
+    # DEBUG: Print params_map summary
+    if debug_optimizer_params:
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        print(f"[DEBUG_OPTIMIZER][rank {rank}] params_map summary:")
+        for key, params_list in params_map.items():
+            param_override_tuple, is_expert_parallel = key
+            layer47_params = [n for n in [getattr(p, '_param_name', 'unknown') for p in params_list] if 'layers.47' in str(n)]
+            expert_params = [p for p in params_list if hasattr(p, 'allreduce')]
+            print(f"rank={rank}  key=(override={param_override_tuple is not None}, is_expert_parallel={is_expert_parallel}): "
+                  f"total={len(params_list)}, layer47_count={len(layer47_params)}, "
+                  f"expert_params_with_allreduce_attr={len(expert_params)}")
+            # Print first few layer 47 expert params
+            for p in params_list[:3]:
+                for name, param in model_chunks[0].named_parameters():
+                    if param is p and 'layers.47' in name and 'experts' in name:
+                        print(f"    - {name}: allreduce={getattr(p, 'allreduce', 'N/A')}, shape={list(p.shape)}")
+    
     # Sort keys, None first.
     for key in sorted(params_key, key=lambda x: (x[0] is not None, x[0])):
         param_override_tuple, is_expert_parallel = key
@@ -775,6 +793,22 @@ def get_megatron_optimizer(
         filter_fn=lambda g: g['is_expert_parallel'],
         buffer_name='expert_parallel_buffers',
     )
+    
+    # DEBUG: Print moe_param_groups info
+    debug_optimizer_params = os.environ.get("DEBUG_OPTIMIZER_PARAMS", "0") == "1"
+    if debug_optimizer_params:
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        total_moe_params = sum(len(g['params']) for g in moe_param_groups)
+        print(f"[DEBUG_OPTIMIZER][rank {rank}] moe_param_groups: {len(moe_param_groups)} groups, {total_moe_params} total params")
+        for i, g in enumerate(moe_param_groups):
+            print(f"  Group {i}: {len(g['params'])} params, is_expert_parallel={g.get('is_expert_parallel')}")
+            # Print layer 47 expert params in this group
+            for p in g['params']:
+                for name, param in model_chunks[0].named_parameters():
+                    if param is p and 'layers.47' in name and 'experts' in name:
+                        print(f"    [MoE] {name}: requires_grad={p.requires_grad}, shape={list(p.shape)}")
+                        break
+    
     if dump_param_to_param_group_map is not None:
         for param_group in moe_param_groups:
             for param in param_group["params"]:
