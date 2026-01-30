@@ -330,27 +330,64 @@ class MoELayer(BaseMoELayer):
         w1_list = []
         w2_list = []
         num_experts = self.num_local_experts
+        
+        # Debug: track which path was used
+        w1_path = None
+        w2_path = None
 
         for i in range(num_experts):
             # Try different ways to access weights depending on implementation
-            if hasattr(self.experts.linear_fc1, f'weight{i}'):
-                w1_list.append(getattr(self.experts.linear_fc1, f'weight{i}'))
-            elif hasattr(self.experts.linear_fc1, 'weights'):
-                w1_list.append(self.experts.linear_fc1.weights[i])
-            elif hasattr(self.experts.linear_fc1, 'weight'):
-                # Single weight tensor for all experts
-                w1_list.append(self.experts.linear_fc1.weight[i])
+            if hasattr(self.experts, 'linear_fc1'):
+                if hasattr(self.experts.linear_fc1, f'weight{i}'):
+                    w1_list.append(getattr(self.experts.linear_fc1, f'weight{i}'))
+                    w1_path = f'linear_fc1.weight{i}'
+                elif hasattr(self.experts.linear_fc1, 'weights'):
+                    w1_list.append(self.experts.linear_fc1.weights[i])
+                    w1_path = 'linear_fc1.weights[i]'
+                elif hasattr(self.experts.linear_fc1, 'weight'):
+                    # Single weight tensor for all experts
+                    w1_list.append(self.experts.linear_fc1.weight[i])
+                    w1_path = 'linear_fc1.weight[i]'
+            elif hasattr(self.experts, 'weight1'):
+                # GroupedMLP uses weight1/weight2 directly
+                # weight1: [hidden_size, ffn_hidden_size * num_experts] -> reshape to [num_experts, ffn_hidden_size, hidden_size]
+                w1_reshaped = self.experts.weight1.view(self.num_local_experts, self.config.hidden_size, -1)
+                w1_list.append(w1_reshaped[i])
+                w1_path = 'weight1 (GroupedMLP)'
 
-            if hasattr(self.experts.linear_fc2, f'weight{i}'):
-                w2_list.append(getattr(self.experts.linear_fc2, f'weight{i}'))
-            elif hasattr(self.experts.linear_fc2, 'weights'):
-                w2_list.append(self.experts.linear_fc2.weights[i])
-            elif hasattr(self.experts.linear_fc2, 'weight'):
-                w2_list.append(self.experts.linear_fc2.weight[i])
+            if hasattr(self.experts, 'linear_fc2'):
+                if hasattr(self.experts.linear_fc2, f'weight{i}'):
+                    w2_list.append(getattr(self.experts.linear_fc2, f'weight{i}'))
+                    w2_path = f'linear_fc2.weight{i}'
+                elif hasattr(self.experts.linear_fc2, 'weights'):
+                    w2_list.append(self.experts.linear_fc2.weights[i])
+                    w2_path = 'linear_fc2.weights[i]'
+                elif hasattr(self.experts.linear_fc2, 'weight'):
+                    w2_list.append(self.experts.linear_fc2.weight[i])
+                    w2_path = 'linear_fc2.weight[i]'
+            elif hasattr(self.experts, 'weight2'):
+                # GroupedMLP uses weight1/weight2 directly
+                w2_reshaped = self.experts.weight2.view(self.num_local_experts, -1, self.config.hidden_size)
+                w2_list.append(w2_reshaped[i])
+                w2_path = 'weight2 (GroupedMLP)'
 
         # Stack into [num_experts, out_features, in_features]
         w1 = torch.stack(w1_list, dim=0)
         w2 = torch.stack(w2_list, dim=0)
+        
+        # Debug: verify gradient connectivity
+        if os.environ.get("DEBUG_EXPERT_WEIGHTS", "0") == "1" and self.layer_number in [1, 48]:
+            import torch.distributed as dist
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            if rank == 0:
+                print(f"[_get_expert_weights_for_sglang][Layer {self.layer_number}]")
+                print(f"  w1_path: {w1_path}")
+                print(f"  w2_path: {w2_path}")
+                print(f"  w1.shape: {w1.shape}, w1.requires_grad: {w1.requires_grad}, w1.grad_fn: {w1.grad_fn}")
+                print(f"  w2.shape: {w2.shape}, w2.requires_grad: {w2.requires_grad}, w2.grad_fn: {w2.grad_fn}")
+                if w1_list:
+                    print(f"  w1_list[0].requires_grad: {w1_list[0].requires_grad}, w1_list[0].grad_fn: {w1_list[0].grad_fn}")
+                    print(f"  w1_list[0].is_leaf: {w1_list[0].is_leaf}")
 
         return w1, w2
 
