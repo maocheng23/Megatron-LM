@@ -523,10 +523,18 @@ class FusedExpertsFunction(torch.autograd.Function):
                 if rank == 0:
                     print(f"\n[DEBUG_GRAD_COMPARE][Layer {layer_id}][Expert {local_expert_id}] ===== GRADIENT INPUTS =====")
                     print(f"  num_tokens_for_expert: {len(token_indices)}")
+                    print(f"  topk (num slots): {topk}")
+                    print(f"  topk_weights.shape: {topk_weights.shape}, dtype: {topk_weights.dtype}")
+                    print(f"  topk_weights[token_indices].shape: {topk_weights[token_indices].shape}")
+                    # Show sample routing weights for first 3 selected tokens
+                    sample_weights = topk_weights[token_indices][:min(3, len(token_indices))]
+                    print(f"  topk_weights sample (first 3 tokens): {sample_weights.tolist()}")
+                    print(f"  topk_weights per-token sum (first 3): {sample_weights.sum(dim=-1).tolist()}")
+                    print(f"  topk_weights (all selected) mean: {topk_weights[token_indices].float().mean().item():.6f}")
+                    print(f"  topk_weights (all selected) sum: {topk_weights[token_indices].float().sum().item():.6f}")
+                    print(f"  grad_output.shape: {grad_output.shape}")
                     print(f"  grad_output norm (all): {grad_output.float().norm().item():.6e}")
                     print(f"  grad_output norm (selected): {grad_output[token_indices].float().norm().item():.6e}")
-                    print(f"  topk_weights (selected) mean: {topk_weights[token_indices].float().mean().item():.6f}")
-                    print(f"  topk_weights (selected) sum: {topk_weights[token_indices].float().sum().item():.6f}")
                     print(f"  expert_grad_output norm: {expert_grad_output.float().norm().item():.6e}")
                     print(f"  intermediate norm: {intermediate.float().norm().item():.6e}")
                     print(f"  expert_input norm: {expert_input.float().norm().item():.6e}")
