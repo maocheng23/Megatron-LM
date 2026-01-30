@@ -388,6 +388,21 @@ class MoELayer(BaseMoELayer):
                 if w1_list:
                     print(f"  w1_list[0].requires_grad: {w1_list[0].requires_grad}, w1_list[0].grad_fn: {w1_list[0].grad_fn}")
                     print(f"  w1_list[0].is_leaf: {w1_list[0].is_leaf}")
+                # Check the original parameters
+                if hasattr(self.experts, 'weight1'):
+                    orig_w1 = self.experts.weight1
+                    print(f"  ORIGINAL weight1: requires_grad={orig_w1.requires_grad}, is_leaf={orig_w1.is_leaf}, "
+                          f"shape={orig_w1.shape}, dtype={orig_w1.dtype}")
+                if hasattr(self.experts, 'weight2'):
+                    orig_w2 = self.experts.weight2
+                    print(f"  ORIGINAL weight2: requires_grad={orig_w2.requires_grad}, is_leaf={orig_w2.is_leaf}, "
+                          f"shape={orig_w2.shape}, dtype={orig_w2.dtype}")
+                if hasattr(self.experts, 'linear_fc1'):
+                    fc1 = self.experts.linear_fc1
+                    if hasattr(fc1, 'weight0'):
+                        print(f"  ORIGINAL linear_fc1.weight0: requires_grad={fc1.weight0.requires_grad}, is_leaf={fc1.weight0.is_leaf}")
+                    if hasattr(fc1, 'weight'):
+                        print(f"  ORIGINAL linear_fc1.weight: requires_grad={fc1.weight.requires_grad}, shape={fc1.weight.shape}")
 
         return w1, w2
 
@@ -475,6 +490,13 @@ class MoELayer(BaseMoELayer):
             rank = dist.get_rank() if dist.is_initialized() else 0
             layer_num = self.layer_number
             
+            if rank == 0:
+                print(f"[DEBUG_GRAD_PROPAGATION][Rank {rank}][Layer {layer_num}] torch.is_grad_enabled()={torch.is_grad_enabled()}")
+                print(f"[DEBUG_GRAD_PROPAGATION][Rank {rank}][Layer {layer_num}] "
+                      f"w1.requires_grad={w1.requires_grad}, w1.is_leaf={w1.is_leaf}, w1.grad_fn={w1.grad_fn}")
+                print(f"[DEBUG_GRAD_PROPAGATION][Rank {rank}][Layer {layer_num}] "
+                      f"w2.requires_grad={w2.requires_grad}, w2.is_leaf={w2.is_leaf}, w2.grad_fn={w2.grad_fn}")
+            
             def make_hook(name, layer):
                 def hook(grad):
                     if rank == 0:
@@ -483,8 +505,17 @@ class MoELayer(BaseMoELayer):
                     return grad
                 return hook
             
-            w1.register_hook(make_hook("w1 (from torch.stack)", layer_num))
-            w2.register_hook(make_hook("w2 (from torch.stack)", layer_num))
+            if w1.requires_grad:
+                w1.register_hook(make_hook("w1 (from torch.stack)", layer_num))
+            else:
+                if rank == 0:
+                    print(f"[WARNING][Layer {layer_num}] w1 does NOT require grad - gradient will NOT flow back!")
+            
+            if w2.requires_grad:
+                w2.register_hook(make_hook("w2 (from torch.stack)", layer_num))
+            else:
+                if rank == 0:
+                    print(f"[WARNING][Layer {layer_num}] w2 does NOT require grad - gradient will NOT flow back!")
         
         # Call SGLang's fused experts with EP parameters
         output = sglang_fused_experts(
