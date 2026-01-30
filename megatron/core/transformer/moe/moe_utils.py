@@ -974,21 +974,24 @@ class FusedExpertsTritonBackward(torch.autograd.Function):
         """
         Forward pass using fused_experts_impl - exactly same as SGLang inference.
         """
-        # Use fused_experts_impl for forward - 100% identical to SGLang
-        # This ensures true on-policy: training forward = inference forward
-        output = fused_experts_impl(
-            hidden_states=hidden_states.contiguous(),
-            w1=w1.contiguous(),
-            w2=w2.contiguous(),
-            topk_weights=topk_weights.contiguous(),
-            topk_ids=topk_ids.contiguous(),
-            inplace=False,
-            activation=activation,
-            is_gated=True,
-            apply_router_weight_on_input=False,
-            filter_expert=True,
-            layer_id=layer_id,
-        )
+        # CRITICAL: Use torch.no_grad() to prevent PyTorch from building autograd graph
+        # We have our own backward implementation
+        with torch.no_grad():
+            # Use fused_experts_impl for forward - 100% identical to SGLang
+            # This ensures true on-policy: training forward = inference forward
+            output = fused_experts_impl(
+                hidden_states=hidden_states.contiguous(),
+                w1=w1.contiguous(),
+                w2=w2.contiguous(),
+                topk_weights=topk_weights.contiguous(),
+                topk_ids=topk_ids.contiguous(),
+                inplace=False,
+                activation=activation,
+                is_gated=True,
+                apply_router_weight_on_input=False,
+                filter_expert=True,
+                layer_id=layer_id,
+            )
         
         # Save tensors for backward
         ctx.save_for_backward(hidden_states, w1, w2, topk_weights, topk_ids)
@@ -1017,7 +1020,8 @@ class FusedExpertsTritonBackward(torch.autograd.Function):
         
         debug = os.environ.get("DEBUG_TRITON_BACKWARD", "0") == "1"
         
-        # Config for Triton kernels (same as fused_experts_impl uses)
+        # Use deterministic config (same as GateUpProjFunction/DownProjFunction use)
+        # This ensures consistency with the forward pass
         config = {
             "BLOCK_SIZE_M": 64,
             "BLOCK_SIZE_N": 64,
@@ -1025,6 +1029,13 @@ class FusedExpertsTritonBackward(torch.autograd.Function):
             "GROUP_SIZE_M": 8,
         }
         compute_type = tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
+        
+        if debug and layer_id in [0, 47]:
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            print(f"[FusedExpertsTritonBackward.backward][Rank {rank}][Layer {layer_id}] ENTERING")
+            print(f"  grad_output.shape={grad_output.shape}, grad_output.norm={grad_output.norm().item():.6f}")
+            print(f"  hidden_states.shape={hidden_states.shape}, w1.shape={w1.shape}, w2.shape={w2.shape}")
+            print(f"  topk_weights.shape={topk_weights.shape}, topk_ids.shape={topk_ids.shape}")
         
         # Initialize gradient tensors
         grad_hidden_states = torch.zeros_like(hidden_states)
@@ -1090,6 +1101,12 @@ class FusedExpertsTritonBackward(torch.autograd.Function):
             )
             silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
             
+            if debug and layer_id in [0, 47] and chunk == 0:
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                print(f"[FusedExpertsTritonBackward][Rank {rank}][Layer {layer_id}] Recomputed intermediates:")
+                print(f"  intermediate_cache1.shape={intermediate_cache1.shape}, norm={intermediate_cache1.norm().item():.6f}")
+                print(f"  intermediate_cache2.shape={intermediate_cache2.shape}, norm={intermediate_cache2.norm().item():.6f}")
+            
             # ============ Backward pass ============
             # Step 3: Backward through DownProj (w2)
             # grad_output shape: [curr_tokens, hidden_size]
@@ -1097,6 +1114,12 @@ class FusedExpertsTritonBackward(torch.autograd.Function):
             grad_intermediate_cache3 = curr_grad_output.unsqueeze(1).expand(
                 curr_tokens, topk, hidden_size
             ).contiguous()
+            
+            if debug and layer_id in [0, 47] and chunk == 0:
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                print(f"[FusedExpertsTritonBackward][Rank {rank}][Layer {layer_id}] DownProj backward input:")
+                print(f"  grad_intermediate_cache3.shape={grad_intermediate_cache3.shape}, norm={grad_intermediate_cache3.norm().item():.6f}")
+                print(f"  curr_topk_weights.shape={curr_topk_weights.shape}, curr_topk_weights[0]={curr_topk_weights[0].tolist()}")
             
             # Get new sorted indices for down projection (with topk=1 per slot)
             sorted_token_ids_down, expert_ids_down, num_tokens_post_padded_down = moe_align_block_size(
@@ -1129,6 +1152,61 @@ class FusedExpertsTritonBackward(torch.autograd.Function):
             grad_w2 += curr_grad_w2
             grad_topk_weights[begin_idx:end_idx] = curr_grad_topk_weights
             
+            if debug and layer_id in [0, 47] and chunk == 0:
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                print(f"[FusedExpertsTritonBackward][Rank {rank}][Layer {layer_id}] After DownProj backward:")
+                print(f"  grad_intermediate_cache2.norm={grad_intermediate_cache2.norm().item():.6f}")
+                print(f"  curr_grad_w2.norm={curr_grad_w2.norm().item():.6f}")
+                print(f"  curr_grad_topk_weights.norm={curr_grad_topk_weights.norm().item():.6f}")
+            
+            # DEBUG: Compare with PyTorch reference (same logic as FusedExpertsFunction.backward)
+            if os.environ.get("DEBUG_COMPARE_PYTORCH", "0") == "1" and layer_id in [0, 47] and chunk == 0:
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                # PyTorch reference for DownProj backward
+                # Using SAME logic as FusedExpertsFunction.backward (off-policy)
+                # Forward: output[i] = intermediate[i] @ w2.T * topk_weights[i]
+                # For each (token, slot) pair indexed by flat_idx = token * topk + slot:
+                #   grad_intermediate[flat_idx] = grad_output[token] * topk_weights[token, slot] @ w2
+                
+                pytorch_grad_intermediate = torch.zeros_like(intermediate_cache2)
+                pytorch_grad_w2 = torch.zeros_like(w2)
+                
+                for e in range(E):
+                    # Find (token, slot) pairs that selected expert e
+                    expert_mask_2d = (curr_topk_ids == e)  # [curr_tokens, topk]
+                    if not expert_mask_2d.any():
+                        continue
+                    
+                    expert_w2 = w2[e]  # [hidden_size, intermediate_size]
+                    
+                    for slot in range(topk):
+                        slot_mask = expert_mask_2d[:, slot]  # [curr_tokens]
+                        if slot_mask.any():
+                            token_indices = slot_mask.nonzero(as_tuple=True)[0]
+                            flat_indices = token_indices * topk + slot
+                            
+                            # grad_output for these tokens (broadcast from [curr_tokens, hidden_size])
+                            slot_grad_out = curr_grad_output[token_indices]  # [num, hidden_size]
+                            slot_weights = curr_topk_weights[token_indices, slot:slot+1]  # [num, 1]
+                            weighted_grad_out = slot_grad_out * slot_weights  # [num, hidden_size]
+                            
+                            # grad_intermediate = weighted_grad_out @ w2
+                            slot_grad_intermediate = weighted_grad_out @ expert_w2  # [num, intermediate_size]
+                            pytorch_grad_intermediate[flat_indices] = slot_grad_intermediate
+                            
+                            # grad_w2 = weighted_grad_out.T @ intermediate
+                            slot_intermediate = intermediate_cache2[flat_indices]  # [num, intermediate_size]
+                            pytorch_grad_w2[e] += weighted_grad_out.T @ slot_intermediate
+                
+                print(f"[DEBUG_COMPARE_PYTORCH][Rank {rank}][Layer {layer_id}] DownProj backward:")
+                print(f"  Triton grad_intermediate_cache2.norm={grad_intermediate_cache2.norm().item():.6f}")
+                print(f"  PyTorch grad_intermediate.norm={pytorch_grad_intermediate.norm().item():.6f}")
+                print(f"  Diff norm={(grad_intermediate_cache2 - pytorch_grad_intermediate).norm().item():.6f}")
+                print(f"  Relative diff={(grad_intermediate_cache2 - pytorch_grad_intermediate).norm().item() / max(pytorch_grad_intermediate.norm().item(), 1e-8):.6f}")
+                print(f"  Triton grad_w2.norm={curr_grad_w2.norm().item():.6f}")
+                print(f"  PyTorch grad_w2.norm={pytorch_grad_w2.norm().item():.6f}")
+                print(f"  Diff norm={(curr_grad_w2 - pytorch_grad_w2).norm().item():.6f}")
+            
             # Step 4: Backward through SiluAndMul
             # silu_and_mul: silu(gate) * up
             x1, x2 = intermediate_cache1.view(-1, N).chunk(2, dim=-1)
@@ -1138,6 +1216,11 @@ class FusedExpertsTritonBackward(torch.autograd.Function):
             grad_x1 = grad_intermediate_cache2 * x2 * dsilu_dx1
             grad_x2 = grad_intermediate_cache2 * silu_x1
             grad_intermediate_cache1 = torch.cat([grad_x1, grad_x2], dim=-1)
+            
+            if debug and layer_id in [0, 47] and chunk == 0:
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                print(f"[FusedExpertsTritonBackward][Rank {rank}][Layer {layer_id}] After SiluAndMul backward:")
+                print(f"  grad_intermediate_cache1.norm={grad_intermediate_cache1.norm().item():.6f}")
             
             # Step 5: Backward through GateUpProj (w1)
             curr_grad_hidden = torch.zeros_like(curr_hidden)
@@ -1160,6 +1243,63 @@ class FusedExpertsTritonBackward(torch.autograd.Function):
                 config=config,
                 compute_type=compute_type,
             )
+            
+            if debug and layer_id in [0, 47] and chunk == 0:
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                print(f"[FusedExpertsTritonBackward][Rank {rank}][Layer {layer_id}] After GateUpProj backward:")
+                print(f"  curr_grad_hidden.norm={curr_grad_hidden.norm().item():.6f}")
+                print(f"  curr_grad_w1.norm={curr_grad_w1.norm().item():.6f}")
+            
+            # DEBUG: Compare with PyTorch reference for GateUpProj (same logic as FusedExpertsFunction.backward)
+            if os.environ.get("DEBUG_COMPARE_PYTORCH", "0") == "1" and layer_id in [0, 47] and chunk == 0:
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                # PyTorch reference for GateUpProj backward
+                # Using SAME logic as FusedExpertsFunction.backward (off-policy)
+                # Forward: gate_up = hidden @ w1.T (per expert)
+                # Backward: grad_hidden += grad_gate_up @ w1 (accumulate over ALL slots that selected this expert)
+                #           grad_w1[e] += grad_gate_up[e].T @ hidden[e]
+                
+                pytorch_grad_hidden = torch.zeros_like(curr_hidden)
+                pytorch_grad_w1 = torch.zeros_like(w1)
+                
+                for e in range(E):
+                    expert_mask_2d = (curr_topk_ids == e)  # [curr_tokens, topk]
+                    token_has_expert = expert_mask_2d.any(dim=1)  # [curr_tokens]
+                    if not token_has_expert.any():
+                        continue
+                    
+                    token_indices = token_has_expert.nonzero(as_tuple=True)[0]
+                    expert_hidden = curr_hidden[token_indices]  # [num_tokens_for_expert, hidden_size]
+                    expert_w1 = w1[e]  # [ffn_hidden_size, hidden_size]
+                    
+                    # Accumulate grad_hidden for each token over all slots that selected this expert
+                    for slot in range(topk):
+                        slot_mask = expert_mask_2d[token_indices, slot]
+                        if slot_mask.any():
+                            slot_indices = slot_mask.nonzero(as_tuple=True)[0]
+                            original_token_indices = token_indices[slot_indices]
+                            
+                            # grad_gate_up for these (token, slot) pairs
+                            flat_idx = original_token_indices * topk + slot
+                            slot_grad_gate_up = grad_intermediate_cache1[flat_idx]  # [num, ffn_hidden_size]
+                            
+                            # grad_hidden[token] += grad_gate_up @ w1
+                            slot_grad_hidden = slot_grad_gate_up @ expert_w1  # [num, hidden_size]
+                            pytorch_grad_hidden[original_token_indices] += slot_grad_hidden
+                            
+                            # grad_w1[e] += grad_gate_up.T @ hidden
+                            slot_hidden = expert_hidden[slot_indices]  # [num, hidden_size]
+                            pytorch_grad_w1[e] += slot_grad_gate_up.T @ slot_hidden
+                
+                print(f"[DEBUG_COMPARE_PYTORCH][Rank {rank}][Layer {layer_id}] GateUpProj backward:")
+                print(f"  Triton grad_hidden.norm={curr_grad_hidden.norm().item():.6f}")
+                print(f"  PyTorch grad_hidden.norm={pytorch_grad_hidden.norm().item():.6f}")
+                print(f"  Diff norm={(curr_grad_hidden - pytorch_grad_hidden).norm().item():.6f}")
+                print(f"  Relative diff={(curr_grad_hidden - pytorch_grad_hidden).norm().item() / max(pytorch_grad_hidden.norm().item(), 1e-8):.6f}")
+                print(f"  Triton grad_w1.norm={curr_grad_w1.norm().item():.6f}")
+                print(f"  PyTorch grad_w1.norm={pytorch_grad_w1.norm().item():.6f}")
+                print(f"  Diff norm={(curr_grad_w1 - pytorch_grad_w1).norm().item():.6f}")
+                print(f"  Relative diff={(curr_grad_w1 - pytorch_grad_w1).norm().item() / max(pytorch_grad_w1.norm().item(), 1e-8):.6f}")
             
             grad_hidden_states[begin_idx:end_idx] = curr_grad_hidden
             grad_w1 += curr_grad_w1
