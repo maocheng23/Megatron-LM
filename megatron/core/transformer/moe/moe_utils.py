@@ -902,15 +902,13 @@ def _pytorch_fused_experts_forward(
                 output[slot_token_indices] += weighted_output.to(output.dtype)
     
     # All-reduce output across EP ranks
+    # IMPORTANT: Use autograd-aware all-reduce so gradients flow correctly
     if ep_group is not None:
         ep_world_size = dist.get_world_size(ep_group)
         if ep_world_size > 1:
-            if os.environ.get("MEGATRON_USE_DETERMINISTIC_ALLREDUCE", "0") == "1":
-                from megatron.core.tensor_parallel.mappings import _tree_all_reduce_sum_impl
-                output_reduced = _tree_all_reduce_sum_impl(output, ep_group)
-                output = output_reduced
-            else:
-                dist.all_reduce(output, group=ep_group)
+            # Use the autograd-aware _tree_all_reduce_sum for proper backward support
+            from megatron.core.tensor_parallel.mappings import _tree_all_reduce_sum
+            output = _tree_all_reduce_sum(output, ep_group, layer_id=layer_number)
     
     # Debug logging
     if os.environ.get("DEBUG_PYTORCH_MOE_FORWARD", "0") == "1" and layer_number in [0, 47]:
