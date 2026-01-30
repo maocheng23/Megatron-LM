@@ -506,7 +506,7 @@ class FusedExpertsFunction(torch.autograd.Function):
                 expert_outputs_cache[local_expert_id] = (token_indices, expert_output)
             
             # Compute weighted grad_output for this expert
-            expert_grad_output = torch.zeros(len(token_indices), hidden_size, 
+            expert_grad_output = torch.zeros(len(token_indices), hidden_size,
                                             dtype=grad_output.dtype, device=grad_output.device)
             for slot in range(topk):
                 slot_mask = mask[token_indices, slot]
@@ -516,6 +516,23 @@ class FusedExpertsFunction(torch.autograd.Function):
                     # Map back to expert_grad_output indices
                     local_indices = slot_mask.nonzero(as_tuple=True)[0]
                     expert_grad_output[local_indices] += grad_output[slot_token_indices] * slot_weights
+
+            # DEBUG: Compare gradient computation inputs between on-policy and off-policy
+            if os.environ.get("DEBUG_GRAD_COMPARE", "0") == "1" and layer_id >= 46 and local_expert_id == 0:
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                if rank == 0:
+                    print(f"\n[DEBUG_GRAD_COMPARE][Layer {layer_id}][Expert {local_expert_id}] ===== GRADIENT INPUTS =====")
+                    print(f"  num_tokens_for_expert: {len(token_indices)}")
+                    print(f"  grad_output norm (all): {grad_output.float().norm().item():.6e}")
+                    print(f"  grad_output norm (selected): {grad_output[token_indices].float().norm().item():.6e}")
+                    print(f"  topk_weights (selected) mean: {topk_weights[token_indices].float().mean().item():.6f}")
+                    print(f"  topk_weights (selected) sum: {topk_weights[token_indices].float().sum().item():.6f}")
+                    print(f"  expert_grad_output norm: {expert_grad_output.float().norm().item():.6e}")
+                    print(f"  intermediate norm: {intermediate.float().norm().item():.6e}")
+                    print(f"  expert_input norm: {expert_input.float().norm().item():.6e}")
+                    # The actual gradient contribution
+                    grad_w2_contrib = expert_grad_output.T @ intermediate
+                    print(f"  grad_w2 contribution norm: {grad_w2_contrib.float().norm().item():.6e}")
             
             # Backward through down projection: expert_output = linear(intermediate, expert_w2)
             # linear computes: intermediate @ expert_w2.T
