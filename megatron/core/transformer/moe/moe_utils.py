@@ -1036,12 +1036,20 @@ class FusedExpertsTritonBackward(torch.autograd.Function):
             print(f"  grad_output.shape={grad_output.shape}, grad_output.norm={grad_output.norm().item():.6f}")
             print(f"  hidden_states.shape={hidden_states.shape}, w1.shape={w1.shape}, w2.shape={w2.shape}")
             print(f"  topk_weights.shape={topk_weights.shape}, topk_ids.shape={topk_ids.shape}")
+            # DEBUG: Check weight norms per rank (to understand TP slicing)
+            print(f"  w1.norm={w1.norm().item():.6f}, w2.norm={w2.norm().item():.6f}")
             # DEBUG: Check topk_weights statistics
-            print(f"  topk_weights stats: mean={topk_weights.float().mean().item():.6f}, "
-                  f"sum={topk_weights.float().sum().item():.6f}, "
-                  f"max={topk_weights.float().max().item():.6f}, "
-                  f"min={topk_weights.float().min().item():.6f}")
+            tw_float = topk_weights.float()
+            print(f"  topk_weights stats: mean={tw_float.mean().item():.6f}, "
+                  f"sum={tw_float.sum().item():.6f}, "
+                  f"max={tw_float.max().item():.6f}, "
+                  f"min={tw_float.min().item():.6f}, "
+                  f"numel={tw_float.numel()}")
             print(f"  topk_weights[0]={topk_weights[0].tolist()}")
+            # Check per-token sum (should be ~1.0 for each token)
+            per_token_sum = tw_float.sum(dim=1)
+            print(f"  per_token_sum: mean={per_token_sum.mean().item():.6f}, "
+                  f"min={per_token_sum.min().item():.6f}, max={per_token_sum.max().item():.6f}")
         
         # Initialize gradient tensors
         grad_hidden_states = torch.zeros_like(hidden_states)
@@ -1164,6 +1172,16 @@ class FusedExpertsTritonBackward(torch.autograd.Function):
                 print(f"  grad_intermediate_cache2.norm={grad_intermediate_cache2.norm().item():.6f}")
                 print(f"  curr_grad_w2.norm={curr_grad_w2.norm().item():.6f}")
                 print(f"  curr_grad_topk_weights.norm={curr_grad_topk_weights.norm().item():.6f}")
+                # Debug: show per-expert gradient contribution
+                print(f"  [DEBUG] Per-expert grad_w2 norms:")
+                for e in range(min(E, 4)):  # First 4 experts
+                    expert_grad = curr_grad_w2[e]
+                    print(f"    Expert {e}: grad_w2.norm={expert_grad.norm().item():.6f}")
+                # Debug: show expert selection statistics
+                expert_counts = torch.zeros(E, dtype=torch.int32, device=curr_topk_ids.device)
+                for e in range(E):
+                    expert_counts[e] = (curr_topk_ids == e).sum().item()
+                print(f"  [DEBUG] Expert selection counts: {expert_counts[:8].tolist()}... (first 8)")
                 
                 # DEBUG: Compute what grad_w2 WOULD BE without topk_weights scaling
                 # This helps compare with Megatron's implementation
