@@ -408,6 +408,15 @@ class FusedExpertsFunction(torch.autograd.Function):
                 print(f"[FusedExpertsFunction.backward][Rank {rank}][Layer {layer_id}] CALLED! "
                       f"ep_group=None, grad_output.shape={grad_output.shape}, "
                       f"topk_weights.requires_grad={topk_weights.requires_grad}")
+
+        # DEBUG: Log grad_output magnitude for diagnosis
+        if os.environ.get("DEBUG_EXPERT_GRAD_MAGNITUDE", "0") == "1" and layer_id >= 46:
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            grad_out_norm = grad_output.float().norm().item()
+            grad_out_sum = grad_output.float().sum().item()
+            print(f"[FusedExpertsFunction.backward][Rank {rank}][Layer {layer_id}] "
+                  f"grad_output: norm={grad_out_norm:.6e}, sum={grad_out_sum:.6e}, "
+                  f"shape={grad_output.shape}, dtype={grad_output.dtype}")
         
         num_tokens, hidden_size = hidden_states.shape
         num_local_experts, ffn_hidden_size, _ = w1.shape  # In EP mode, w1 only has local experts!
@@ -516,6 +525,15 @@ class FusedExpertsFunction(torch.autograd.Function):
             grad_intermediate = expert_grad_output @ expert_w2.to(expert_grad_output.dtype)
             if grad_w2 is not None:
                 grad_w2[local_expert_id] += expert_grad_output.T.to(grad_w2.dtype) @ intermediate.to(grad_w2.dtype)
+
+            # DEBUG: Log intermediate gradient magnitudes for first expert of last layer
+            if os.environ.get("DEBUG_EXPERT_GRAD_MAGNITUDE", "0") == "1" and layer_id >= 46 and local_expert_id == 0:
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                print(f"[FusedExpertsFunction.backward][Rank {rank}][Layer {layer_id}][Expert {local_expert_id}] "
+                      f"num_tokens={len(token_indices)}, "
+                      f"expert_grad_output_norm={expert_grad_output.float().norm().item():.6e}, "
+                      f"intermediate_norm={intermediate.float().norm().item():.6e}, "
+                      f"grad_w2_contrib_norm={(expert_grad_output.T @ intermediate).float().norm().item():.6e}")
             
             # Backward through element-wise multiply: intermediate = gate * up
             grad_gate = grad_intermediate * up
@@ -759,23 +777,151 @@ class FusedExpertsFunction(torch.autograd.Function):
                           f"ZEROING grad_hidden_states (isolating layer update)")
 
         # DEBUG: Check final gradient values before returning
-        if os.environ.get("DEBUG_EXPERT_GRAD", "0") == "1":
+        if os.environ.get("DEBUG_EXPERT_GRAD", "0") == "1" or (os.environ.get("DEBUG_EXPERT_GRAD_MAGNITUDE", "0") == "1" and layer_id >= 46):
             rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-            grad_w1_norm = grad_w1.norm().item() if grad_w1 is not None else 0
-            grad_w2_norm = grad_w2.norm().item() if grad_w2 is not None else 0
-            grad_topk_norm = grad_topk_weights.norm().item() if grad_topk_weights is not None else 0
-            grad_hidden_norm = grad_hidden_states.norm().item() if grad_hidden_states is not None else 0
+            grad_w1_norm = grad_w1.float().norm().item() if grad_w1 is not None else 0
+            grad_w2_norm = grad_w2.float().norm().item() if grad_w2 is not None else 0
+            grad_topk_norm = grad_topk_weights.float().norm().item() if grad_topk_weights is not None else 0
+            grad_hidden_norm = grad_hidden_states.float().norm().item() if grad_hidden_states is not None else 0
             print(f"[FusedExpertsFunction.backward][Rank {rank}][Layer {layer_id}] FINAL gradients:")
-            print(f"  grad_w1_norm: {grad_w1_norm:.10e}, grad_w2_norm: {grad_w2_norm:.10e}")
-            print(f"  grad_topk_weights_norm: {grad_topk_norm:.10e}")
-            print(f"  grad_hidden_states_norm: {grad_hidden_norm:.10e} (this will flow to layer {layer_id-1})")
+            print(f"  grad_w1_norm: {grad_w1_norm:.6e}, grad_w2_norm: {grad_w2_norm:.6e}")
+            print(f"  grad_topk_weights_norm: {grad_topk_norm:.6e} (ROUTER)")
+            print(f"  grad_hidden_states_norm: {grad_hidden_norm:.6e} (upstream)")
+            print(f"  RATIO grad_topk/grad_w2: {grad_topk_norm/grad_w2_norm if grad_w2_norm > 0 else 0:.4f}")
             if grad_w1 is not None and grad_w1_norm > 0:
                 # Print per-expert gradient norms
                 for i in range(min(3, grad_w1.shape[0])):
-                    print(f"  grad_w1[{i}] norm: {grad_w1[i].norm().item():.10e}")
+                    print(f"  grad_w1[{i}] norm: {grad_w1[i].float().norm().item():.6e}")
+        
+        # DEBUG: Detailed comparison logging for gradient analysis
+        # Enable with DEBUG_COMPARE_GRAD_DISTRIBUTION=1
+        if os.environ.get("DEBUG_COMPARE_GRAD_DISTRIBUTION", "0") == "1" and layer_id in [0, 47]:
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            if rank == 0:
+                grad_w1_norm = grad_w1.float().norm().item() if grad_w1 is not None else 0
+                grad_w2_norm = grad_w2.float().norm().item() if grad_w2 is not None else 0
+                grad_topk_norm = grad_topk_weights.float().norm().item() if grad_topk_weights is not None else 0
+                grad_hidden_norm = grad_hidden_states.float().norm().item() if grad_hidden_states is not None else 0
+                grad_output_norm = grad_output.float().norm().item()
+                
+                total_expert_grad = (grad_w1_norm**2 + grad_w2_norm**2)**0.5
+                
+                print(f"\n[GRAD_DISTRIBUTION][Layer {layer_id}] ========================================")
+                print(f"  grad_output (incoming): {grad_output_norm:.6e}")
+                print(f"  grad_w1 (expert):       {grad_w1_norm:.6e}")
+                print(f"  grad_w2 (expert):       {grad_w2_norm:.6e}")
+                print(f"  TOTAL expert grad:      {total_expert_grad:.6e}")
+                print(f"  grad_topk (router):     {grad_topk_norm:.6e}")
+                print(f"  grad_hidden (upstream): {grad_hidden_norm:.6e}")
+                print(f"  RATIO expert/router:    {total_expert_grad/grad_topk_norm if grad_topk_norm > 0 else 0:.4f}")
+                print(f"  RATIO expert/incoming:  {total_expert_grad/grad_output_norm if grad_output_norm > 0 else 0:.4f}")
+                print(f"========================================\n")
 
         # Return gradients for all inputs (None for non-tensor inputs)
         return grad_hidden_states, grad_w1, grad_w2, grad_topk_weights, None, None, None, None
+
+
+def _pytorch_fused_experts_forward(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    activation: str,
+    layer_number: int,
+    ep_group,
+) -> torch.Tensor:
+    """Pure PyTorch forward for MoE expert computation with natural autograd.
+    
+    This function computes the same result as FusedExpertsFunction but uses
+    standard PyTorch ops that enable natural autograd gradient computation.
+    Use this for debugging gradient issues by comparing with the custom backward.
+    
+    Enable with USE_PYTORCH_MOE_FORWARD=1 environment variable.
+    
+    Args:
+        hidden_states: Input tensor [num_tokens, hidden_size]
+        w1: Gate/up projection weights [num_local_experts, ffn_hidden_size, hidden_size]
+        w2: Down projection weights [num_local_experts, hidden_size, ffn_hidden_size//2]
+        topk_weights: Router weights [num_tokens, topk]
+        topk_ids: Expert indices [num_tokens, topk] (LOCAL expert IDs, -1 for remote)
+        activation: Activation function name ("silu" or "gelu")
+        layer_number: Layer index for debugging
+        ep_group: Expert parallel process group for all-reducing output
+        
+    Returns:
+        output: Output tensor [num_tokens, hidden_size]
+    """
+    import torch.distributed as dist
+    
+    num_tokens, hidden_size = hidden_states.shape
+    num_local_experts = w1.shape[0]
+    topk = topk_ids.shape[1]
+    
+    # Initialize output
+    output = torch.zeros(num_tokens, hidden_size, dtype=hidden_states.dtype, device=hidden_states.device)
+    
+    # Process each LOCAL expert
+    for local_expert_id in range(num_local_experts):
+        # Find tokens that selected this expert
+        mask = (topk_ids == local_expert_id)
+        if not mask.any():
+            continue
+        
+        token_indices = mask.any(dim=1).nonzero(as_tuple=True)[0]
+        if len(token_indices) == 0:
+            continue
+        
+        # Get expert input
+        expert_input = hidden_states[token_indices]  # [num_tokens_for_expert, hidden_size]
+        expert_w1 = w1[local_expert_id]  # [ffn_hidden_size, hidden_size]
+        expert_w2 = w2[local_expert_id]  # [hidden_size, ffn_hidden_size//2]
+        
+        # Forward through expert
+        gate_up = torch.nn.functional.linear(expert_input, expert_w1)
+        gate_pre, up = gate_up.chunk(2, dim=-1)
+        
+        if activation == "silu":
+            gate = torch.nn.functional.silu(gate_pre)
+        elif activation == "gelu":
+            gate = torch.nn.functional.gelu(gate_pre)
+        else:
+            raise ValueError(f"Unsupported activation: {activation}")
+        
+        intermediate = gate * up
+        expert_output = torch.nn.functional.linear(intermediate, expert_w2)
+        
+        # Apply router weights and accumulate output
+        for slot in range(topk):
+            slot_mask = mask[token_indices, slot]
+            if slot_mask.any():
+                slot_token_indices = token_indices[slot_mask]
+                slot_weights = topk_weights[slot_token_indices, slot].unsqueeze(-1)
+                local_indices = slot_mask.nonzero(as_tuple=True)[0]
+                weighted_output = expert_output[local_indices] * slot_weights
+                output[slot_token_indices] += weighted_output.to(output.dtype)
+    
+    # All-reduce output across EP ranks
+    if ep_group is not None:
+        ep_world_size = dist.get_world_size(ep_group)
+        if ep_world_size > 1:
+            if os.environ.get("MEGATRON_USE_DETERMINISTIC_ALLREDUCE", "0") == "1":
+                from megatron.core.tensor_parallel.mappings import _tree_all_reduce_sum_impl
+                output_reduced = _tree_all_reduce_sum_impl(output, ep_group)
+                output = output_reduced
+            else:
+                dist.all_reduce(output, group=ep_group)
+    
+    # Debug logging
+    if os.environ.get("DEBUG_PYTORCH_MOE_FORWARD", "0") == "1" and layer_number in [0, 47]:
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if rank == 0:
+            print(f"[_pytorch_fused_experts_forward][Layer {layer_number}] "
+                  f"output.shape={output.shape}, "
+                  f"output.norm()={output.float().norm().item():.6e}, "
+                  f"output.sum()={output.float().sum().item():.6e}")
+    
+    return output
 
 
 def sglang_fused_experts(
@@ -877,19 +1023,35 @@ def sglang_fused_experts(
               f"hidden_states.requires_grad={hidden_states.requires_grad}, "
               f"ep_group={ep_group}, ep_size={ep_size}")
     
-    # Use custom autograd function: forward uses triton kernel (bitwise identical),
-    # backward uses PyTorch operations for gradient computation
-    # Pass ep_group so grad_topk_weights can be all-reduced across EP ranks
-    output = FusedExpertsFunction.apply(
-        hidden_states.contiguous(),
-        w1.contiguous(),
-        w2.contiguous(),
-        topk_weights.contiguous(),
-        topk_ids_local.contiguous(),
-        activation,
-        layer_number,
-        ep_group,
-    )
+    # DEBUG: Use pure PyTorch forward for gradient comparison
+    # Enable with USE_PYTORCH_MOE_FORWARD=1 to bypass triton kernel and use PyTorch ops
+    # This allows autograd to compute gradients naturally, helping diagnose if the
+    # custom backward in FusedExpertsFunction is causing gradient magnitude issues
+    if os.environ.get("USE_PYTORCH_MOE_FORWARD", "0") == "1":
+        output = _pytorch_fused_experts_forward(
+            hidden_states.contiguous(),
+            w1.contiguous(),
+            w2.contiguous(),
+            topk_weights.contiguous(),
+            topk_ids_local.contiguous(),
+            activation,
+            layer_number,
+            ep_group,
+        )
+    else:
+        # Use custom autograd function: forward uses triton kernel (bitwise identical),
+        # backward uses PyTorch operations for gradient computation
+        # Pass ep_group so grad_topk_weights can be all-reduced across EP ranks
+        output = FusedExpertsFunction.apply(
+            hidden_states.contiguous(),
+            w1.contiguous(),
+            w2.contiguous(),
+            topk_weights.contiguous(),
+            topk_ids_local.contiguous(),
+            activation,
+            layer_number,
+            ep_group,
+        )
 
     # Debug: compare expert output
     if os.environ.get("DEBUG_MEGATRON_EP_MAPPING", "0") == "1" and layer_number <= 1:
