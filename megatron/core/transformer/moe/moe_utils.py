@@ -1032,12 +1032,16 @@ class FusedExpertsTritonBackward(torch.autograd.Function):
         
         if debug and layer_id in [0, 47]:
             rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-            print(f"[FusedExpertsTritonBackward.backward][Rank {rank}][Layer {layer_id}] ENTERING")
-            print(f"  grad_output.shape={grad_output.shape}, grad_output.norm={grad_output.norm().item():.6f}")
-            print(f"  hidden_states.shape={hidden_states.shape}, w1.shape={w1.shape}, w2.shape={w2.shape}")
-            print(f"  topk_weights.shape={topk_weights.shape}, topk_ids.shape={topk_ids.shape}")
+            print(f"[FusedExpertsTritonBackward.backward][Rank {rank}][Layer {layer_id}] ENTERING", flush=True)
+            print(f"  grad_output.shape={grad_output.shape}, grad_output.norm={grad_output.norm().item():.6f}", flush=True)
+            print(f"  hidden_states.shape={hidden_states.shape}, w1.shape={w1.shape}, w2.shape={w2.shape}", flush=True)
+            print(f"  topk_weights.shape={topk_weights.shape}, topk_ids.shape={topk_ids.shape}", flush=True)
             # DEBUG: Check weight norms per rank (to understand TP slicing)
-            print(f"  w1.norm={w1.norm().item():.6f}, w2.norm={w2.norm().item():.6f}")
+            print(f"  w1.norm={w1.norm().item():.6f}, w2.norm={w2.norm().item():.6f}", flush=True)
+            # DEBUG: Check individual expert weight norms
+            print(f"  [DEBUG] Per-expert weight norms (first 4):", flush=True)
+            for e in range(min(4, w1.shape[0])):
+                print(f"    Expert {e}: w1[{e}].norm={w1[e].norm().item():.6f}, w2[{e}].norm={w2[e].norm().item():.6f}", flush=True)
             # DEBUG: Check topk_weights statistics
             tw_float = topk_weights.float()
             print(f"  topk_weights stats: mean={tw_float.mean().item():.6f}, "
@@ -1117,9 +1121,49 @@ class FusedExpertsTritonBackward(torch.autograd.Function):
             
             if debug and layer_id in [0, 47] and chunk == 0:
                 rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-                print(f"[FusedExpertsTritonBackward][Rank {rank}][Layer {layer_id}] Recomputed intermediates:")
-                print(f"  intermediate_cache1.shape={intermediate_cache1.shape}, norm={intermediate_cache1.norm().item():.6f}")
-                print(f"  intermediate_cache2.shape={intermediate_cache2.shape}, norm={intermediate_cache2.norm().item():.6f}")
+                print(f"[FusedExpertsTritonBackward][Rank {rank}][Layer {layer_id}] Recomputed intermediates:", flush=True)
+                print(f"  intermediate_cache1.shape={intermediate_cache1.shape}, norm={intermediate_cache1.norm().item():.6f}", flush=True)
+                print(f"  intermediate_cache2.shape={intermediate_cache2.shape}, norm={intermediate_cache2.norm().item():.6f}", flush=True)
+                # DEBUG: Check sorted_token_ids for DownProj (critical for backward kernel)
+                print(f"  sorted_token_ids_down.shape={sorted_token_ids_down.shape}, "
+                      f"min={sorted_token_ids_down.min().item()}, max={sorted_token_ids_down.max().item()}, "
+                      f"first_10={sorted_token_ids_down[:10].tolist()}", flush=True)
+                print(f"  expert_ids_down.shape={expert_ids_down.shape}, first_10={expert_ids_down[:10].tolist()}", flush=True)
+                print(f"  num_tokens_post_padded_down={num_tokens_post_padded_down}", flush=True)
+                
+                # DEBUG: Verify intermediate values by re-running full forward and comparing
+                # This checks if our recomputation matches fused_experts_impl
+                with torch.no_grad():
+                    ref_output = fused_experts_impl(
+                        hidden_states=curr_hidden.contiguous(),
+                        w1=w1.contiguous(),
+                        w2=w2.contiguous(),
+                        topk_weights=curr_topk_weights.contiguous(),
+                        topk_ids=curr_topk_ids.contiguous(),
+                        inplace=False,
+                        activation=activation,
+                        is_gated=True,
+                        apply_router_weight_on_input=False,
+                        filter_expert=True,
+                        layer_id=layer_id,
+                    )
+                print(f"  [VERIFY] ref_output (from fused_experts_impl) norm={ref_output.norm().item():.6f}", flush=True)
+                
+                # Also compute output using our recomputed intermediates to see if they match
+                # DownProj: intermediate_cache2 @ w2.T * topk_weights, then reduce
+                our_output = torch.zeros_like(curr_hidden)
+                for e in range(E):
+                    expert_mask = (curr_topk_ids == e)
+                    if expert_mask.any():
+                        flat_indices = expert_mask.view(-1).nonzero(as_tuple=True)[0]
+                        token_indices = flat_indices // topk
+                        slot_intermediate = intermediate_cache2[flat_indices]
+                        slot_output = slot_intermediate @ w2[e].T
+                        slot_weights = curr_topk_weights.view(-1)[flat_indices]
+                        our_output.index_add_(0, token_indices, slot_output * slot_weights.unsqueeze(-1))
+                print(f"  [VERIFY] our_output (from recomputed intermediates) norm={our_output.norm().item():.6f}", flush=True)
+                diff = (ref_output - our_output).norm().item()
+                print(f"  [VERIFY] DIFF between ref and our: {diff:.6f} (relative: {diff / ref_output.norm().item():.6f})", flush=True)
             
             # ============ Backward pass ============
             # Step 3: Backward through DownProj (w2)
