@@ -469,6 +469,23 @@ class MoELayer(BaseMoELayer):
                   f"w2.shape={w2.shape}, w2[0,0,:5]={w2[0, 0, :5].tolist()}, "
                   f"w2 sum={w2.float().sum().item():.6f}, w2 std={w2.float().std().item():.6f}")
 
+        # DEBUG: Register backward hooks to verify gradient propagation
+        if os.environ.get("DEBUG_GRAD_PROPAGATION", "0") == "1" and self.layer_number in [1, 48]:
+            import torch.distributed as dist
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            layer_num = self.layer_number
+            
+            def make_hook(name, layer):
+                def hook(grad):
+                    if rank == 0:
+                        print(f"[GRAD_HOOK][Rank {rank}][Layer {layer}] {name} received grad.norm={grad.norm().item():.6f}, "
+                              f"grad.shape={grad.shape}")
+                    return grad
+                return hook
+            
+            w1.register_hook(make_hook("w1 (from torch.stack)", layer_num))
+            w2.register_hook(make_hook("w2 (from torch.stack)", layer_num))
+        
         # Call SGLang's fused experts with EP parameters
         output = sglang_fused_experts(
             layer_number=self.layer_number,

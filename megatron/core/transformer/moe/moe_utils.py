@@ -1036,6 +1036,12 @@ class FusedExpertsTritonBackward(torch.autograd.Function):
             print(f"  grad_output.shape={grad_output.shape}, grad_output.norm={grad_output.norm().item():.6f}")
             print(f"  hidden_states.shape={hidden_states.shape}, w1.shape={w1.shape}, w2.shape={w2.shape}")
             print(f"  topk_weights.shape={topk_weights.shape}, topk_ids.shape={topk_ids.shape}")
+            # DEBUG: Check topk_weights statistics
+            print(f"  topk_weights stats: mean={topk_weights.float().mean().item():.6f}, "
+                  f"sum={topk_weights.float().sum().item():.6f}, "
+                  f"max={topk_weights.float().max().item():.6f}, "
+                  f"min={topk_weights.float().min().item():.6f}")
+            print(f"  topk_weights[0]={topk_weights[0].tolist()}")
         
         # Initialize gradient tensors
         grad_hidden_states = torch.zeros_like(hidden_states)
@@ -1158,6 +1164,23 @@ class FusedExpertsTritonBackward(torch.autograd.Function):
                 print(f"  grad_intermediate_cache2.norm={grad_intermediate_cache2.norm().item():.6f}")
                 print(f"  curr_grad_w2.norm={curr_grad_w2.norm().item():.6f}")
                 print(f"  curr_grad_topk_weights.norm={curr_grad_topk_weights.norm().item():.6f}")
+                
+                # DEBUG: Compute what grad_w2 WOULD BE without topk_weights scaling
+                # This helps compare with Megatron's implementation
+                grad_w2_unweighted_norm = 0.0
+                for e in range(E):
+                    expert_mask = (curr_topk_ids == e)  # [curr_tokens, topk]
+                    if expert_mask.any():
+                        flat_indices = expert_mask.view(-1).nonzero(as_tuple=True)[0]
+                        # intermediate[slot] @ grad_output (without weights)
+                        slot_intermediate = intermediate_cache2[flat_indices]  # [num_slots, inter_size]
+                        # Need to map slots back to tokens for grad_output
+                        token_indices = flat_indices // topk
+                        slot_grad_out = curr_grad_output[token_indices]  # [num_slots, hidden_size]
+                        grad_w2_e_unweighted = slot_intermediate.T @ slot_grad_out  # [inter_size, hidden_size]
+                        grad_w2_unweighted_norm += (grad_w2_e_unweighted ** 2).sum().item()
+                grad_w2_unweighted_norm = grad_w2_unweighted_norm ** 0.5
+                print(f"  [DEBUG] grad_w2 WITHOUT topk_weights scaling: norm={grad_w2_unweighted_norm:.6f}")
             
             # DEBUG: Compare with PyTorch reference (same logic as FusedExpertsFunction.backward)
             if os.environ.get("DEBUG_COMPARE_PYTORCH", "0") == "1" and layer_id in [0, 47] and chunk == 0:
