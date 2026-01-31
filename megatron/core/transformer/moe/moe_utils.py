@@ -1212,6 +1212,9 @@ class FusedExpertsTritonBackward(torch.autograd.Function):
                 print(f"  curr_grad_topk_weights.norm={curr_grad_topk_weights.norm().item():.6f}")
                 
                 # CRITICAL DEBUG: Compute PyTorch reference grad_w2 and compare with Triton kernel
+                # Forward: output = intermediate @ w2.T, where w2 shape is [hidden_size, inter_size]
+                # So: grad_w2 = (grad_output * weights).T @ intermediate
+                # grad_w2 shape: [hidden_size, inter_size]
                 pytorch_grad_w2_ref = torch.zeros_like(w2)
                 grad_intermediate_cache3_flat = grad_intermediate_cache3.view(-1, hidden_size)
                 for e in range(E):
@@ -1224,9 +1227,10 @@ class FusedExpertsTritonBackward(torch.autograd.Function):
                         slot_grad_out = grad_intermediate_cache3_flat[flat_indices]  # [num_slots, hidden_size]
                         # Get topk_weights for these slots
                         slot_weights = curr_topk_weights.view(-1)[flat_indices]  # [num_slots]
-                        # grad_w2[e] = slot_intermediate.T @ (slot_grad_out * slot_weights)
+                        # grad_w2[e] = (grad_out * weights).T @ intermediate
+                        # = [hidden_size, num_slots] @ [num_slots, inter_size] = [hidden_size, inter_size]
                         weighted_grad_out = slot_grad_out * slot_weights.unsqueeze(-1)
-                        pytorch_grad_w2_ref[e] = slot_intermediate.T @ weighted_grad_out
+                        pytorch_grad_w2_ref[e] = weighted_grad_out.T @ slot_intermediate
                 
                 print(f"  [PYTORCH_REF] grad_w2.norm={pytorch_grad_w2_ref.norm().item():.6f}")
                 diff = (curr_grad_w2 - pytorch_grad_w2_ref).norm().item()
