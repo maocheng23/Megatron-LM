@@ -1412,43 +1412,59 @@ class FusedExpertsTritonBackward(torch.autograd.Function):
         # This helps understand if the 1/8 gradient difference is due to:
         # (A) Just grad_norm reporting difference (local vs global)
         # (B) Actual grad_w value difference (need all-reduce to match off-policy)
-        if os.environ.get("DEBUG_GRAD_W_ALLREDUCE", "0") == "1" and ep_group is not None:
-            ep_world_size = torch.distributed.get_world_size(ep_group)
+        if os.environ.get("DEBUG_GRAD_W_ALLREDUCE", "0") == "1":
             rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
             
-            if ep_world_size > 1 and layer_id in [0, 47]:
-                # Local grad_w norms (before any all-reduce)
-                local_grad_w1_norm = grad_w1.float().norm().item()
-                local_grad_w2_norm = grad_w2.float().norm().item()
-                
-                # All-reduce sum to get "global" grad_w
-                grad_w1_global = grad_w1.clone()
-                grad_w2_global = grad_w2.clone()
-                torch.distributed.all_reduce(grad_w1_global, group=ep_group)
-                torch.distributed.all_reduce(grad_w2_global, group=ep_group)
-                global_grad_w1_norm = grad_w1_global.float().norm().item()
-                global_grad_w2_norm = grad_w2_global.float().norm().item()
-                
-                # Calculate ratio
-                ratio_w1 = global_grad_w1_norm / max(local_grad_w1_norm, 1e-10)
-                ratio_w2 = global_grad_w2_norm / max(local_grad_w2_norm, 1e-10)
-                
+            # First, always print diagnostic info for layer 0 or last layer
+            if layer_id == 0 or layer_id >= 46:
                 print(f"[DEBUG_GRAD_W_ALLREDUCE][Rank {rank}][Layer {layer_id}] "
-                      f"grad_w1: local_norm={local_grad_w1_norm:.6e}, "
-                      f"global_norm (after allreduce sum)={global_grad_w1_norm:.6e}, "
-                      f"ratio={ratio_w1:.2f}")
-                print(f"[DEBUG_GRAD_W_ALLREDUCE][Rank {rank}][Layer {layer_id}] "
-                      f"grad_w2: local_norm={local_grad_w2_norm:.6e}, "
-                      f"global_norm (after allreduce sum)={global_grad_w2_norm:.6e}, "
-                      f"ratio={ratio_w2:.2f}")
+                      f"ep_group={ep_group}, "
+                      f"ep_world_size={torch.distributed.get_world_size(ep_group) if ep_group is not None else 'N/A'}")
+            
+            if ep_group is not None:
+                ep_world_size = torch.distributed.get_world_size(ep_group)
                 
-                # Also check if all ranks have same grad_w (they should have different experts!)
-                # Each rank should have non-zero grad only for its local experts
-                # Sum across all ranks should give the "full" gradient
-                local_sum_w1 = grad_w1.float().sum().item()
-                local_sum_w2 = grad_w2.float().sum().item()
-                print(f"[DEBUG_GRAD_W_ALLREDUCE][Rank {rank}][Layer {layer_id}] "
-                      f"grad_w1.sum={local_sum_w1:.6e}, grad_w2.sum={local_sum_w2:.6e}")
+                # Only do detailed analysis for specific layers to reduce output
+                if layer_id == 0 or layer_id >= 46:
+                    # Local grad_w norms (before any all-reduce)
+                    local_grad_w1_norm = grad_w1.float().norm().item()
+                    local_grad_w2_norm = grad_w2.float().norm().item()
+                    
+                    if ep_world_size > 1:
+                        # All-reduce sum to get "global" grad_w
+                        grad_w1_global = grad_w1.clone()
+                        grad_w2_global = grad_w2.clone()
+                        torch.distributed.all_reduce(grad_w1_global, group=ep_group)
+                        torch.distributed.all_reduce(grad_w2_global, group=ep_group)
+                        global_grad_w1_norm = grad_w1_global.float().norm().item()
+                        global_grad_w2_norm = grad_w2_global.float().norm().item()
+                        
+                        # Calculate ratio
+                        ratio_w1 = global_grad_w1_norm / max(local_grad_w1_norm, 1e-10)
+                        ratio_w2 = global_grad_w2_norm / max(local_grad_w2_norm, 1e-10)
+                        
+                        print(f"[DEBUG_GRAD_W_ALLREDUCE][Rank {rank}][Layer {layer_id}] "
+                              f"grad_w1: local_norm={local_grad_w1_norm:.6e}, "
+                              f"global_norm (after allreduce sum)={global_grad_w1_norm:.6e}, "
+                              f"ratio={ratio_w1:.2f}")
+                        print(f"[DEBUG_GRAD_W_ALLREDUCE][Rank {rank}][Layer {layer_id}] "
+                              f"grad_w2: local_norm={local_grad_w2_norm:.6e}, "
+                              f"global_norm (after allreduce sum)={global_grad_w2_norm:.6e}, "
+                              f"ratio={ratio_w2:.2f}")
+                    else:
+                        print(f"[DEBUG_GRAD_W_ALLREDUCE][Rank {rank}][Layer {layer_id}] "
+                              f"ep_world_size=1, no all-reduce needed. "
+                              f"grad_w1.norm={local_grad_w1_norm:.6e}, grad_w2.norm={local_grad_w2_norm:.6e}")
+                    
+                    # Also print local gradient sum for debugging
+                    local_sum_w1 = grad_w1.float().sum().item()
+                    local_sum_w2 = grad_w2.float().sum().item()
+                    print(f"[DEBUG_GRAD_W_ALLREDUCE][Rank {rank}][Layer {layer_id}] "
+                          f"grad_w1.sum={local_sum_w1:.6e}, grad_w2.sum={local_sum_w2:.6e}")
+            else:
+                if layer_id == 0 or layer_id >= 46:
+                    print(f"[DEBUG_GRAD_W_ALLREDUCE][Rank {rank}][Layer {layer_id}] "
+                          f"ep_group is None, cannot do all-reduce comparison")
         
         if debug and layer_id in [0, 47]:
             rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
