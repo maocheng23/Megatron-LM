@@ -1408,6 +1408,48 @@ class FusedExpertsTritonBackward(torch.autograd.Function):
                           f"After EP all-reduce: grad_hidden_states.norm={grad_hidden_states.norm().item():.6f}, "
                           f"grad_topk_weights.norm={grad_topk_weights.norm().item():.6f}")
         
+        # DEBUG: Compare local grad_w vs all-reduce sum grad_w
+        # This helps understand if the 1/8 gradient difference is due to:
+        # (A) Just grad_norm reporting difference (local vs global)
+        # (B) Actual grad_w value difference (need all-reduce to match off-policy)
+        if os.environ.get("DEBUG_GRAD_W_ALLREDUCE", "0") == "1" and ep_group is not None:
+            ep_world_size = torch.distributed.get_world_size(ep_group)
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            
+            if ep_world_size > 1 and layer_id in [0, 47]:
+                # Local grad_w norms (before any all-reduce)
+                local_grad_w1_norm = grad_w1.float().norm().item()
+                local_grad_w2_norm = grad_w2.float().norm().item()
+                
+                # All-reduce sum to get "global" grad_w
+                grad_w1_global = grad_w1.clone()
+                grad_w2_global = grad_w2.clone()
+                torch.distributed.all_reduce(grad_w1_global, group=ep_group)
+                torch.distributed.all_reduce(grad_w2_global, group=ep_group)
+                global_grad_w1_norm = grad_w1_global.float().norm().item()
+                global_grad_w2_norm = grad_w2_global.float().norm().item()
+                
+                # Calculate ratio
+                ratio_w1 = global_grad_w1_norm / max(local_grad_w1_norm, 1e-10)
+                ratio_w2 = global_grad_w2_norm / max(local_grad_w2_norm, 1e-10)
+                
+                print(f"[DEBUG_GRAD_W_ALLREDUCE][Rank {rank}][Layer {layer_id}] "
+                      f"grad_w1: local_norm={local_grad_w1_norm:.6e}, "
+                      f"global_norm (after allreduce sum)={global_grad_w1_norm:.6e}, "
+                      f"ratio={ratio_w1:.2f}")
+                print(f"[DEBUG_GRAD_W_ALLREDUCE][Rank {rank}][Layer {layer_id}] "
+                      f"grad_w2: local_norm={local_grad_w2_norm:.6e}, "
+                      f"global_norm (after allreduce sum)={global_grad_w2_norm:.6e}, "
+                      f"ratio={ratio_w2:.2f}")
+                
+                # Also check if all ranks have same grad_w (they should have different experts!)
+                # Each rank should have non-zero grad only for its local experts
+                # Sum across all ranks should give the "full" gradient
+                local_sum_w1 = grad_w1.float().sum().item()
+                local_sum_w2 = grad_w2.float().sum().item()
+                print(f"[DEBUG_GRAD_W_ALLREDUCE][Rank {rank}][Layer {layer_id}] "
+                      f"grad_w1.sum={local_sum_w1:.6e}, grad_w2.sum={local_sum_w2:.6e}")
+        
         if debug and layer_id in [0, 47]:
             rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
             print(f"[FusedExpertsTritonBackward][Rank {rank}][Layer {layer_id}] "
