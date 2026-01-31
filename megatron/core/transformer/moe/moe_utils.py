@@ -1124,12 +1124,6 @@ class FusedExpertsTritonBackward(torch.autograd.Function):
                 print(f"[FusedExpertsTritonBackward][Rank {rank}][Layer {layer_id}] Recomputed intermediates:", flush=True)
                 print(f"  intermediate_cache1.shape={intermediate_cache1.shape}, norm={intermediate_cache1.norm().item():.6f}", flush=True)
                 print(f"  intermediate_cache2.shape={intermediate_cache2.shape}, norm={intermediate_cache2.norm().item():.6f}", flush=True)
-                # DEBUG: Check sorted_token_ids for DownProj (critical for backward kernel)
-                print(f"  sorted_token_ids_down.shape={sorted_token_ids_down.shape}, "
-                      f"min={sorted_token_ids_down.min().item()}, max={sorted_token_ids_down.max().item()}, "
-                      f"first_10={sorted_token_ids_down[:10].tolist()}", flush=True)
-                print(f"  expert_ids_down.shape={expert_ids_down.shape}, first_10={expert_ids_down[:10].tolist()}", flush=True)
-                print(f"  num_tokens_post_padded_down={num_tokens_post_padded_down}", flush=True)
                 
                 # DEBUG: Verify intermediate values by re-running full forward and comparing
                 # This checks if our recomputation matches fused_experts_impl
