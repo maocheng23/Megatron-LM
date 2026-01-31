@@ -1398,52 +1398,82 @@ class FusedExpertsTritonBackward(torch.autograd.Function):
         # EP all-reduce for gradients
         # - grad_topk_weights: Router is shared across ranks, each rank computes partial gradient
         # - grad_hidden_states: Each rank only has partial gradient from its local experts
-        # - grad_w1, grad_w2: CRITICAL FIX - Without AllGather in forward, each rank only sees
-        #   local tokens. To match off-policy (AllGather) behavior where each expert sees ALL
-        #   tokens routed to it globally, we need to all-reduce expert weight gradients.
-        #   This ensures gradient magnitude matches off-policy training.
+        # - grad_w1, grad_w2: NO all-reduce needed because:
+        #   1. Each rank has different local experts (e.g., rank 0 has experts 0-15, rank 1 has 16-31)
+        #   2. Each rank's grad_w corresponds to different experts
+        #   3. All-reduce would incorrectly sum gradients of different experts
+        #   4. With "All tokens on each EP rank" mode (no sequence parallel), each rank already
+        #      sees all tokens, so grad_w is already complete for each rank's local experts
         if ep_group is not None:
             ep_world_size = torch.distributed.get_world_size(ep_group)
             if ep_world_size > 1:
                 torch.distributed.all_reduce(grad_topk_weights, group=ep_group)
                 torch.distributed.all_reduce(grad_hidden_states, group=ep_group)
                 
-                # CRITICAL: All-reduce expert weight gradients to match off-policy behavior
-                # In on-policy mode (no AllGather), each rank only processes local tokens.
-                # But each expert should receive gradients from ALL tokens that route to it
-                # across all ranks. Without this, gradient magnitude is ~1/EP_size of off-policy.
-                torch.distributed.all_reduce(grad_w1, group=ep_group)
-                torch.distributed.all_reduce(grad_w2, group=ep_group)
+                # NOTE: We intentionally do NOT all-reduce grad_w1/grad_w2 because:
+                # - Each rank's grad_w[i] corresponds to a DIFFERENT expert
+                # - All-reduce would incorrectly mix gradients of different experts
                 
                 if debug and layer_id in [0, 47]:
                     rank = torch.distributed.get_rank()
                     print(f"[FusedExpertsTritonBackward][Rank {rank}][Layer {layer_id}] "
                           f"After EP all-reduce: grad_hidden_states.norm={grad_hidden_states.norm().item():.6f}, "
-                          f"grad_topk_weights.norm={grad_topk_weights.norm().item():.6f}, "
-                          f"grad_w1.norm={grad_w1.norm().item():.6f}, "
-                          f"grad_w2.norm={grad_w2.norm().item():.6f}")
+                          f"grad_topk_weights.norm={grad_topk_weights.norm().item():.6f}")
         
-        # DEBUG: Show grad_w norms after all-reduce (grad_w is now all-reduced above)
-        # With the fix applied, grad_w1 and grad_w2 are now all-reduced, so this shows final values
+        # DEBUG: Detailed gradient analysis
         if os.environ.get("DEBUG_GRAD_W_ALLREDUCE", "0") == "1":
             rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
             
             if layer_id == 0 or layer_id >= 46:
-                print(f"[DEBUG_GRAD_W_ALLREDUCE][Rank {rank}][Layer {layer_id}] "
+                ep_world_size = torch.distributed.get_world_size(ep_group) if ep_group is not None else 1
+                
+                print(f"[DEBUG_GRAD_W][Rank {rank}][Layer {layer_id}] "
                       f"ep_group={'present' if ep_group is not None else 'None'}, "
-                      f"ep_world_size={torch.distributed.get_world_size(ep_group) if ep_group is not None else 'N/A'}")
+                      f"ep_world_size={ep_world_size}")
                 
-                # These are now the all-reduced values (after the fix above)
-                final_grad_w1_norm = grad_w1.float().norm().item()
-                final_grad_w2_norm = grad_w2.float().norm().item()
-                final_sum_w1 = grad_w1.float().sum().item()
-                final_sum_w2 = grad_w2.float().sum().item()
+                # Local grad_w values (each rank has different experts)
+                grad_w1_norm = grad_w1.float().norm().item()
+                grad_w2_norm = grad_w2.float().norm().item()
+                grad_w1_sum = grad_w1.float().sum().item()
+                grad_w2_sum = grad_w2.float().sum().item()
                 
-                print(f"[DEBUG_GRAD_W_ALLREDUCE][Rank {rank}][Layer {layer_id}] "
-                      f"AFTER all-reduce fix: grad_w1.norm={final_grad_w1_norm:.6e}, "
-                      f"grad_w2.norm={final_grad_w2_norm:.6e}")
-                print(f"[DEBUG_GRAD_W_ALLREDUCE][Rank {rank}][Layer {layer_id}] "
-                      f"grad_w1.sum={final_sum_w1:.6e}, grad_w2.sum={final_sum_w2:.6e}")
+                print(f"[DEBUG_GRAD_W][Rank {rank}][Layer {layer_id}] "
+                      f"LOCAL grad_w1.norm={grad_w1_norm:.6e}, grad_w2.norm={grad_w2_norm:.6e}")
+                print(f"[DEBUG_GRAD_W][Rank {rank}][Layer {layer_id}] "
+                      f"LOCAL grad_w1.sum={grad_w1_sum:.6e}, grad_w2.sum={grad_w2_sum:.6e}")
+                
+                # Count how many token-expert pairs were processed (non-zero grad contributions)
+                # This helps verify if all expected pairs are being processed
+                num_local_experts = grad_w1.shape[0]
+                print(f"[DEBUG_GRAD_W][Rank {rank}][Layer {layer_id}] "
+                      f"num_local_experts={num_local_experts}, grad_w1.shape={list(grad_w1.shape)}")
+                
+                # Check per-expert gradient norms
+                for e in range(min(3, num_local_experts)):  # First 3 experts
+                    e_norm = grad_w1[e].float().norm().item()
+                    print(f"[DEBUG_GRAD_W][Rank {rank}][Layer {layer_id}] "
+                          f"local_expert[{e}] grad_w1.norm={e_norm:.6e}")
+                
+                # Verify tokens are same across ranks (check hidden_states hash)
+                if hidden_states is not None:
+                    hs_sum = hidden_states.float().sum().item()
+                    hs_norm = hidden_states.float().norm().item()
+                    print(f"[DEBUG_GRAD_W][Rank {rank}][Layer {layer_id}] "
+                          f"hidden_states.shape={list(hidden_states.shape)}, "
+                          f"sum={hs_sum:.6e}, norm={hs_norm:.6e}")
+                
+                # Verify topk_ids consistency
+                if topk_ids is not None:
+                    num_tokens = topk_ids.shape[0]
+                    topk = topk_ids.shape[1]
+                    # Count how many token-expert pairs select local experts
+                    local_start = rank * num_local_experts
+                    local_end = local_start + num_local_experts
+                    local_pairs = ((topk_ids >= local_start) & (topk_ids < local_end)).sum().item()
+                    total_pairs = num_tokens * topk
+                    print(f"[DEBUG_GRAD_W][Rank {rank}][Layer {layer_id}] "
+                          f"topk_ids: num_tokens={num_tokens}, topk={topk}, "
+                          f"local_pairs={local_pairs}/{total_pairs} ({100*local_pairs/total_pairs:.1f}%)")
         
         if debug and layer_id in [0, 47]:
             rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
