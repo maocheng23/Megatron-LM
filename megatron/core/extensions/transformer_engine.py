@@ -839,15 +839,14 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         )
         self.te_quant_params: Optional[TEQuantizationParams] = None
 
-        # Set proper partition_stride
-        setattr(self.weight, 'partition_stride', stride)
-        if bias and hasattr(self, 'bias') and self.bias is not None:
-            setattr(self.bias, 'partition_stride', stride)
+        # TE LayerNormLinear has nested structure: self.linear.weight is the actual weight
+        # We need to find and set TP attributes on the actual weight tensor
+        actual_weight = self._get_actual_weight()
 
         if config.use_cpu_initialization:
             output_size_per_partition = divide(output_size, self.tp_size)
             _ = _initialize_affine_weight_cpu(
-                self.weight,
+                actual_weight,
                 output_size,
                 input_size,
                 output_size_per_partition,
@@ -857,16 +856,38 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                 return_master_weight=False,
                 rank=self.tp_rank,
                 world_size=self.tp_size,
-                skip_set_tensor_parallel_attributes=True,
+                skip_set_tensor_parallel_attributes=False,  # Need TP attrs for weight update
             )
             if bias:
-                self.bias = Parameter(
-                    torch.empty(output_size_per_partition, dtype=config.params_dtype)
-                )
-                set_tensor_model_parallel_attributes(self.bias, True, 0, stride)
-                with torch.no_grad():
-                    self.bias.zero_()
-                setattr(self.bias, "allreduce", True)
+                actual_bias = self._get_actual_bias()
+                if actual_bias is not None:
+                    set_tensor_model_parallel_attributes(actual_bias, True, 0, stride)
+                    with torch.no_grad():
+                        actual_bias.zero_()
+                    setattr(actual_bias, "allreduce", True)
+        else:
+            # Set proper partition_stride only when NOT using cpu_initialization
+            # (TE parent class handles weight init, we just need to add partition_stride)
+            setattr(actual_weight, 'partition_stride', stride)
+            if bias:
+                actual_bias = self._get_actual_bias()
+                if actual_bias is not None:
+                    setattr(actual_bias, 'partition_stride', stride)
+
+    def _get_actual_weight(self):
+        """Get the actual weight tensor from TE's nested structure."""
+        # TE LayerNormLinear may have weight at self.linear.weight or self.weight
+        if hasattr(self, 'linear') and hasattr(self.linear, 'weight'):
+            return self.linear.weight
+        return self.weight
+
+    def _get_actual_bias(self):
+        """Get the actual bias tensor from TE's nested structure."""
+        if hasattr(self, 'linear') and hasattr(self.linear, 'bias') and self.linear.bias is not None:
+            return self.linear.bias
+        if hasattr(self, 'bias') and self.bias is not None:
+            return self.bias
+        return None
 
     def finish_init(self, quantization_config: QuantizationConfig):
         """Post-init of quantization override"""
@@ -978,12 +999,8 @@ class TEColumnParallelLinear(TELinear):
             tp_group=tp_group,
         )
 
-        # Set proper partition_stride
-        setattr(self.weight, 'partition_stride', stride)
-        if bias and hasattr(self, 'bias') and self.bias is not None:
-            setattr(self.bias, 'partition_stride', stride)
-
         if config.use_cpu_initialization:
+            # _initialize_affine_weight_cpu will set all TP attributes including partition_stride
             output_size_per_partition = divide(output_size, world_size)
             _ = _initialize_affine_weight_cpu(
                 self.weight,
@@ -996,7 +1013,7 @@ class TEColumnParallelLinear(TELinear):
                 return_master_weight=False,
                 rank=rank,
                 world_size=world_size,
-                skip_set_tensor_parallel_attributes=True,
+                skip_set_tensor_parallel_attributes=False,  # Need TP attrs for weight update
             )
             if bias:
                 self.bias = Parameter(
@@ -1006,6 +1023,11 @@ class TEColumnParallelLinear(TELinear):
                 with torch.no_grad():
                     self.bias.zero_()
                 setattr(self.bias, "allreduce", True)
+        else:
+            # Set proper partition_stride only when NOT using cpu_initialization
+            setattr(self.weight, 'partition_stride', stride)
+            if bias and hasattr(self, 'bias') and self.bias is not None:
+                setattr(self.bias, 'partition_stride', stride)
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 0, bias sharded"""
@@ -1097,7 +1119,7 @@ class TERowParallelLinear(TELinear):
                 params_dtype=config.params_dtype,
                 rank=rank,
                 world_size=world_size,
-                skip_set_tensor_parallel_attributes=True,
+                skip_set_tensor_parallel_attributes=False,  # Need TP attrs for weight update
             )
             if bias:
                 self.bias = Parameter(torch.empty(output_size, dtype=config.params_dtype))

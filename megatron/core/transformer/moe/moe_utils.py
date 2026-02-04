@@ -1,17 +1,22 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import functools
+import logging
 import math
+import os
 from dataclasses import dataclass
 from typing import List, Optional, Union
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 from megatron.core import parallel_state
 from megatron.core.fp4_utils import get_fp4_align_size
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import get_cuda_rng_tracker, get_expert_parallel_rng_tracker_name
+from megatron.core.tensor_parallel.mappings import _tree_all_reduce_sum, _tree_all_reduce_sum_impl
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -36,6 +41,56 @@ try:
 except ImportError:
     HAVE_TE = False
 
+# Try to import SGLang's fused_experts for deterministic expert computation
+try:
+    from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts_impl
+    HAVE_SGLANG_FUSED_EXPERTS = True
+
+    # Initialize SGLang server args if not already set (needed for fused_experts_impl)
+    from sglang.srt.server_args import get_global_server_args, set_global_server_args_for_scheduler
+    try:
+        get_global_server_args()
+    except ValueError:
+        # Server args not set - create minimal mock for Megatron usage
+        use_deterministic = os.environ.get("MEGATRON_USE_DETERMINISTIC_ALLREDUCE", "0") == "1"
+        class _MinimalServerArgs:
+            enable_deterministic_inference = use_deterministic
+            rl_on_policy_target = "fsdp_tp" if use_deterministic else None
+        set_global_server_args_for_scheduler(_MinimalServerArgs())
+except ImportError:
+    HAVE_SGLANG_FUSED_EXPERTS = False
+    fused_experts_impl = None
+
+# Try to import triton backward functions for correct gradient computation
+# These ensure forward and backward use the same triton kernels, avoiding numerical mismatch
+try:
+    from megatron.core.transformer.moe.sgl_fused_moe import (
+        GateUpProjFunction,
+        SiluAndMulFunction, 
+        DownProjFunction,
+        MoeSumReduceFunction,
+    )
+    from megatron.core.transformer.moe.sgl_fused_moe.fused_moe_triton_backward_kernels import (
+        invoke_fused_moe_backward_kernel,
+    )
+    from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+        moe_align_block_size,
+        invoke_fused_moe_kernel,
+        silu_and_mul,
+    )
+    import triton.language as tl
+    HAVE_TRITON_BACKWARD = True
+except ImportError:
+    HAVE_TRITON_BACKWARD = False
+    GateUpProjFunction = None
+    SiluAndMulFunction = None
+    DownProjFunction = None
+    MoeSumReduceFunction = None
+    invoke_fused_moe_backward_kernel = None
+    moe_align_block_size = None
+    invoke_fused_moe_kernel = None
+    silu_and_mul = None
+    tl = None
 
 # MOE logging
 _MOE_LAYER_WISE_LOGGING_TRACKER = {}
@@ -310,6 +365,760 @@ def permute(
     permuted_input = tokens.index_select(0, sorted_indices)
 
     return permuted_input, permuted_probs, sorted_indices
+
+
+class FusedExpertsFunction(torch.autograd.Function):
+    """Custom autograd function for fused experts.
+    
+    Forward: Uses SGLang's fused_experts_impl (triton kernel) for bitwise identical results
+    Backward: Uses pure PyTorch operations for gradient computation
+    
+    IMPORTANT: In EP mode, grad_topk_weights is all-reduced across EP ranks so the router
+    receives complete gradients from all experts.
+    
+    NOTE (CRITICAL): We must use PyTorch forward pass to compute intermediates for backward,
+    because using triton kernel for forward and PyTorch for backward would cause gradient
+    mismatch due to numerical differences between triton and PyTorch implementations.
+    The triton kernel output is ONLY used for the returned output value (to match inference),
+    NOT for backward gradient computation.
+    """
+    
+    @staticmethod
+    def forward(ctx, hidden_states, w1, w2, topk_weights, topk_ids, activation, layer_id, ep_group):
+        """Forward pass using SGLang's triton kernel.
+        
+        Args:
+            ep_group: Expert parallel process group for all-reducing grad_topk_weights.
+                      Can be None if EP size is 1.
+        """
+        # Save tensors for backward
+        ctx.save_for_backward(hidden_states, w1, w2, topk_weights, topk_ids)
+        ctx.activation = activation
+        ctx.ep_group = ep_group
+        ctx.layer_id = layer_id
+        
+        # Use SGLang's fused_experts_impl for bitwise identical forward output
+        # NOTE: The triton output is used for the return value only.
+        # In backward, we recompute using PyTorch ops to ensure gradient consistency.
+        with torch.no_grad():
+            output = fused_experts_impl(
+                hidden_states=hidden_states.contiguous(),
+                w1=w1.contiguous(),
+                w2=w2.contiguous(),
+                topk_weights=topk_weights.contiguous(),
+                topk_ids=topk_ids.contiguous(),
+                inplace=False,
+                activation=activation,
+                is_gated=True,
+                apply_router_weight_on_input=False,
+                filter_expert=True,
+                layer_id=layer_id,
+            )
+        
+        # CRITICAL FIX: Also compute PyTorch forward to save intermediates for backward.
+        # This ensures gradient computation uses consistent intermediate values.
+        # Without this, backward uses recomputed PyTorch intermediates that may differ
+        # from triton kernel, causing gradient magnitude mismatch (e.g., 10x smaller).
+        #
+        # NOTE: This adds memory overhead but is necessary for correct gradients.
+        # Set USE_TRITON_BACKWARD_RECOMPUTE=1 to use the old behavior (recompute in backward).
+        if os.environ.get("USE_TRITON_BACKWARD_RECOMPUTE", "0") != "1":
+            num_local_experts = w1.shape[0]
+            topk = topk_ids.shape[1]
+            pytorch_intermediates = {}
+            pytorch_expert_outputs = {}
+            
+            for local_expert_id in range(num_local_experts):
+                mask = (topk_ids == local_expert_id)
+                if not mask.any():
+                    continue
+                
+                token_indices = mask.any(dim=1).nonzero(as_tuple=True)[0]
+                if len(token_indices) == 0:
+                    continue
+                
+                expert_input = hidden_states[token_indices]
+                expert_w1 = w1[local_expert_id]
+                expert_w2 = w2[local_expert_id]
+                
+                # Compute forward (same ops as backward will use)
+                gate_up = torch.nn.functional.linear(expert_input, expert_w1)
+                gate_pre, up = gate_up.chunk(2, dim=-1)
+                
+                if activation == "silu":
+                    gate = torch.nn.functional.silu(gate_pre)
+                elif activation == "gelu":
+                    gate = torch.nn.functional.gelu(gate_pre)
+                else:
+                    raise ValueError(f"Unsupported activation: {activation}")
+                
+                intermediate = gate * up
+                expert_output = torch.nn.functional.linear(intermediate, expert_w2)
+                
+                # Save for backward
+                pytorch_intermediates[local_expert_id] = (token_indices, intermediate.detach(), gate_pre.detach(), up.detach(), gate.detach())
+                pytorch_expert_outputs[local_expert_id] = expert_output.detach()
+            
+            ctx.pytorch_intermediates = pytorch_intermediates
+            ctx.pytorch_expert_outputs = pytorch_expert_outputs
+        else:
+            ctx.pytorch_intermediates = None
+            ctx.pytorch_expert_outputs = None
+        
+        # Mark output as requiring grad if inputs do
+        return output.clone().requires_grad_(hidden_states.requires_grad or w1.requires_grad or w2.requires_grad or topk_weights.requires_grad)
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Backward pass using pure PyTorch operations.
+        
+        IMPORTANT: In EP mode, each rank only computes grad_topk_weights for its local experts.
+        We all-reduce grad_topk_weights across EP ranks so the router receives complete gradients.
+        """
+        hidden_states, w1, w2, topk_weights, topk_ids = ctx.saved_tensors
+        activation = ctx.activation
+        ep_group = ctx.ep_group
+        layer_id = ctx.layer_id
+
+        num_tokens, hidden_size = hidden_states.shape
+        num_local_experts, ffn_hidden_size, _ = w1.shape  # In EP mode, w1 only has local experts!
+        topk = topk_ids.shape[1]
+        
+        # Get EP info to compute global expert IDs
+        if ep_group is not None:
+            ep_world_size = torch.distributed.get_world_size(ep_group)
+            ep_rank = torch.distributed.get_rank(ep_group)
+        else:
+            ep_world_size = 1
+            ep_rank = 0
+        
+        # Initialize gradients
+        grad_hidden_states = torch.zeros_like(hidden_states) if hidden_states.requires_grad else None
+        grad_w1 = torch.zeros_like(w1) if w1.requires_grad else None
+        grad_w2 = torch.zeros_like(w2) if w2.requires_grad else None
+        grad_topk_weights = torch.zeros_like(topk_weights) if topk_weights.requires_grad else None
+
+        # Store expert outputs for grad_topk_weights calculation
+        expert_outputs_cache = {}
+
+        # Check if we have saved intermediates from forward pass
+        pytorch_intermediates = getattr(ctx, 'pytorch_intermediates', None)
+        pytorch_expert_outputs = getattr(ctx, 'pytorch_expert_outputs', None)
+        use_saved_intermediates = (pytorch_intermediates is not None and pytorch_expert_outputs is not None)
+
+        # Process each LOCAL expert (topk_ids contains local IDs in EP mode)
+        for local_expert_id in range(num_local_experts):
+            mask = (topk_ids == local_expert_id)
+            if not mask.any():
+                continue
+            
+            token_indices = mask.any(dim=1).nonzero(as_tuple=True)[0]
+            if len(token_indices) == 0:
+                continue
+            
+            expert_input = hidden_states[token_indices]
+            expert_w1 = w1[local_expert_id]  # Use local ID to index into local weights
+            expert_w2 = w2[local_expert_id]
+            
+            # Get intermediate values: either from saved forward or recompute
+            if use_saved_intermediates and local_expert_id in pytorch_intermediates:
+                saved_token_indices, intermediate, gate_pre, up, gate = pytorch_intermediates[local_expert_id]
+                expert_output = pytorch_expert_outputs[local_expert_id]
+                
+                # Verify token_indices match (sanity check)
+                if not torch.equal(token_indices, saved_token_indices):
+                    raise RuntimeError(
+                        f"Token indices mismatch in backward for expert {local_expert_id}! "
+                        f"This should not happen. backward: {token_indices.shape}, saved: {saved_token_indices.shape}"
+                    )
+            else:
+                # Fallback: recompute forward pass (old behavior, may cause gradient mismatch)
+                gate_up = torch.nn.functional.linear(expert_input, expert_w1)
+                gate_pre, up = gate_up.chunk(2, dim=-1)
+                
+                if activation == "silu":
+                    gate = torch.nn.functional.silu(gate_pre)
+                elif activation == "gelu":
+                    gate = torch.nn.functional.gelu(gate_pre)
+                else:
+                    raise ValueError(f"Unsupported activation: {activation}")
+                
+                intermediate = gate * up
+                expert_output = torch.nn.functional.linear(intermediate, expert_w2)
+            
+            # Cache for grad_topk_weights computation (use local ID as key)
+            if grad_topk_weights is not None:
+                expert_outputs_cache[local_expert_id] = (token_indices, expert_output)
+            
+            # Compute weighted grad_output for this expert
+            expert_grad_output = torch.zeros(len(token_indices), hidden_size,
+                                            dtype=grad_output.dtype, device=grad_output.device)
+            for slot in range(topk):
+                slot_mask = mask[token_indices, slot]
+                if slot_mask.any():
+                    slot_token_indices = token_indices[slot_mask]
+                    slot_weights = topk_weights[slot_token_indices, slot].unsqueeze(-1)
+                    # Map back to expert_grad_output indices
+                    local_indices = slot_mask.nonzero(as_tuple=True)[0]
+                    expert_grad_output[local_indices] += grad_output[slot_token_indices] * slot_weights
+
+            # Backward through down projection: expert_output = linear(intermediate, expert_w2)
+            # linear computes: intermediate @ expert_w2.T
+            # expert_w2 shape: [hidden_size, ffn_hidden_size//2] = [2048, 768]
+            # grad_intermediate = grad_expert_output @ expert_w2 (not w2.T!)
+            # grad_w2 = grad_expert_output.T @ intermediate
+            grad_intermediate = expert_grad_output @ expert_w2.to(expert_grad_output.dtype)
+            if grad_w2 is not None:
+                grad_w2[local_expert_id] += expert_grad_output.T.to(grad_w2.dtype) @ intermediate.to(grad_w2.dtype)
+
+            # Backward through element-wise multiply: intermediate = gate * up
+            grad_gate = grad_intermediate * up
+            grad_up = grad_intermediate * gate
+            
+            # Backward through activation
+            if activation == "silu":
+                sigmoid_gate_pre = torch.sigmoid(gate_pre)
+                grad_gate_pre = grad_gate * sigmoid_gate_pre * (1 + gate_pre * (1 - sigmoid_gate_pre))
+            elif activation == "gelu":
+                # Use autograd for gelu backward
+                gate_pre_detached = gate_pre.detach().requires_grad_(True)
+                with torch.enable_grad():
+                    gate_recompute = torch.nn.functional.gelu(gate_pre_detached)
+                    grad_gate_pre = torch.autograd.grad(
+                        gate_recompute, gate_pre_detached, grad_gate
+                    )[0]
+            
+            # Combine grad_gate_pre and grad_up back to grad_gate_up
+            grad_gate_up = torch.cat([grad_gate_pre, grad_up], dim=-1)
+            
+            # Backward through gate_up projection: gate_up = linear(expert_input, expert_w1)
+            # linear computes: expert_input @ expert_w1.T
+            # expert_w1 shape: [ffn_hidden_size, hidden_size]
+            # grad_expert_input = grad_gate_up @ expert_w1
+            # grad_w1 = grad_gate_up.T @ expert_input
+            if grad_hidden_states is not None:
+                grad_expert_input = grad_gate_up @ expert_w1.to(grad_gate_up.dtype)
+                grad_hidden_states[token_indices] += grad_expert_input.to(grad_hidden_states.dtype)
+            
+            if grad_w1 is not None:
+                grad_w1[local_expert_id] += grad_gate_up.T.to(grad_w1.dtype) @ expert_input.to(grad_w1.dtype)
+        
+        # Compute grad_topk_weights
+        # output[i] = sum_k(topk_weights[i,k] * expert_k(input[i]))
+        # d(output[i]) / d(topk_weights[i,k]) = expert_k(input[i])
+        # grad_topk_weights[i,k] = sum_j(grad_output[i,j] * expert_output_k[i,j])
+        #                       = (grad_output[i] · expert_output_k[i])
+        if grad_topk_weights is not None:
+            for local_expert_id, (token_indices, expert_output) in expert_outputs_cache.items():
+                mask = (topk_ids == local_expert_id)  # Match against LOCAL expert ID!
+                for slot in range(topk):
+                    slot_mask = mask[token_indices, slot]
+                    if slot_mask.any():
+                        slot_token_indices = token_indices[slot_mask]
+                        local_indices = slot_mask.nonzero(as_tuple=True)[0]
+                        # grad_topk_weights[token_idx, slot] = dot(grad_output[token_idx], expert_output[local_idx])
+                        expert_out_selected = expert_output[local_indices]  # [num_selected, hidden_size]
+                        grad_out_selected = grad_output[slot_token_indices]  # [num_selected, hidden_size]
+                        # Element-wise multiply and sum over hidden dimension
+                        grad_weights = (grad_out_selected * expert_out_selected).sum(dim=-1)  # [num_selected]
+                        grad_topk_weights[slot_token_indices, slot] += grad_weights.to(grad_topk_weights.dtype)
+            
+            # All-reduce grad_topk_weights across EP ranks
+            # Each rank only computes gradients for its local experts.
+            if ep_group is not None:
+                ep_world_size = torch.distributed.get_world_size(ep_group)
+                if ep_world_size > 1:
+                    # Use deterministic tree all-reduce to ensure consistent gradient accumulation
+                    if os.environ.get("MEGATRON_USE_DETERMINISTIC_ALLREDUCE", "0") == "1":
+                        grad_topk_weights_reduced = _tree_all_reduce_sum_impl(grad_topk_weights, ep_group)
+                        grad_topk_weights.copy_(grad_topk_weights_reduced)
+                    else:
+                        torch.distributed.all_reduce(grad_topk_weights, group=ep_group)
+        
+        # All-reduce grad_hidden_states across EP ranks
+        # Each rank only computes gradients from its local experts.
+        if grad_hidden_states is not None and ep_group is not None:
+            ep_world_size = torch.distributed.get_world_size(ep_group)
+            if ep_world_size > 1:
+                # Use deterministic tree all-reduce to ensure consistent gradient accumulation
+                if os.environ.get("MEGATRON_USE_DETERMINISTIC_ALLREDUCE", "0") == "1":
+                    grad_hidden_states_reduced = _tree_all_reduce_sum_impl(grad_hidden_states, ep_group)
+                    grad_hidden_states.copy_(grad_hidden_states_reduced)
+                else:
+                    torch.distributed.all_reduce(grad_hidden_states, group=ep_group)
+        
+        # Return gradients for all inputs (None for non-tensor inputs)
+        return grad_hidden_states, grad_w1, grad_w2, grad_topk_weights, None, None, None, None
+
+
+class FusedExpertsTritonBackward(torch.autograd.Function):
+    """
+    Custom autograd function for MoE experts with:
+    - Forward: Uses fused_experts_impl (100% identical to SGLang inference)
+    - Backward: Uses Triton backward kernels for gradient computation
+    
+    This ensures true on-policy (forward matches SGLang exactly) while using
+    Triton kernels for backward to avoid numerical mismatch issues.
+    
+    Key design for EP mode:
+    - grad_w1, grad_w2: No all-reduce needed (each rank has independent experts)
+    - grad_topk_weights: Needs EP all-reduce (router is shared across ranks)
+    - grad_hidden_states: Needs EP all-reduce (each rank only has partial gradients)
+    """
+    
+    @staticmethod
+    def forward(ctx, hidden_states, w1, w2, topk_weights, topk_ids, activation, layer_id, ep_group):
+        """
+        Forward pass using fused_experts_impl - exactly same as SGLang inference.
+        """
+        # CRITICAL: Use torch.no_grad() to prevent PyTorch from building autograd graph
+        # We have our own backward implementation
+        with torch.no_grad():
+            # Use fused_experts_impl for forward - 100% identical to SGLang
+            # This ensures true on-policy: training forward = inference forward
+            output = fused_experts_impl(
+                hidden_states=hidden_states.contiguous(),
+                w1=w1.contiguous(),
+                w2=w2.contiguous(),
+                topk_weights=topk_weights.contiguous(),
+                topk_ids=topk_ids.contiguous(),
+                inplace=False,
+                activation=activation,
+                is_gated=True,
+                apply_router_weight_on_input=False,
+                filter_expert=True,
+                layer_id=layer_id,
+            )
+        
+        # Save tensors for backward
+        ctx.save_for_backward(hidden_states, w1, w2, topk_weights, topk_ids)
+        ctx.activation = activation
+        ctx.ep_group = ep_group
+        ctx.layer_id = layer_id
+        
+        return output
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        """
+        Backward pass using Triton backward kernels.
+        
+        We recompute intermediates using the same Triton kernels as forward,
+        then use invoke_fused_moe_backward_kernel for gradient computation.
+        """
+        hidden_states, w1, w2, topk_weights, topk_ids = ctx.saved_tensors
+        activation = ctx.activation
+        ep_group = ctx.ep_group
+        layer_id = ctx.layer_id
+        
+        num_tokens, hidden_size = hidden_states.shape
+        E, N, K = w1.shape  # E=num_experts, N=ffn_hidden_size, K=hidden_size
+        topk = topk_ids.shape[1]
+
+        # Use deterministic config (same as GateUpProjFunction/DownProjFunction use)
+        config = {
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 32,
+            "GROUP_SIZE_M": 8,
+        }
+        compute_type = tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
+
+        # Initialize gradient tensors
+        grad_hidden_states = torch.zeros_like(hidden_states)
+        grad_w1 = torch.zeros_like(w1)
+        grad_w2 = torch.zeros_like(w2)
+        grad_topk_weights = torch.zeros_like(topk_weights)
+        
+        CHUNK_SIZE = 64 * 1024
+        
+        for chunk in range((num_tokens // CHUNK_SIZE) + 1):
+            begin_idx, end_idx = chunk * CHUNK_SIZE, min((chunk + 1) * CHUNK_SIZE, num_tokens)
+            if begin_idx >= end_idx:
+                continue
+            
+            curr_tokens = end_idx - begin_idx
+            curr_hidden = hidden_states[begin_idx:end_idx]
+            curr_topk_ids = topk_ids[begin_idx:end_idx]
+            curr_topk_weights = topk_weights[begin_idx:end_idx]
+            curr_grad_output = grad_output[begin_idx:end_idx]
+            
+            # Get sorted token/expert metadata
+            sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+                curr_topk_ids, config["BLOCK_SIZE_M"], E
+            )
+            
+            # ============ Recompute forward intermediates ============
+            # Step 1: GateUpProj - hidden @ w1 -> intermediate_cache1
+            intermediate_cache1 = torch.empty(
+                (curr_tokens * topk, N),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+            invoke_fused_moe_kernel(
+                curr_hidden,
+                w1,
+                None,  # b1
+                intermediate_cache1,
+                None, None, None,  # scales
+                curr_topk_weights,
+                curr_topk_ids,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                False,  # MUL_ROUTED_WEIGHT
+                topk,
+                config,
+                compute_type=compute_type,
+                use_fp8_w8a8=False,
+                use_int8_w8a8=False,
+                use_int8_w8a16=False,
+                use_int4_w4a16=False,
+                per_channel_quant=False,
+                block_shape=None,
+                c_sorted=False,
+                filter_expert=True,
+            )
+            
+            # Step 2: SiluAndMul
+            intermediate_cache2 = torch.empty(
+                (curr_tokens * topk, N // 2),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+            silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+
+            # ============ Backward pass ============
+            # Step 3: Backward through DownProj (w2)
+            # grad_output shape: [curr_tokens, hidden_size]
+            # Need to expand to [curr_tokens, topk, hidden_size] for backward
+            grad_intermediate_cache3 = curr_grad_output.unsqueeze(1).expand(
+                curr_tokens, topk, hidden_size
+            ).contiguous()
+
+            # Get new sorted indices for down projection (with topk=1 per slot)
+            sorted_token_ids_down, expert_ids_down, num_tokens_post_padded_down = moe_align_block_size(
+                curr_topk_ids, config["BLOCK_SIZE_M"], E
+            )
+            
+            # Backward for w2: intermediate_cache2 @ w2 * topk_weights -> output
+            grad_intermediate_cache2 = torch.zeros_like(intermediate_cache2)
+            curr_grad_w2 = torch.zeros_like(w2)
+            curr_grad_topk_weights = torch.zeros_like(curr_topk_weights)
+            
+            invoke_fused_moe_backward_kernel(
+                grad_output=grad_intermediate_cache3,
+                input=intermediate_cache2,
+                weight=w2,
+                grad_input=grad_intermediate_cache2,
+                grad_weight=curr_grad_w2,
+                grad_topk_weights=curr_grad_topk_weights,
+                topk_weights=curr_topk_weights,
+                topk_ids=curr_topk_ids,
+                sorted_token_ids=sorted_token_ids_down,
+                expert_ids=expert_ids_down,
+                num_tokens_post_padded=num_tokens_post_padded_down,
+                mul_routed_weight=True,  # DownProj applies routing weights
+                top_k=1,  # Per-slot processing
+                config=config,
+                compute_type=compute_type,
+            )
+            
+            grad_w2 += curr_grad_w2
+            grad_topk_weights[begin_idx:end_idx] = curr_grad_topk_weights
+
+            # Step 4: Backward through SiluAndMul
+            # silu_and_mul: silu(gate) * up
+            x1, x2 = intermediate_cache1.view(-1, N).chunk(2, dim=-1)
+            silu_x1 = torch.nn.functional.silu(x1)
+            sig = torch.sigmoid(x1)
+            dsilu_dx1 = sig + x1 * sig * (1 - sig)
+            grad_x1 = grad_intermediate_cache2 * x2 * dsilu_dx1
+            grad_x2 = grad_intermediate_cache2 * silu_x1
+            grad_intermediate_cache1 = torch.cat([grad_x1, grad_x2], dim=-1)
+
+            # Step 5: Backward through GateUpProj (w1)
+            curr_grad_hidden = torch.zeros_like(curr_hidden)
+            curr_grad_w1 = torch.zeros_like(w1)
+            
+            invoke_fused_moe_backward_kernel(
+                grad_output=grad_intermediate_cache1,
+                input=curr_hidden,
+                weight=w1,
+                grad_input=curr_grad_hidden,
+                grad_weight=curr_grad_w1,
+                grad_topk_weights=None,  # GateUpProj doesn't use routing weights
+                topk_weights=curr_topk_weights,
+                topk_ids=curr_topk_ids,
+                sorted_token_ids=sorted_token_ids,
+                expert_ids=expert_ids,
+                num_tokens_post_padded=num_tokens_post_padded,
+                mul_routed_weight=False,
+                top_k=topk,
+                config=config,
+                compute_type=compute_type,
+            )
+
+            grad_hidden_states[begin_idx:end_idx] = curr_grad_hidden
+            grad_w1 += curr_grad_w1
+
+        # EP all-reduce for router and upstream gradients
+        if ep_group is not None:
+            ep_world_size = torch.distributed.get_world_size(ep_group)
+            if ep_world_size > 1:
+                torch.distributed.all_reduce(grad_topk_weights, group=ep_group)
+                torch.distributed.all_reduce(grad_hidden_states, group=ep_group)
+
+        return grad_hidden_states, grad_w1, grad_w2, grad_topk_weights, None, None, None, None
+
+
+def _sglang_fused_experts_with_triton_backward(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    activation: str,
+    layer_number: int,
+    ep_group,
+) -> torch.Tensor:
+    """
+    MoE expert computation with:
+    - Forward: fused_experts_impl (100% identical to SGLang inference) 
+    - Backward: Triton backward kernels
+    
+    This ensures TRUE ON-POLICY: training forward = inference forward,
+    while using Triton kernels for backward to get correct gradients.
+    
+    Enable with USE_TRITON_BACKWARD=1 environment variable.
+    """
+    if not HAVE_TRITON_BACKWARD:
+        raise RuntimeError(
+            "Triton backward functions not available. "
+            "Make sure megatron.core.transformer.moe.sgl_fused_moe is properly installed."
+        )
+    
+    output = FusedExpertsTritonBackward.apply(
+        hidden_states.contiguous(),
+        w1.contiguous(),
+        w2.contiguous(),
+        topk_weights.contiguous(),
+        topk_ids.contiguous(),
+        activation,
+        layer_number,
+        ep_group,
+    )
+    
+    return output
+
+
+def _pytorch_fused_experts_forward(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    activation: str,
+    layer_number: int,
+    ep_group,
+) -> torch.Tensor:
+    """Pure PyTorch forward for MoE expert computation with natural autograd.
+    
+    This function computes the same result as FusedExpertsFunction but uses
+    standard PyTorch ops that enable natural autograd gradient computation.
+    Use this for debugging gradient issues by comparing with the custom backward.
+    
+    Enable with USE_PYTORCH_MOE_FORWARD=1 environment variable.
+    
+    Args:
+        hidden_states: Input tensor [num_tokens, hidden_size]
+        w1: Gate/up projection weights [num_local_experts, ffn_hidden_size, hidden_size]
+        w2: Down projection weights [num_local_experts, hidden_size, ffn_hidden_size//2]
+        topk_weights: Router weights [num_tokens, topk]
+        topk_ids: Expert indices [num_tokens, topk] (LOCAL expert IDs, -1 for remote)
+        activation: Activation function name ("silu" or "gelu")
+        layer_number: Layer index for debugging
+        ep_group: Expert parallel process group for all-reducing output
+        
+    Returns:
+        output: Output tensor [num_tokens, hidden_size]
+    """
+    import torch.distributed as dist
+    
+    num_tokens, hidden_size = hidden_states.shape
+    num_local_experts = w1.shape[0]
+    topk = topk_ids.shape[1]
+    
+    # Initialize output
+    output = torch.zeros(num_tokens, hidden_size, dtype=hidden_states.dtype, device=hidden_states.device)
+    
+    # Process each LOCAL expert
+    for local_expert_id in range(num_local_experts):
+        # Find tokens that selected this expert
+        mask = (topk_ids == local_expert_id)
+        if not mask.any():
+            continue
+        
+        token_indices = mask.any(dim=1).nonzero(as_tuple=True)[0]
+        if len(token_indices) == 0:
+            continue
+        
+        # Get expert input
+        expert_input = hidden_states[token_indices]  # [num_tokens_for_expert, hidden_size]
+        expert_w1 = w1[local_expert_id]  # [ffn_hidden_size, hidden_size]
+        expert_w2 = w2[local_expert_id]  # [hidden_size, ffn_hidden_size//2]
+        
+        # Forward through expert
+        gate_up = torch.nn.functional.linear(expert_input, expert_w1)
+        gate_pre, up = gate_up.chunk(2, dim=-1)
+        
+        if activation == "silu":
+            gate = torch.nn.functional.silu(gate_pre)
+        elif activation == "gelu":
+            gate = torch.nn.functional.gelu(gate_pre)
+        else:
+            raise ValueError(f"Unsupported activation: {activation}")
+        
+        intermediate = gate * up
+        expert_output = torch.nn.functional.linear(intermediate, expert_w2)
+        
+        # Apply router weights and accumulate output
+        for slot in range(topk):
+            slot_mask = mask[token_indices, slot]
+            if slot_mask.any():
+                slot_token_indices = token_indices[slot_mask]
+                slot_weights = topk_weights[slot_token_indices, slot].unsqueeze(-1)
+                local_indices = slot_mask.nonzero(as_tuple=True)[0]
+                weighted_output = expert_output[local_indices] * slot_weights
+                output[slot_token_indices] += weighted_output.to(output.dtype)
+    
+    # All-reduce output across EP ranks
+    # IMPORTANT: Use autograd-aware all-reduce so gradients flow correctly
+    if ep_group is not None:
+        ep_world_size = dist.get_world_size(ep_group)
+        if ep_world_size > 1:
+            # Use the autograd-aware _tree_all_reduce_sum for proper backward support
+            from megatron.core.tensor_parallel.mappings import _tree_all_reduce_sum
+            output = _tree_all_reduce_sum(output, ep_group, layer_id=layer_number)
+    
+    return output
+
+
+def sglang_fused_experts(
+    layer_number: int,
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    activation: str = "silu",
+    apply_router_weight_on_input: bool = False,
+    # EP parameters (new)
+    num_experts: Optional[int] = None,
+    num_local_experts: Optional[int] = None,
+    ep_rank: int = 0,
+    ep_size: int = 1,
+    ep_group = None,
+):
+    """Call fused experts implementation for deterministic MoE computation.
+
+    Forward: Uses SGLang's fused_experts_impl (triton kernel) for bitwise identical results
+    Backward: Uses custom autograd function for gradient computation
+
+    Args:
+        hidden_states: Input tensor [num_tokens, hidden_size]
+        w1: Gate/up projection weights [num_local_experts, ffn_hidden_size, hidden_size]
+        w2: Down projection weights [num_local_experts, hidden_size, ffn_hidden_size//2]
+        topk_weights: Router weights [num_tokens, topk]
+        topk_ids: Expert indices [num_tokens, topk] (global expert ids)
+        activation: Activation function name ("silu" or "gelu")
+        apply_router_weight_on_input: Whether to apply router weight on input
+        num_experts: Total number of experts (global)
+        num_local_experts: Number of local experts on this rank
+        ep_rank: Expert parallel rank
+        ep_size: Expert parallel world size
+        ep_group: Expert parallel process group for all-reducing grad_topk_weights
+
+    Returns:
+        output: Output tensor [num_tokens, hidden_size]
+    """
+    if not HAVE_SGLANG_FUSED_EXPERTS:
+        raise ImportError(
+            "SGLang's fused_experts_impl is required. Please install sglang."
+        )
+
+    # EP mode: convert global expert ids to local expert ids
+    # This matches SGLang's StandardDispatcher behavior
+    local_expert_mapping = None
+    if ep_size > 1 and num_experts is not None and num_local_experts is not None:
+        # Create global -> local expert mapping
+        # Non-local experts are mapped to -1 (will be skipped)
+        local_expert_mapping = torch.full(
+            (num_experts,), -1, dtype=torch.int32, device=topk_ids.device
+        )
+        local_start = ep_rank * num_local_experts
+        local_expert_mapping[local_start : local_start + num_local_experts] = torch.arange(
+            0, num_local_experts, dtype=torch.int32, device=topk_ids.device
+        )
+        
+        # Convert topk_ids from global to local
+        topk_ids_local = local_expert_mapping[topk_ids.long()]
+    else:
+        topk_ids_local = topk_ids.to(torch.int32)
+
+    # Choose which backward implementation to use:
+    # 1. USE_TRITON_BACKWARD=1: Use triton backward kernels (recommended for correct gradients)
+    # 2. USE_PYTORCH_MOE_FORWARD=1: Use pure PyTorch forward+backward (for debugging)
+    # 3. Default: Use triton forward + PyTorch backward (may cause gradient mismatch!)
+    
+    use_triton_backward = os.environ.get("USE_TRITON_BACKWARD", "0") == "1"
+    use_pytorch_forward = os.environ.get("USE_PYTORCH_MOE_FORWARD", "0") == "1"
+    
+    if use_triton_backward and HAVE_TRITON_BACKWARD:
+        # RECOMMENDED: Use triton backward kernels for correct gradient computation
+        # This ensures forward and backward use the same triton kernels, avoiding numerical mismatch
+        output = _sglang_fused_experts_with_triton_backward(
+            hidden_states.contiguous(),
+            w1.contiguous(),
+            w2.contiguous(),
+            topk_weights.contiguous(),
+            topk_ids_local.contiguous(),
+            activation,
+            layer_number,
+            ep_group,
+        )
+    elif use_pytorch_forward:
+        # DEBUG: Use pure PyTorch forward for gradient comparison
+        # Enable with USE_PYTORCH_MOE_FORWARD=1 to bypass triton kernel and use PyTorch ops
+        # This allows autograd to compute gradients naturally, helping diagnose if the
+        # custom backward in FusedExpertsFunction is causing gradient magnitude issues
+        output = _pytorch_fused_experts_forward(
+            hidden_states.contiguous(),
+            w1.contiguous(),
+            w2.contiguous(),
+            topk_weights.contiguous(),
+            topk_ids_local.contiguous(),
+            activation,
+            layer_number,
+            ep_group,
+        )
+    else:
+        # Default: Use custom autograd function with triton forward + PyTorch backward
+        # WARNING: This may cause gradient magnitude mismatch due to numerical differences
+        # between triton and PyTorch implementations!
+        # Pass ep_group so grad_topk_weights can be all-reduced across EP ranks
+        output = FusedExpertsFunction.apply(
+            hidden_states.contiguous(),
+            w1.contiguous(),
+            w2.contiguous(),
+            topk_weights.contiguous(),
+            topk_ids_local.contiguous(),
+            activation,
+            layer_number,
+            ep_group,
+        )
+
+    return output
 
 
 def unpermute(

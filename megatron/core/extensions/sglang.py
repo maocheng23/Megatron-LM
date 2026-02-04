@@ -43,6 +43,7 @@ from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
+    get_expert_data_parallel_rank,
     get_expert_model_parallel_rank,
     get_expert_model_parallel_world_size,
 )
@@ -60,18 +61,18 @@ logger = logging.getLogger(__name__)
 
 
 def _print_sglang_log(message: str, level: int = logging.INFO):
-    """Print SGLang log message on rank 0 in distributed training."""
+    """logger.info SGLang log message on rank 0 in distributed training."""
     log_single_rank(logger, level, message)
-    # Also print to stdout for visibility
+    # Also logger.info to stdout for visibility
     try:
         if torch.distributed.is_initialized():
             if torch.distributed.get_rank() == 0:
-                print(message, flush=True)
+                logger.info(message,  )
         else:
-            print(message, flush=True)
+            logger.info(message,  )
     except Exception:
         # Fallback if distributed is not available
-        print(message, flush=True)
+        logger.info(message,  )
 
 
 # =============================================================================
@@ -252,6 +253,7 @@ class SGLangLinear(MegatronModule):
         layer_number: Optional[int] = None,
         is_expert: bool = False,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        stride: int = 1,
     ):
         super().__init__(config=config)
 
@@ -262,6 +264,7 @@ class SGLangLinear(MegatronModule):
         self.is_expert = is_expert
         self.skip_bias_add = skip_bias_add
         self.layer_number = layer_number
+        self.stride = stride
 
         # Determine device and dtype
         if config.init_model_with_meta_device:
@@ -295,6 +298,19 @@ class SGLangLinear(MegatronModule):
             )
             if config.perform_initialization and device != 'meta':
                 init_method(self.weight)
+            
+            # Set TP attributes for weight update/checkpoint compatibility
+            # NOTE: partition_stride tracks stride-based sharding so TP weight
+            # reconstruction can restore GLU gate/up layout when stride > 1.
+            partition_stride = stride if parallel_mode in ("column", "row") and self.tp_size > 1 else 1
+            if parallel_mode in ("column", "row") and self.tp_size > 1:
+                setattr(self.weight, 'tensor_model_parallel', True)
+                setattr(self.weight, 'partition_dim', 0 if parallel_mode == "column" else 1)
+                setattr(self.weight, 'partition_stride', partition_stride)
+            else:
+                setattr(self.weight, 'tensor_model_parallel', False)
+                setattr(self.weight, 'partition_dim', -1)
+                setattr(self.weight, 'partition_stride', 1)
         else:
             self.register_parameter('weight', None)
 
@@ -303,6 +319,15 @@ class SGLangLinear(MegatronModule):
             self.bias = nn.Parameter(
                 torch.zeros(local_output_size, dtype=dtype, device=device)
             )
+            # Set TP attributes for bias (column parallel has sharded bias)
+            if parallel_mode == "column" and self.tp_size > 1:
+                setattr(self.bias, 'tensor_model_parallel', True)
+                setattr(self.bias, 'partition_dim', 0)
+                setattr(self.bias, 'partition_stride', partition_stride)
+            else:
+                setattr(self.bias, 'tensor_model_parallel', False)
+                setattr(self.bias, 'partition_dim', -1)
+                setattr(self.bias, 'partition_stride', 1)
         else:
             self.register_parameter('bias', None)
 
@@ -357,6 +382,10 @@ class SGLangColumnParallelLinear(SGLangLinear):
 
     Equivalent to KitchenColumnParallelLinear.
     Splits output dimension across TP ranks.
+    
+    IMPORTANT: Column parallel linear requires all-reduce of grad_input in backward.
+    This is achieved by using copy_to_tensor_model_parallel_region before the matmul,
+    which has identity forward but all-reduce backward.
     """
 
     def __init__(
@@ -394,9 +423,18 @@ class SGLangColumnParallelLinear(SGLangLinear):
             tp_comm_buffer_name=tp_comm_buffer_name,
             layer_number=layer_number,
             tp_group=tp_group,
+            stride=stride,
         )
 
         self.stride = stride
+
+    def forward(self, x: Tensor) -> Tuple[Tensor, Optional[Tensor]]:
+        from megatron.core.tensor_parallel.mappings import copy_to_tensor_model_parallel_region
+        
+        if self.tp_size > 1 and self.tp_group is not None:
+            x = copy_to_tensor_model_parallel_region(x, group=self.tp_group)
+        
+        return super().forward(x)
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 0, bias sharded."""
@@ -412,6 +450,13 @@ class SGLangRowParallelLinear(SGLangLinear):
 
     Equivalent to KitchenRowParallelLinear.
     Splits input dimension across TP ranks.
+    
+    IMPORTANT: Row parallel linear requires all_reduce after GEMM to combine
+    partial results from all TP ranks.
+    
+    For MoE true on-policy mode, set reduce_results=False to skip all-reduce here,
+    and let the all-reduce happen in transformer_layer._forward_mlp with tree_all_reduce
+    to match SGLang's numerical path exactly.
     """
 
     def __init__(
@@ -428,6 +473,7 @@ class SGLangRowParallelLinear(SGLangLinear):
         tp_comm_buffer_name: Optional[str] = None,
         layer_number: Optional[int] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        reduce_results: bool = True,
     ):
         if not input_is_parallel:
             raise ValueError("SGLang linear layers do not support input_is_parallel = False")
@@ -447,6 +493,41 @@ class SGLangRowParallelLinear(SGLangLinear):
             layer_number=layer_number,
             tp_group=tp_group,
         )
+        
+        self.reduce_results = reduce_results
+
+    def forward(self, x: Tensor) -> Tuple[Tensor, Optional[Tensor]]:
+        """Forward pass with all_reduce for row parallelism.
+        
+        Row parallel linear splits the input along the last dimension.
+        Each rank computes a partial result, then all_reduce combines them.
+        
+        For SGLang true on-policy mode, uses tree_all_reduce instead of standard
+        NCCL all_reduce to match SGLang's tensor_model_parallel_tree_all_reduce
+        for numerical consistency.
+        """
+        # Call parent's forward to get partial result
+        output_before, bias = super().forward(x)
+        
+        # CRITICAL: all_reduce to combine partial results from all TP ranks
+        # Without this, each rank only has its partial computation
+        if self.reduce_results and self.tp_size > 1 and self.tp_group is not None:
+            # Check if we should use tree_all_reduce for SGLang true on-policy mode
+            use_tree_allreduce = getattr(self.config, 'use_sglang', False)
+            
+            if use_tree_allreduce:
+                # Use tree_all_reduce for SGLang true on-policy mode
+                # This matches SGLang's tensor_model_parallel_tree_all_reduce
+                from megatron.core.tensor_parallel.mappings import _tree_all_reduce_sum
+                output = _tree_all_reduce_sum(output_before, self.tp_group)
+            else:
+                # Standard NCCL all_reduce
+                from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
+                output = reduce_from_tensor_model_parallel_region(output_before, group=self.tp_group)
+        else:
+            output = output_before
+        
+        return output, bias
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 1, bias not sharded."""
@@ -519,30 +600,48 @@ class SGLangGroupedLinear(MegatronModule):
             elif parallel_mode == "row":
                 local_input_size = divide(input_size, self.tp_size)
 
-        # Initialize weights for each expert
-        self.weights = nn.ParameterList([
-            nn.Parameter(
+        # Initialize weights for each expert using TE-compatible naming (weight0, weight1, etc.)
+        # This matches TEGroupedLinear's naming convention for checkpoint compatibility
+        self.use_bias = bias and not skip_bias_add
+        for i in range(num_gemms):
+            weight = nn.Parameter(
                 torch.empty(local_output_size, local_input_size, dtype=dtype, device=device)
             )
-            for _ in range(num_gemms)
-        ])
+            self.register_parameter(f'weight{i}', weight)
 
-        if config.perform_initialization and device != 'meta':
-            for weight in self.weights:
+            if config.perform_initialization and device != 'meta':
                 init_method(weight)
 
-        # Initialize biases
-        if bias and not skip_bias_add:
-            self.biases = nn.ParameterList([
-                nn.Parameter(torch.zeros(local_output_size, dtype=dtype, device=device))
-                for _ in range(num_gemms)
-            ])
-        else:
-            self.biases = None
+            # Set TP attributes for weights (for weight update/checkpoint compatibility)
+            if self.explicit_expert_comm and self.tp_size > 1:
+                setattr(weight, 'tensor_model_parallel', True)
+                setattr(weight, 'partition_dim', 0 if parallel_mode == "column" else 1)
+                setattr(weight, 'partition_stride', 1)
+            else:
+                setattr(weight, 'tensor_model_parallel', False)
+                setattr(weight, 'partition_dim', -1)
+                setattr(weight, 'partition_stride', 1)
 
-        # Set gradient attributes
-        for weight in self.weights:
+            # Set gradient attributes
             weight.allreduce = not (is_expert and self.expert_parallel)
+
+        # Initialize biases using TE-compatible naming (bias0, bias1, etc.)
+        if self.use_bias:
+            for i in range(num_gemms):
+                bias_param = nn.Parameter(
+                    torch.zeros(local_output_size, dtype=dtype, device=device)
+                )
+                self.register_parameter(f'bias{i}', bias_param)
+
+                # Set TP attributes for biases
+                if self.explicit_expert_comm and parallel_mode == "column" and self.tp_size > 1:
+                    setattr(bias_param, 'tensor_model_parallel', True)
+                    setattr(bias_param, 'partition_dim', 0)
+                    setattr(bias_param, 'partition_stride', 1)
+                else:
+                    setattr(bias_param, 'tensor_model_parallel', False)
+                    setattr(bias_param, 'partition_dim', -1)
+                    setattr(bias_param, 'partition_stride', 1)
 
     def forward(self, x: Tensor, m_splits: List[int]) -> Tuple[Tensor, Optional[Tensor]]:
         """
@@ -560,14 +659,16 @@ class SGLangGroupedLinear(MegatronModule):
                 expert_input = x[offset:offset + num_tokens]
                 expert_input = expert_input.view(-1, expert_input.size(-1))
 
-                if self.biases is not None:
+                weight = getattr(self, f'weight{i}')
+                if self.use_bias:
+                    bias = getattr(self, f'bias{i}')
                     expert_output = sglang_addmm(
-                        self.biases[i].unsqueeze(0).expand(expert_input.size(0), -1),
+                        bias.unsqueeze(0).expand(expert_input.size(0), -1),
                         expert_input,
-                        self.weights[i].t(),
+                        weight.t(),
                     )
                 else:
-                    expert_output = sglang_mm(expert_input, self.weights[i].t())
+                    expert_output = sglang_mm(expert_input, weight.t())
 
                 outputs.append(expert_output)
             offset += num_tokens
@@ -577,22 +678,32 @@ class SGLangGroupedLinear(MegatronModule):
         else:
             output = x.new_empty(0, self.output_size)
 
-        if self.skip_bias_add and self.biases is not None:
+        if self.skip_bias_add and self.use_bias:
             # Return concatenated biases (same size as output)
             return output, None  # Bias handling for grouped is complex
         return output, None
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
-        """Sharded state dict for distributed checkpointing."""
+        """Sharded state dict for distributed checkpointing.
+
+        Matches TE's _sharded_state_dict_grouped format for compatibility with TEGroupedMLP.
+        Returns dict keys in format: {prefix}weight{idx}, {prefix}bias{idx}
+        """
+        from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
+
+        singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
         sharded_state_dict = {}
         num_global_experts = get_expert_model_parallel_world_size() * self.num_gemms
         local_expert_indices_offset = get_expert_model_parallel_rank() * self.num_gemms
         ep_axis = len(sharded_offsets)
 
         for gemm_idx in range(self.num_gemms):
-            state_dict = {f"{gemm_idx}.weight": self.weights[gemm_idx]}
-            if self.biases is not None:
-                state_dict[f"{gemm_idx}.bias"] = self.biases[gemm_idx]
+            global_expert_idx = local_expert_indices_offset + gemm_idx
+            # Create state dict with indexed keys (matching TE format)
+            # Use getattr to access weight{i} and bias{i} parameters
+            state_dict = {f"{gemm_idx}.weight": getattr(self, f'weight{gemm_idx}')}
+            if self.use_bias:
+                state_dict[f"{gemm_idx}.bias"] = getattr(self, f'bias{gemm_idx}')
 
             tp_axis_map = {}
             if self.parallel_mode == "column":
@@ -600,22 +711,50 @@ class SGLangGroupedLinear(MegatronModule):
             elif self.parallel_mode == "row":
                 tp_axis_map = {f"{gemm_idx}.weight": 1}
 
+            # Determine expert prefix for ShardedTensor.key (matches TE logic)
+            if singleton_local_shards:
+                expert_prefix = f"{global_expert_idx}.{prefix}"
+                new_sharded_offsets = sharded_offsets
+            else:
+                expert_prefix = prefix
+                new_sharded_offsets = (
+                    *sharded_offsets,
+                    (ep_axis, global_expert_idx, num_global_experts),
+                )
+
+            # Create sharded tensors with empty prefix (like TE)
+            # IMPORTANT: Pass tp_group to use expert_tensor_parallel_group for MoE experts
             sub_sd = make_sharded_tensors_for_checkpoint(
                 state_dict,
-                "",
+                '',  # Empty prefix, will be set by replace_prefix_for_sharding
                 tp_axis_map,
-                (
-                    *sharded_offsets,
-                    (ep_axis, local_expert_indices_offset + gemm_idx, num_global_experts),
-                ),
+                new_sharded_offsets,
+                tp_group=self.tp_group,  # Use expert TP group, not default TP group
             )
-            sharded_state_dict.update(sub_sd)
+
+            # Update ShardedTensor.key from "{idx}." to expert_prefix (matching TE)
+            replace_prefix_for_sharding(sub_sd, f"{gemm_idx}.", expert_prefix)
+
+            # Add to result dict with TE-compatible keys: {prefix}weight{idx}, {prefix}bias{idx}
+            sharded_state_dict[f"{prefix}weight{gemm_idx}"] = sub_sd[f"{gemm_idx}.weight"]
+            if self.use_bias:
+                sharded_state_dict[f"{prefix}bias{gemm_idx}"] = sub_sd[f"{gemm_idx}.bias"]
+
+        # Adjust replica ids - replication along DP modulo EP (matching TE)
+        for k, sh_ten in sharded_state_dict.items():
+            replica_id = sh_ten.replica_id
+            if len(replica_id) == 3:
+                sh_ten.replica_id = (*replica_id[:2], get_expert_data_parallel_rank())
 
         return sharded_state_dict
 
 
 class SGLangColumnParallelGroupedLinear(SGLangGroupedLinear):
-    """Column-parallel grouped linear for MoE."""
+    """Column-parallel grouped linear for MoE.
+    
+    IMPORTANT: Column parallel grouped linear requires all-reduce of grad_input 
+    in backward. This is achieved by using copy_to_tensor_model_parallel_region.
+    """
 
     def __init__(
         self,
@@ -647,9 +786,26 @@ class SGLangColumnParallelGroupedLinear(SGLangGroupedLinear):
             tp_group=tp_group,
         )
 
+    def forward(self, x: Tensor, m_splits: List[int]) -> Tuple[Tensor, Optional[Tensor]]:
+        """Forward pass with proper TP communication for MoE.
+        
+        Uses copy_to_tensor_model_parallel_region to ensure grad_input is
+        all-reduced in backward pass when using TP for experts.
+        """
+        from megatron.core.tensor_parallel.mappings import copy_to_tensor_model_parallel_region
+        
+        if self.tp_size > 1 and self.tp_group is not None and self.explicit_expert_comm:
+            x = copy_to_tensor_model_parallel_region(x, group=self.tp_group)
+        
+        return super().forward(x, m_splits)
+
 
 class SGLangRowParallelGroupedLinear(SGLangGroupedLinear):
-    """Row-parallel grouped linear for MoE."""
+    """Row-parallel grouped linear for MoE.
+    
+    IMPORTANT: Row parallel grouped linear requires all_reduce after GEMM
+    to combine partial results from all TP ranks (when not using expert parallel).
+    """
 
     def __init__(
         self,
@@ -681,6 +837,23 @@ class SGLangRowParallelGroupedLinear(SGLangGroupedLinear):
             tp_group=tp_group,
         )
 
+    def forward(self, x: Tensor, m_splits: List[int]) -> Tuple[Tensor, Optional[Tensor]]:
+        """Forward pass with all_reduce for row parallelism.
+        
+        Row parallel grouped linear splits the input along the last dimension.
+        Each rank computes a partial result, then all_reduce combines them.
+        """
+        # Call parent's forward to get partial result
+        output, bias = super().forward(x, m_splits)
+        
+        # CRITICAL: all_reduce to combine partial results from all TP ranks
+        # Skip if using explicit expert comm (EP handles communication differently)
+        if self.tp_size > 1 and self.tp_group is not None and not self.explicit_expert_comm:
+            from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
+            output = reduce_from_tensor_model_parallel_region(output, group=self.tp_group)
+        
+        return output, bias
+
 
 # =============================================================================
 # SGLang Normalization Layers
@@ -689,6 +862,12 @@ class SGLangRowParallelGroupedLinear(SGLangGroupedLinear):
 class SGLangRMSNorm(MegatronModule):
     """
     RMSNorm matching SGLang's FSDP-compatible numerical paths.
+    
+    When residual is provided (for MoE pre_mlp_layernorm), this matches SGLang's
+    RMSNorm.forward_native with fp32_residual=False:
+    1. x = x + residual (bf16 add)
+    2. residual = x.clone()
+    3. RMSNorm computation in FP32
     """
 
     def __init__(
@@ -701,6 +880,7 @@ class SGLangRMSNorm(MegatronModule):
 
         self.hidden_size = hidden_size
         self.eps = eps
+        self.variance_epsilon = eps  # Alias for compatibility
 
         if config.init_model_with_meta_device:
             device = 'meta'
@@ -711,14 +891,29 @@ class SGLangRMSNorm(MegatronModule):
         self.weight = nn.Parameter(
             torch.ones(hidden_size, dtype=torch.float32, device=device)
         )
-
-    def forward(self, x: Tensor) -> Tensor:
+    
+    def forward(self, x: Tensor, residual: Tensor = None):
         """Forward matching SGLang's forward_native with FSDP settings.
+        
+        Args:
+            x: Input tensor (attention output for MoE, or already-resadded for Dense)
+            residual: Optional residual tensor. When provided (MoE case), performs
+                     bf16 residual add inside LayerNorm to match SGLang exactly.
+        
+        Returns:
+            If residual is None: normalized tensor
+            If residual is provided: (normalized tensor, updated residual)
         """
         if not x.is_contiguous():
             x = x.contiguous()
         
-        orig_dtype = x.dtype  # Use input dtype (for Q/K norms and intermediate norms)
+        orig_dtype = x.dtype
+        
+        # If residual is provided, do resadd in bf16 (matching SGLang's fp32_residual=False)
+        if residual is not None:
+            x = x + residual  # bf16 add, matching SGLang
+            residual = x.clone()  # Update residual to resadd result, matching SGLang
+        
         x = x.to(torch.float32)
         
         # RMSNorm computation in FP32
@@ -726,8 +921,11 @@ class SGLangRMSNorm(MegatronModule):
         x = x * torch.rsqrt(variance + self.eps)
         
         # cast_x_before_out_mul=True: weight * x.to(orig_dtype)
+        # Match SGLang exactly - don't add extra dtype conversion
         x = self.weight * x.to(orig_dtype)
         
+        if residual is not None:
+            return x, residual
         return x
 
 
@@ -967,7 +1165,8 @@ class SGLangLayerNormColumnParallelLinear(MegatronModule):
 
     def forward(self, x: Tensor) -> Tuple[Tensor, Optional[Tensor]]:
         normed = self.norm(x)
-        return self.linear(normed)
+        linear_output, _ = self.linear(normed)
+        return linear_output, None
 
     def state_dict(self, *args, prefix="", keep_vars=False, **kwargs):
         """State dict with TE-compatible key names for checkpoint compatibility."""
@@ -1586,7 +1785,7 @@ class SGLangSpecProvider(BackendSpecProvider):
                 "Please install flash-attn>=3.0.0 or set use_sglang_attention=False."
             )
 
-        # Print clear initialization message
+        # logger.info clear initialization message
         _print_sglang_log("=" * 80)
         _print_sglang_log("🔧 SGLANG KERNEL: Initializing SGLangSpecProvider")
         _print_sglang_log(f"   - use_sglang_attention: {use_sglang_attention}")
@@ -1617,11 +1816,11 @@ class SGLangSpecProvider(BackendSpecProvider):
 
     def layer_norm(self, rms_norm: bool = False, for_qk: bool = False) -> type:
         """LayerNorm or RMSNorm module.
-        
+
         IMPORTANT: Always use SGLang's LayerNorm implementations for true on-policy mode.
         This ensures numerical consistency between SGLang inference and Megatron training.
         Do NOT use fallback here as TransformerEngine's norms have different numerical behavior.
-        
+
         For Q/K layernorm (for_qk=True), always use RMSNorm as most LLMs (Qwen, LLaMA, etc.)
         use RMSNorm for query/key normalization, even when the main layernorm might be different.
         """
@@ -1629,7 +1828,11 @@ class SGLangSpecProvider(BackendSpecProvider):
         # This avoids bias parameters that would break checkpoint compatibility
         if for_qk or rms_norm:
             return SGLangRMSNorm
-        return SGLangLayerNorm
+        # Return SGLangNorm which will check config.normalization at instantiation time
+        # This ensures correct norm type (RMSNorm vs LayerNorm) based on model config
+        # Fixes MoE models like Qwen3-30B-A3B which use RMSNorm but pre_mlp_layernorm
+        # was getting SGLangLayerNorm (with bias) causing checkpoint mismatch
+        return SGLangNorm
 
     def core_attention(self) -> type:
         """Core attention module using Flash Attention 3."""

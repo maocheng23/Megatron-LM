@@ -627,6 +627,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
 
         attention_output, attention_output_bias = attention_output_with_bias
+        
         attention_output = self.post_self_attn_layernorm(attention_output)
         attention_output_with_bias = (attention_output, attention_output_bias)
 
@@ -638,11 +639,21 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # The remaining residual add is already handled inside the
             # self attention module.
             hidden_states = attention_output_with_bias[0]
+            self._moe_pre_resadd_residual = None  # Not used for fused kernel
+        elif self.is_moe_layer and getattr(self.config, 'use_sglang', False):
+            # For MoE SGLang mode: don't do resadd here, let pre_mlp_layernorm do it
+            # This matches SGLang's behavior where RMSNorm does x = x + residual internally
+            from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add_no_resadd
+            with self.bias_dropout_add_exec_handler():
+                hidden_states, self._moe_pre_resadd_residual = get_bias_dropout_add_no_resadd(
+                    self.training, self.config.bias_dropout_fusion
+                )(attention_output_with_bias, residual, self.hidden_dropout)
         else:
             with self.bias_dropout_add_exec_handler():
                 hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
                     attention_output_with_bias, residual, self.hidden_dropout
                 )
+            self._moe_pre_resadd_residual = None  # Not needed for non-MoE or non-SGLang
         nvtx_range_pop(suffix="self_attn_bda")
 
         # Residual connection.
@@ -686,13 +697,31 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         residual = hidden_states
 
         # Optional Layer norm post the cross-attention.
+        # For MoE SGLang mode, pass residual to pre_mlp_layernorm to do resadd inside
+        moe_residual = getattr(self, '_moe_pre_resadd_residual', None)
+        
+        # NOTE: For MoE SGLang true on-policy mode, tree_all_reduce is done inside 
+        # SGLangRowParallelLinear to match SGLang's numerical path exactly.
+        # Do NOT add additional all-reduce here as it would cause double all-reduce!
+        
         if self.recompute_pre_mlp_layernorm:
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
-                self.pre_mlp_layernorm, hidden_states
-            )
+            if moe_residual is not None:
+                # MoE SGLang mode: pass residual for internal resadd
+                pre_mlp_layernorm_output, residual = self.pre_mlp_norm_checkpoint.checkpoint(
+                    self.pre_mlp_layernorm, hidden_states, moe_residual
+                )
+            else:
+                pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
+                    self.pre_mlp_layernorm, hidden_states
+                )
         else:
-            pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
+            if moe_residual is not None:
+                # MoE SGLang mode: pass residual for internal resadd
+                # This matches SGLang's RMSNorm.forward_native with fp32_residual=False
+                pre_mlp_layernorm_output, residual = self.pre_mlp_layernorm(hidden_states, moe_residual)
+            else:
+                pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
 
         nvtx_range_push(suffix="mlp")
         # Potentially chunk the MLP computation during prefill to minimize the peak activation size

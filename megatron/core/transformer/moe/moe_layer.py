@@ -7,6 +7,7 @@ from typing import Optional, Union
 import torch
 
 from megatron.core import parallel_state, tensor_parallel, utils
+from megatron.core.tensor_parallel.mappings import _tree_all_reduce_sum
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
@@ -14,6 +15,8 @@ from megatron.core.transformer.moe.moe_utils import (
     MoECudaGraphTensorStore,
     get_default_pg_collection,
     maybe_skip_or_early_return_by_cudagraph,
+    sglang_fused_experts,
+    HAVE_SGLANG_FUSED_EXPERTS,
 )
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.token_dispatcher import (
@@ -35,6 +38,9 @@ try:
 except ImportError:
     HAVE_TE = False
 
+import os
+import logging
+logger = logging.getLogger(__name__)
 
 @dataclass
 class MoESubmodules:
@@ -314,6 +320,114 @@ class MoELayer(BaseMoELayer):
         hidden_states, probs, residual = self.preprocess(hidden_states, probs, routing_map)
         return hidden_states, probs, residual
 
+    def _get_expert_weights_for_sglang(self):
+        """Extract expert weights in SGLang format [num_experts, out_features, in_features]."""
+        # Get weights from TEGroupedMLP
+        # linear_fc1: [num_experts, ffn_hidden_size, hidden_size]
+        # linear_fc2: [num_experts, hidden_size, ffn_hidden_size // 2] (for gated)
+
+        # Access weights - TEGroupedLinear stores weights as individual parameters
+        w1_list = []
+        w2_list = []
+        num_experts = self.num_local_experts
+
+        for i in range(num_experts):
+            # Try different ways to access weights depending on implementation
+            if hasattr(self.experts, 'linear_fc1'):
+                if hasattr(self.experts.linear_fc1, f'weight{i}'):
+                    w1_list.append(getattr(self.experts.linear_fc1, f'weight{i}'))
+                elif hasattr(self.experts.linear_fc1, 'weights'):
+                    w1_list.append(self.experts.linear_fc1.weights[i])
+                elif hasattr(self.experts.linear_fc1, 'weight'):
+                    w1_list.append(self.experts.linear_fc1.weight[i])
+            elif hasattr(self.experts, 'weight1'):
+                # GroupedMLP uses weight1/weight2 directly
+                w1_reshaped = self.experts.weight1.view(self.num_local_experts, self.config.hidden_size, -1)
+                w1_list.append(w1_reshaped[i])
+
+            if hasattr(self.experts, 'linear_fc2'):
+                if hasattr(self.experts.linear_fc2, f'weight{i}'):
+                    w2_list.append(getattr(self.experts.linear_fc2, f'weight{i}'))
+                elif hasattr(self.experts.linear_fc2, 'weights'):
+                    w2_list.append(self.experts.linear_fc2.weights[i])
+                elif hasattr(self.experts.linear_fc2, 'weight'):
+                    w2_list.append(self.experts.linear_fc2.weight[i])
+            elif hasattr(self.experts, 'weight2'):
+                # GroupedMLP uses weight1/weight2 directly
+                w2_reshaped = self.experts.weight2.view(self.num_local_experts, -1, self.config.hidden_size)
+                w2_list.append(w2_reshaped[i])
+
+        # Stack into [num_experts, out_features, in_features]
+        w1 = torch.stack(w1_list, dim=0)
+        w2 = torch.stack(w2_list, dim=0)
+
+        return w1, w2
+
+    def _sglang_forward(self, hidden_states: torch.Tensor):
+        """Forward using SGLang's fused experts for true on-policy computation.
+        
+        This implements SGLang's EP backend=None mode:
+        - All tokens are processed on each EP rank
+        - Router computes topk for all tokens (same result on each rank)
+        - Expert computation only processes local experts (non-local experts skipped)
+        - Results are all-reduced across EP ranks
+        """
+        # Compute shared experts
+        shared_expert_output = self.shared_experts_compute(hidden_states)
+
+        # Get routing (this also stores topk_weights and topk_ids in router)
+        probs, routing_map = self.route(hidden_states)
+
+        # Get topk values from router (stored during _sglang_router_forward)
+        topk_weights = self.router._sglang_topk_weights
+        topk_ids = self.router._sglang_topk_ids
+        
+        # Get EP info
+        ep_size = utils.get_pg_size(self.ep_group)
+        ep_rank = utils.get_pg_rank(self.ep_group)
+
+        # Reshape hidden_states if needed
+        original_shape = hidden_states.shape
+        if len(original_shape) == 3:
+            hidden_states_2d = hidden_states.view(-1, original_shape[-1])
+        else:
+            hidden_states_2d = hidden_states
+
+        # Get expert weights (only local experts)
+        w1, w2 = self._get_expert_weights_for_sglang()
+
+        # Call SGLang's fused experts with EP parameters
+        output = sglang_fused_experts(
+            layer_number=self.layer_number,
+            hidden_states=hidden_states_2d,
+            w1=w1,
+            w2=w2,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            activation="silu",  # Qwen uses SwiGLU
+            # EP parameters
+            num_experts=self.config.num_moe_experts,
+            num_local_experts=self.num_local_experts,
+            ep_rank=ep_rank,
+            ep_size=ep_size,
+            ep_group=self.attn_tp_group,  # Use TP group for gradient all-reduce to match forward all-reduce
+        )
+
+        # MoE all-reduce: use TP group to match SGLang's tensor_model_parallel_tree_all_reduce
+        tp_size = utils.get_pg_size(self.attn_tp_group)
+        if tp_size > 1:
+            output = _tree_all_reduce_sum(output, self.attn_tp_group, layer_id=self.layer_number)
+
+        # Reshape output if needed
+        if len(original_shape) == 3:
+            output = output.view(original_shape[0], original_shape[1], -1)
+
+        # Add shared expert output
+        if shared_expert_output is not None:
+            output = output + shared_expert_output
+
+        return output, None  # mlp_bias is None
+
     def forward(self, hidden_states: torch.Tensor):
         """Forward pass for the MoE layer.
 
@@ -329,32 +443,37 @@ class MoELayer(BaseMoELayer):
         Returns:
             A tuple containing the output tensor and the MLP bias, if any.
         """
-        if self.training and self.attn_tp_group.size() > 1 and not self.config.sequence_parallel:
-            raise ValueError(
-                "During training, performance may degrade if MoE and tensor parallelism"
-                "are enabled without also enabling sequence parallelism."
-            )
+        # Use SGLang fused experts when use_sglang_router is enabled
+        use_sglang_experts = (
+            getattr(self.config, 'use_sglang_router', False)
+            and HAVE_SGLANG_FUSED_EXPERTS
+        )
 
-        # MoE forward: route -> dispatch -> compute -> combine
-        def custom_forward(hidden_states):
-            try:
-                shared_expert_output = self.shared_experts_compute(hidden_states)
-                probs, routing_map = self.route(hidden_states)
-                hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
-            except MoECudaGraphPartialCaptureSignal as e:
-                # This signal is raised from the maybe_skip_or_early_return_by_cudagraph decorator.
-                # It means we should early-return from the MoE layer forward pass.
-                # This happens when we are partially capturing the CUDA graph of the MoE layer,
-                # like cuda_graph_scope=["moe_router", "moe_preprocess"].
-                # We need to return the intermediate tensors as CUDA graph outputs.
-                return e.get_early_return_outputs(hidden_states, shared_expert_output)
+        if use_sglang_experts:
+            # Use SGLang's fused expert computation for true on-policy
+            def custom_forward(hidden_states):
+                return self._sglang_forward(hidden_states)
+        else:
+            # MoE forward: route -> dispatch -> compute -> combine
+            def custom_forward(hidden_states):
+                try:
+                    shared_expert_output = self.shared_experts_compute(hidden_states)
+                    probs, routing_map = self.route(hidden_states)
+                    hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
+                except MoECudaGraphPartialCaptureSignal as e:
+                    # This signal is raised from the maybe_skip_or_early_return_by_cudagraph decorator.
+                    # It means we should early-return from the MoE layer forward pass.
+                    # This happens when we are partially capturing the CUDA graph of the MoE layer,
+                    # like cuda_graph_scope=["moe_router", "moe_preprocess"].
+                    # We need to return the intermediate tensors as CUDA graph outputs.
+                    return e.get_early_return_outputs(hidden_states, shared_expert_output)
 
-            dispatched_input, probs = self.dispatch(hidden_states, probs)
-            output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
-            assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
-            output = self.combine(output, shared_expert_output)
+                dispatched_input, probs = self.dispatch(hidden_states, probs)
+                output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
+                assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
+                output = self.combine(output, shared_expert_output)
 
-            return output, mlp_bias
+                return output, mlp_bias
 
         if self.moe_layer_recompute:
             if self.config.fp8 or self.config.fp4:

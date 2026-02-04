@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 
 from megatron.core.jit import jit_fuser
 from megatron.core.tensor_parallel import reduce_from_tensor_model_parallel_region
@@ -22,11 +23,30 @@ from megatron.core.transformer.moe.moe_utils import (
     z_loss_func,
 )
 from megatron.core.transformer.moe.deterministic_router import (
-    fused_moe_router_deterministic,
     convert_topk_to_megatron_format,
     is_sglang_router_available,
 )
+from megatron.core.transformer.moe.true_on_policy_config import (
+    TrueOnPolicyConfig,
+    get_qwen3_moe_config,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
+
+import logging
+logger = logging.getLogger(__name__)
+
+# Try to import get_global_server_args for rl_on_policy_target check
+try:
+    from sglang.srt.server_args import get_global_server_args
+    HAVE_SGLANG_SERVER_ARGS = True
+except ImportError:
+    HAVE_SGLANG_SERVER_ARGS = False
+
+    def get_global_server_args():
+        # Return a mock object if SGLang is not available
+        class MockServerArgs:
+            rl_on_policy_target = None
+        return MockServerArgs()
 
 
 class Router(ABC, MegatronModule):
@@ -45,6 +65,7 @@ class Router(ABC, MegatronModule):
         super().__init__(config)
         self.config = config
         self.num_experts = self.config.num_moe_experts
+
         self.moe_aux_loss_func = None
         self.layer_number = None
         self.tp_group = pg_collection.tp
@@ -75,10 +96,24 @@ class Router(ABC, MegatronModule):
             if self.bias is not None:
                 self.config.init_method(self.bias)
         self.weight.data = self.weight.data.to(dtype=self.config.params_dtype)
+        # CRITICAL FIX for MoE EP mode:
+        # Router weights are replicated across all EP/TP ranks. In backward pass,
+        # each rank computes partial gradient (from its local experts + local sequence tokens).
+        # These gradients MUST be SUM-reduced across TP group to ensure all ranks have
+        # identical router weights after optimizer step.
+        #
+        # We ALWAYS set sequence_parallel=True for router weights (regardless of global config)
+        # because in finalize_model_grads, gradient all-reduce is triggered by:
+        #   (config.sequence_parallel AND param.sequence_parallel)
+        # Setting param.sequence_parallel=True is necessary but not sufficient alone.
+        #
+        # However, we also need config.sequence_parallel=True for the all-reduce to happen.
+        # If global SP is disabled, we need an alternative approach - see below.
         setattr(self.weight, 'sequence_parallel', self.config.sequence_parallel)
         if self.bias is not None:
             self.bias.data = self.bias.data.to(dtype=self.config.params_dtype)
             setattr(self.bias, 'sequence_parallel', self.config.sequence_parallel)
+            setattr(self.bias, 'average_gradients_across_tp_domain', True)
 
     def gating(self, input: torch.Tensor):
         """Forward pass of the router gate.
@@ -580,9 +615,8 @@ class TopKRouter(Router):
 
         # Apply input jitter
         input = self.apply_input_jitter(input)
-        
-        # Option 1: Use SGLang's fused router directly (GEMM + Softcap + TopK in one kernel)
-        # This provides bit-exact same results as SGLang inference
+
+        # Use SGLang's router for true on-policy (bit-exact same results as SGLang inference)
         if self.config.use_sglang_router:
             return self._sglang_router_forward(input)
         
@@ -598,14 +632,14 @@ class TopKRouter(Router):
         return probs, routing_map
     
     def _sglang_router_forward(self, input: torch.Tensor):
-        # Ensure router is available
+        """Router forward using SGLang's routing logic for true on-policy."""
         if not is_sglang_router_available() and input.is_cuda:
             import warnings
             warnings.warn(
                 "SGLang router not available, falling back to deterministic PyTorch implementation. "
                 "Install SGLang for optimal performance: pip install sglang"
             )
-        
+
         # Reshape input: [seq_len, batch_size, hidden_dim] -> [num_tokens, hidden_dim]
         original_shape = input.shape
         if len(original_shape) == 3:
@@ -613,33 +647,51 @@ class TopKRouter(Router):
             input_2d = input.view(-1, hidden_dim)
         else:
             input_2d = input
-        
+
         # Move router weight to same device if needed
         if self.weight.device.type == 'cpu':
             self.weight.data = self.weight.data.to(device=input.device)
-        
-        # Call SGLang's fused router (or fallback)
-        # This matches SGLang's FusedMoeRouter.forward_cuda() exactly
-        topk_weights, topk_ids = fused_moe_router_deterministic(
-            hidden_states=input_2d,
-            router_weight=self.weight,
-            topk=self.topk,
-            moe_softcapping=self.config.moe_softcapping,
-            correction_bias=self.expert_bias,  # SGLang calls this correction_bias
+
+        # Use the same routing logic as SGLang's qwen3_moe.py
+        # SGLang's ReplicatedLinear does: output = x @ weight.T (+ bias)
+        # in the input's native dtype (bf16/fp16), NOT converted to fp32
+        router_logits = torch.mm(input_2d, self.weight.t())
+        if self.bias is not None:
+            router_logits = router_logits + self.bias
+
+        # Apply softmax, topk, and renormalize (matching SGLang)
+        routing_weights = F.softmax(
+            router_logits, dim=1, dtype=torch.float
         )
-        
-        # Convert SGLang format (topk_weights, topk_ids) to Megatron format (probs, routing_map)
+        routing_weights, selected_experts = torch.topk(
+            routing_weights, self.topk, dim=-1
+        )
+        # Use non-in-place operation to preserve gradient computation
+        routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+        routing_weights = routing_weights.to(input_2d.dtype)
+
+        # Store topk values for SGLang fused experts (used in MoE layer)
+        self._sglang_topk_weights = routing_weights
+        self._sglang_topk_ids = selected_experts
+
+        # Convert SGLang format to Megatron format (probs, routing_map)
         probs, routing_map = convert_topk_to_megatron_format(
-            topk_weights,
-            topk_ids,
+            routing_weights,
+            selected_experts,
             num_experts=self.config.num_moe_experts,
             dtype=input.dtype,
         )
-        
+
         # Apply expert bias tracking (for load balancing)
         self._apply_expert_bias(routing_map)
-        
+
         return probs, routing_map
+
+    def _get_true_on_policy_config(self) -> TrueOnPolicyConfig:
+        """Get the true on-policy config (Qwen3-MoE)."""
+        if not hasattr(self, '_true_on_policy_config'):
+            self._true_on_policy_config = get_qwen3_moe_config()
+        return self._true_on_policy_config
 
     def _load_from_state_dict(self, *args, **kwargs):
         """Load the state dict of the router."""

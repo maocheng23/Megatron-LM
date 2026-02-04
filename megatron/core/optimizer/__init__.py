@@ -1,6 +1,8 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import copy
 import logging
+import os
+import re
 import warnings
 from dataclasses import astuple
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -126,6 +128,81 @@ def _get_param_groups(
     # Map (pg_overrides, is_expert_parallel) to params.
     params_map = {}
 
+    # Check for ONLY_UPDATE_ENTIRE_LAYER first (updates entire layer: attention + MoE + layernorm)
+    # Supports: single layer (e.g., "47"), comma-separated (e.g., "46,47"), or range (e.g., "40-47")
+    only_update_entire_layer = os.environ.get("ONLY_UPDATE_ENTIRE_LAYER")
+    
+    only_optimize_layer = os.environ.get("ONLY_OPTIMIZE_LAYER_EXPERTS")
+    only_optimize_layer_source = "ONLY_OPTIMIZE_LAYER_EXPERTS"
+    if only_optimize_layer is None:
+        # Allow reusing ONLY_UPDATE_LAYER_EXPERTS for convenience in debug runs.
+        only_optimize_layer = os.environ.get("ONLY_UPDATE_LAYER_EXPERTS")
+        only_optimize_layer_source = "ONLY_UPDATE_LAYER_EXPERTS"
+
+    target_layer = None  # For backward compatibility (single layer)
+    target_layers_set = None  # Set of layer IDs for multi-layer support
+    optimize_mode = None  # "moe_only", "entire_layer", or None
+    
+    def parse_layer_spec(spec_str):
+        """Parse layer specification: '47', '46,47', '40-47', or '40-47,0'"""
+        layers = set()
+        for part in spec_str.split(','):
+            part = part.strip()
+            if '-' in part:
+                # Range: "40-47"
+                start, end = part.split('-')
+                layers.update(range(int(start), int(end) + 1))
+            else:
+                # Single layer
+                layers.add(int(part))
+        return layers
+    
+    # ONLY_UPDATE_ENTIRE_LAYER takes precedence
+    if only_update_entire_layer is not None:
+        try:
+            target_layers_set = parse_layer_spec(only_update_entire_layer)
+            target_layer = min(target_layers_set)  # For backward compatibility
+            optimize_mode = "entire_layer"
+        except ValueError as exc:
+            raise ValueError(
+                f"ONLY_UPDATE_ENTIRE_LAYER must be layer spec (e.g., '47', '46,47', '40-47'), "
+                f"got {only_update_entire_layer!r}"
+            ) from exc
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f"ONLY_UPDATE_ENTIRE_LAYER={sorted(target_layers_set)}: "
+            f"ALL parameters from these {len(target_layers_set)} layers will be added to optimizer.",
+        )
+    elif only_optimize_layer is not None:
+        try:
+            target_layer = int(only_optimize_layer)
+            target_layers_set = {target_layer}
+            optimize_mode = "moe_only"
+        except ValueError as exc:
+            raise ValueError(
+                f"{only_optimize_layer_source} must be an int layer id, got {only_optimize_layer!r}"
+            ) from exc
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f"{only_optimize_layer_source}={target_layer}: "
+            "only target layer MoE experts will be added to optimizer param groups.",
+        )
+
+    layer_id_re = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+    warned_missing_layer_id = False
+
+    # Check if we should also include router weights for the target layer
+    include_router = os.environ.get("INCLUDE_TARGET_LAYER_ROUTER", "0") == "1"
+    if target_layer is not None and include_router and optimize_mode == "moe_only":
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f"INCLUDE_TARGET_LAYER_ROUTER=1: "
+            f"also including router (gate) weights for layer {target_layer}.",
+        )
+
     if config_overrides is None:
         # TODO remove this default behavior eventually.
         #  This is only needed for backwards compatibility with the old config overrides API where
@@ -138,6 +215,42 @@ def _get_param_groups(
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
                 continue
+            if target_layers_set is not None:
+                if optimize_mode == "entire_layer":
+                    # Keep ALL parameters from the target layers (attention + MoE + layernorm)
+                    match = layer_id_re.search(name)
+                    if match is None:
+                        # Skip non-layer params (embedding, lm_head, etc.)
+                        continue
+                    layer_id_parsed = int(match.group(1))
+                    if layer_id_parsed not in target_layers_set:
+                        continue
+                    # Include this parameter (it's from one of the target layers)
+                else:
+                    # MoE-only mode: Keep only target-layer experts (and optionally router)
+                    is_expert_param = ".mlp.experts." in name
+                    is_router_param = ".mlp.gate." in name or ".mlp.router." in name
+                    
+                    # Skip if not an expert or router param (when router is enabled)
+                    if not is_expert_param and not (include_router and is_router_param):
+                        continue
+                    
+                    match = layer_id_re.search(name)
+                    if match is None:
+                        if not warned_missing_layer_id:
+                            log_single_rank(
+                                logger,
+                                logging.WARNING,
+                                f"{only_optimize_layer_source} is set but "
+                                f"could not parse layer id from param name: {name}. "
+                                "Skipping unmatched parameters.",
+                            )
+                            warned_missing_layer_id = True
+                        continue
+                    layer_id_parsed = int(match.group(1))
+                    if layer_id_parsed not in target_layers_set:
+                        continue
+                    # Include this parameter
 
             uses_default_config = False
             # Get optimizer config overrides for this parameter.
@@ -177,6 +290,7 @@ def _get_param_groups(
                 params_key.append(key)
     # Need to pick one of the param_override_tuples to use for the param group.
     param_groups = []
+    
     # Sort keys, None first.
     for key in sorted(params_key, key=lambda x: (x[0] is not None, x[0])):
         param_override_tuple, is_expert_parallel = key
@@ -634,6 +748,7 @@ def get_megatron_optimizer(
         filter_fn=lambda g: g['is_expert_parallel'],
         buffer_name='expert_parallel_buffers',
     )
+    
     if dump_param_to_param_group_map is not None:
         for param_group in moe_param_groups:
             for param in param_group["params"]:

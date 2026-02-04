@@ -572,11 +572,15 @@ class TransformerConfig(ModelParallelConfig):
     and group-limited topk. This is an experimental feature and only for benchmark."""
 
     use_sglang_router: bool = False
-    """Use SGLang's fused_moe_router_cudacore directly for MoE routing.
+    """Use SGLang's router implementation for Qwen3-MoE routing.
     This provides bit-exact same results as SGLang's inference.
-    When enabled, bypasses Megatron's routing logic and uses SGLang's implementation.
-    Requires: pip install sglang (or sglang available in PYTHONPATH).
-    This is similar to --use-sglang and --use-sglang-attention for other components."""
+    When enabled, uses SGLang's fused_topk (topk_softmax from sgl_kernel).
+    Requires: pip install sglang (or sglang available in PYTHONPATH)."""
+
+    true_on_policy_model: Optional[str] = None
+    """Model name for true on-policy config (e.g., 'qwen3_moe').
+    Uses model-specific routing to match SGLang exactly.
+    When set, this takes precedence over use_sglang_router."""
 
     moe_softcapping: float = 0.0
     """Softcapping value for router logits. Used in Gemma2 and similar models.

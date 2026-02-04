@@ -1114,9 +1114,13 @@ def validate_args(args, defaults={}):
         assert not args.use_flash_attn, "Flash attention can not be used in deterministic mode."
         assert not args.cross_entropy_loss_fusion, "Cross Entropy Fusion is currently not deterministic."
 
-        all_reduce_choices = ["Tree", "Ring", "CollnetDirect", "CollnetChain", "^NVLS"]
-        assert os.getenv("NCCL_ALGO", -1) != -1 and os.getenv("NCCL_ALGO") in all_reduce_choices, \
-            f"NCCL_ALGO must be one of {all_reduce_choices}."
+        # Accept both global formats (Tree, Ring) and operation-specific formats (allreduce:Tree)
+        # Operation-specific formats are preferred as they don't affect other operations like AllGather
+        all_reduce_choices = ["Tree", "Ring", "CollnetDirect", "CollnetChain", "^NVLS",
+                              "allreduce:Tree", "allreduce:Ring"]
+        nccl_algo = os.getenv("NCCL_ALGO", None)
+        assert nccl_algo is not None and nccl_algo in all_reduce_choices, \
+            f"NCCL_ALGO must be one of {all_reduce_choices}. Got: {nccl_algo}"
 
         torch.use_deterministic_algorithms(True)
 
@@ -3534,6 +3538,13 @@ def _add_sglang_arguments(parser: argparse.ArgumentParser):
             default=False,
             help="Use SGLang's fused MoE router for deterministic routing. "
                  "Provides bit-exact same results as SGLang inference.",
+        )
+        group.add_argument(
+            '--true-on-policy-model',
+            type=str,
+            default=None,
+            help="Model name for true on-policy config (e.g., 'qwen3_moe'). "
+                 "Uses model-specific routing to match SGLang exactly.",
         )
     return parser
 

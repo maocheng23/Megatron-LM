@@ -345,8 +345,15 @@ class LinearWithFrozenWeight(torch.autograd.Function):
         grad_input = grad_output.matmul(weight)
 
         if ctx.allreduce_dgrad:
-            # All-reduce. Note: here async and sync are effectively the same.
-            torch.distributed.all_reduce(grad_input, group=ctx.tp_group)
+            # Use deterministic all-reduce for true on-policy mode
+            import os
+            if os.environ.get("MEGATRON_USE_DETERMINISTIC_ALLREDUCE", "0") == "1":
+                from megatron.core.tensor_parallel.mappings import _tree_all_reduce_sum_impl
+                grad_input_reduced = _tree_all_reduce_sum_impl(grad_input, ctx.tp_group)
+                grad_input.copy_(grad_input_reduced)
+            else:
+                # All-reduce. Note: here async and sync are effectively the same.
+                torch.distributed.all_reduce(grad_input, group=ctx.tp_group)
 
         return grad_input, None, None, None, None
 
@@ -534,8 +541,17 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             )
 
         if ctx.allreduce_dgrad:
-            # Asynchronous all-reduce
-            handle = torch.distributed.all_reduce(grad_input, group=tp_group, async_op=True)
+            # Use deterministic all-reduce for true on-policy mode
+            import os
+            if os.environ.get("MEGATRON_USE_DETERMINISTIC_ALLREDUCE", "0") == "1":
+                # Synchronous deterministic all-reduce using tree reduction
+                from megatron.core.tensor_parallel.mappings import _tree_all_reduce_sum_impl
+                grad_input_reduced = _tree_all_reduce_sum_impl(grad_input, tp_group)
+                grad_input.copy_(grad_input_reduced)
+                handle = None  # No async handle needed
+            else:
+                # Asynchronous all-reduce (original behavior)
+                handle = torch.distributed.all_reduce(grad_input, group=tp_group, async_op=True)
             # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
             # all-reduce is scheduled before the weight gradient computation
 
@@ -614,7 +630,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             # provided during forward
             return (sub_grad_input, grad_weight, grad_bias, None, None, None, None, None, None)
 
-        if ctx.allreduce_dgrad:
+        if ctx.allreduce_dgrad and handle is not None:
             handle.wait()
 
         return grad_input, grad_weight, grad_bias, None, None, None, None, None, None
