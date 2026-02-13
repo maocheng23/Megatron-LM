@@ -628,20 +628,22 @@ class FusedExpertsFunction(torch.autograd.Function):
             if ep_group is not None:
                 ep_world_size = torch.distributed.get_world_size(ep_group)
                 if ep_world_size > 1:
-                    # Use deterministic tree all-reduce to ensure consistent gradient accumulation
-                    if os.environ.get("MEGATRON_USE_DETERMINISTIC_ALLREDUCE", "0") == "1":
+                    use_det = os.environ.get("MEGATRON_USE_DETERMINISTIC_ALLREDUCE", "0") == "1"
+                    fwd_only = os.environ.get("MEGATRON_DETERMINISTIC_FORWARD_ONLY", "0") == "1"
+                    if use_det and not fwd_only:
                         grad_topk_weights_reduced = _tree_all_reduce_sum_impl(grad_topk_weights, ep_group)
                         grad_topk_weights.copy_(grad_topk_weights_reduced)
                     else:
                         torch.distributed.all_reduce(grad_topk_weights, group=ep_group)
-        
+
         # All-reduce grad_hidden_states across EP ranks
         # Each rank only computes gradients from its local experts.
         if grad_hidden_states is not None and ep_group is not None:
             ep_world_size = torch.distributed.get_world_size(ep_group)
             if ep_world_size > 1:
-                # Use deterministic tree all-reduce to ensure consistent gradient accumulation
-                if os.environ.get("MEGATRON_USE_DETERMINISTIC_ALLREDUCE", "0") == "1":
+                use_det = os.environ.get("MEGATRON_USE_DETERMINISTIC_ALLREDUCE", "0") == "1"
+                fwd_only = os.environ.get("MEGATRON_DETERMINISTIC_FORWARD_ONLY", "0") == "1"
+                if use_det and not fwd_only:
                     grad_hidden_states_reduced = _tree_all_reduce_sum_impl(grad_hidden_states, ep_group)
                     grad_hidden_states.copy_(grad_hidden_states_reduced)
                 else:

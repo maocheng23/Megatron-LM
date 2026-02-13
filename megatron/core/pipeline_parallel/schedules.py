@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import contextlib
+import os
 from functools import partial
 from typing import Callable, Iterator, List, Optional, Union
 
@@ -565,6 +566,19 @@ def forward_backward_no_pipelining(
     if config.timers is not None:
         config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
 
+    # --- Profiling instrumentation for fwd/bwd breakdown ---
+    import time as _time
+    _profile_enabled = os.environ.get("SLIME_PROFILE_FWD_BWD", "0") == "1"
+    _fwd_time = 0.0
+    _bwd_time = 0.0
+    _grad_sync_time = 0.0
+
+    # --- Relax deterministic algorithms for backward when FORWARD_ONLY mode ---
+    _fwd_only_det = (
+        os.environ.get("MEGATRON_DETERMINISTIC_FORWARD_ONLY", "0") == "1"
+        and torch.are_deterministic_algorithms_enabled()
+    )
+
     no_sync_func = config.no_sync_func
     if no_sync_func is None:
         no_sync_func = contextlib.nullcontext
@@ -595,6 +609,9 @@ def forward_backward_no_pipelining(
     else:
         with no_sync_func():
             for i in range(num_microbatches - 1):
+                if _profile_enabled and not forward_only:
+                    torch.cuda.synchronize()
+                    _t0 = _time.time()
                 output_tensor, num_tokens = forward_step(
                     forward_step_func,
                     data_iterator,
@@ -610,11 +627,25 @@ def forward_backward_no_pipelining(
                 )
                 total_num_tokens += num_tokens
                 if not forward_only:
+                    if _profile_enabled:
+                        torch.cuda.synchronize()
+                        _fwd_time += _time.time() - _t0
+                        _t0 = _time.time()
+                    if _fwd_only_det:
+                        torch.use_deterministic_algorithms(False)
                     backward_step(
                         input_tensor, output_tensor, output_tensor_grad, model_type, config
                     )
+                    if _fwd_only_det:
+                        torch.use_deterministic_algorithms(True)
+                    if _profile_enabled:
+                        torch.cuda.synchronize()
+                        _bwd_time += _time.time() - _t0
         # Run computation for last microbatch out of context handler (want to
         # synchronize gradients).
+        if _profile_enabled and not forward_only:
+            torch.cuda.synchronize()
+            _t0 = _time.time()
         output_tensor, num_tokens = forward_step(
             forward_step_func,
             data_iterator,
@@ -634,9 +665,25 @@ def forward_backward_no_pipelining(
         total_num_tokens += num_tokens
 
         if not forward_only:
+            if _profile_enabled:
+                torch.cuda.synchronize()
+                _fwd_time += _time.time() - _t0
+                _t0 = _time.time()
+            if _fwd_only_det:
+                torch.use_deterministic_algorithms(False)
             backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
+            if _fwd_only_det:
+                torch.use_deterministic_algorithms(True)
+            if _profile_enabled:
+                torch.cuda.synchronize()
+                _bwd_time += _time.time() - _t0
 
     if config.finalize_model_grads_func is not None and not forward_only:
+        if _profile_enabled:
+            torch.cuda.synchronize()
+            _t0 = _time.time()
+        if _fwd_only_det:
+            torch.use_deterministic_algorithms(False)
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
         # data parallelism and layernorm all-reduce for sequence parallelism).
         config.finalize_model_grads_func(
@@ -644,6 +691,21 @@ def forward_backward_no_pipelining(
             total_num_tokens if config.calculate_per_token_loss else None,
             pg_collection=pg_collection,
         )
+        if _fwd_only_det:
+            torch.use_deterministic_algorithms(True)
+        if _profile_enabled:
+            torch.cuda.synchronize()
+            _grad_sync_time += _time.time() - _t0
+
+    if _profile_enabled and not forward_only:
+        _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        if _rank == 0:
+            print(
+                f"[PROFILE] fwd_bwd_breakdown: fwd={_fwd_time:.2f}s bwd={_bwd_time:.2f}s "
+                f"grad_sync={_grad_sync_time:.2f}s total={_fwd_time+_bwd_time+_grad_sync_time:.2f}s "
+                f"num_microbatches={num_microbatches}",
+                flush=True,
+            )
 
     if config.timers is not None:
         config.timers('forward-backward').stop()

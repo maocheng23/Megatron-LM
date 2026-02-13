@@ -118,6 +118,19 @@ def _reduce(input_, group):
     return input_
 
 
+def _reduce_standard(input_, group):
+    """All-reduce using standard NCCL (non-deterministic, fast).
+
+    Used in backward pass when MEGATRON_DETERMINISTIC_FORWARD_ONLY=1
+    to avoid the performance cost of tree-based AllReduce in gradients.
+    """
+    assert group is not None, "group should not be None"
+    if group.size() == 1:
+        return input_
+    torch.distributed.all_reduce(input_.contiguous(), group=group)
+    return input_
+
+
 def _split_along_last_dim(input_, group):
     """Split the tensor along its last dimension and keep the
     corresponding slice."""
@@ -296,6 +309,9 @@ class _CopyToModelParallelRegion(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         """Backward function."""
+        if (os.environ.get("MEGATRON_USE_DETERMINISTIC_ALLREDUCE", "0") == "1"
+                and os.environ.get("MEGATRON_DETERMINISTIC_FORWARD_ONLY", "0") == "1"):
+            return _reduce_standard(grad_output, ctx.group), None
         return _reduce(grad_output, ctx.group), None
 
 

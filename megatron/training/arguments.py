@@ -1116,11 +1116,15 @@ def validate_args(args, defaults={}):
 
         # Accept both global formats (Tree, Ring) and operation-specific formats (allreduce:Tree)
         # Operation-specific formats are preferred as they don't affect other operations like AllGather
+        # When MEGATRON_DETERMINISTIC_FORWARD_ONLY=1, NCCL_ALGO is not required because
+        # forward uses software tree AllReduce (AllGather + tree sum) which bypasses NCCL AllReduce.
         all_reduce_choices = ["Tree", "Ring", "CollnetDirect", "CollnetChain", "^NVLS",
                               "allreduce:Tree", "allreduce:Ring"]
         nccl_algo = os.getenv("NCCL_ALGO", None)
-        assert nccl_algo is not None and nccl_algo in all_reduce_choices, \
-            f"NCCL_ALGO must be one of {all_reduce_choices}. Got: {nccl_algo}"
+        fwd_only_det = os.getenv("MEGATRON_DETERMINISTIC_FORWARD_ONLY", "0") == "1"
+        if not fwd_only_det:
+            assert nccl_algo is not None and nccl_algo in all_reduce_choices, \
+                f"NCCL_ALGO must be one of {all_reduce_choices}. Got: {nccl_algo}"
 
         torch.use_deterministic_algorithms(True)
 

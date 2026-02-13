@@ -345,14 +345,14 @@ class LinearWithFrozenWeight(torch.autograd.Function):
         grad_input = grad_output.matmul(weight)
 
         if ctx.allreduce_dgrad:
-            # Use deterministic all-reduce for true on-policy mode
             import os
-            if os.environ.get("MEGATRON_USE_DETERMINISTIC_ALLREDUCE", "0") == "1":
+            use_det = os.environ.get("MEGATRON_USE_DETERMINISTIC_ALLREDUCE", "0") == "1"
+            fwd_only = os.environ.get("MEGATRON_DETERMINISTIC_FORWARD_ONLY", "0") == "1"
+            if use_det and not fwd_only:
                 from megatron.core.tensor_parallel.mappings import _tree_all_reduce_sum_impl
                 grad_input_reduced = _tree_all_reduce_sum_impl(grad_input, ctx.tp_group)
                 grad_input.copy_(grad_input_reduced)
             else:
-                # All-reduce. Note: here async and sync are effectively the same.
                 torch.distributed.all_reduce(grad_input, group=ctx.tp_group)
 
         return grad_input, None, None, None, None
@@ -541,16 +541,15 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             )
 
         if ctx.allreduce_dgrad:
-            # Use deterministic all-reduce for true on-policy mode
             import os
-            if os.environ.get("MEGATRON_USE_DETERMINISTIC_ALLREDUCE", "0") == "1":
-                # Synchronous deterministic all-reduce using tree reduction
+            use_det = os.environ.get("MEGATRON_USE_DETERMINISTIC_ALLREDUCE", "0") == "1"
+            fwd_only = os.environ.get("MEGATRON_DETERMINISTIC_FORWARD_ONLY", "0") == "1"
+            if use_det and not fwd_only:
                 from megatron.core.tensor_parallel.mappings import _tree_all_reduce_sum_impl
                 grad_input_reduced = _tree_all_reduce_sum_impl(grad_input, tp_group)
                 grad_input.copy_(grad_input_reduced)
-                handle = None  # No async handle needed
+                handle = None
             else:
-                # Asynchronous all-reduce (original behavior)
                 handle = torch.distributed.all_reduce(grad_input, group=tp_group, async_op=True)
             # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
             # all-reduce is scheduled before the weight gradient computation
