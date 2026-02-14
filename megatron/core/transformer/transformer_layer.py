@@ -520,6 +520,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
         return get_transformer_layer_offset(config)
 
+    # Class-level component profiling state
+    _component_profile_checked = False
+    _component_profile_enabled = False
+    _component_attn_times = {}  # layer_number -> list of ms
+    _component_mlp_times = {}   # layer_number -> list of ms
+    _component_call_count = 0
+    _component_print_interval = 256  # print every N forward calls (across all layers)
+
     def forward(self, *args, **kwargs):
         """
         Perform a forward pass through the transformer layer.
@@ -531,6 +539,59 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # this is only used to uniquely identify decode and non-decode cuda graph
         # runners in the cuda graph manager
         kwargs.pop("dynamic_inference_decode_only", None)
+
+        # --- Per-layer component profiling ---
+        cls = TransformerLayer
+        if not cls._component_profile_checked:
+            import os as _os
+            cls._component_profile_enabled = _os.environ.get("SLIME_PROFILE_COMPONENT", "0") == "1"
+            cls._component_profile_checked = True
+
+        if cls._component_profile_enabled:
+            _start_attn = torch.cuda.Event(enable_timing=True)
+            _end_attn = torch.cuda.Event(enable_timing=True)
+            _start_mlp = torch.cuda.Event(enable_timing=True)
+            _end_mlp = torch.cuda.Event(enable_timing=True)
+
+            _start_attn.record()
+            hidden_states, context = self._forward_attention(*args, **kwargs)
+            _end_attn.record()
+
+            _start_mlp.record()
+            output = self._forward_mlp(hidden_states, kwargs.get("inference_context", None))
+            _end_mlp.record()
+
+            torch.cuda.synchronize()
+            _attn_ms = _start_attn.elapsed_time(_end_attn)
+            _mlp_ms = _start_mlp.elapsed_time(_end_mlp)
+
+            _ln = self.layer_number
+            cls._component_attn_times.setdefault(_ln, []).append(_attn_ms)
+            cls._component_mlp_times.setdefault(_ln, []).append(_mlp_ms)
+            cls._component_call_count += 1
+
+            if cls._component_call_count % cls._component_print_interval == 0:
+                _total_attn = sum(sum(v) for v in cls._component_attn_times.values())
+                _total_mlp = sum(sum(v) for v in cls._component_mlp_times.values())
+                _n_calls = sum(len(v) for v in cls._component_attn_times.values())
+                print(
+                    f"[SLIME_PROFILE_COMPONENT] After {cls._component_call_count} layer-forwards: "
+                    f"attention={_total_attn/1000:.2f}s, mlp/moe={_total_mlp/1000:.2f}s, "
+                    f"ratio attn:mlp = {_total_attn/max(_total_mlp,1):.2f}:1 "
+                    f"(over {_n_calls} layer×microbatch calls)",
+                    flush=True,
+                )
+                # Per-layer breakdown
+                for _ln_key in sorted(cls._component_attn_times.keys()):
+                    _a = sum(cls._component_attn_times[_ln_key])
+                    _m = sum(cls._component_mlp_times.get(_ln_key, [0]))
+                    print(
+                        f"  layer {_ln_key}: attn={_a/1000:.3f}s, mlp={_m/1000:.3f}s",
+                        flush=True,
+                    )
+
+            return output, context
+
         hidden_states, context = self._forward_attention(*args, **kwargs)
         output = self._forward_mlp(hidden_states, kwargs.get("inference_context", None))
         return output, context

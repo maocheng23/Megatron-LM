@@ -569,6 +569,7 @@ def forward_backward_no_pipelining(
     # --- Profiling instrumentation for fwd/bwd breakdown ---
     import time as _time
     _profile_enabled = os.environ.get("SLIME_PROFILE_FWD_BWD", "0") == "1"
+    _profile_bwd_detail = os.environ.get("SLIME_PROFILE_BWD_DETAIL", "0") == "1"
     _fwd_time = 0.0
     _bwd_time = 0.0
     _grad_sync_time = 0.0
@@ -671,7 +672,21 @@ def forward_backward_no_pipelining(
                 _t0 = _time.time()
             if _fwd_only_det:
                 torch.use_deterministic_algorithms(False)
-            backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
+            if _profile_bwd_detail:
+                _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                from torch.profiler import profile, ProfilerActivity
+                with profile(
+                    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                    record_shapes=True,
+                ) as _prof:
+                    backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
+                if _rank == 0:
+                    print("[PROFILE_BWD_DETAIL] Last microbatch backward kernel breakdown:", flush=True)
+                    print(_prof.key_averages().table(sort_by="cuda_time_total", row_limit=40), flush=True)
+                    _prof.export_chrome_trace("/tmp/bwd_trace.json")
+                    print("[PROFILE_BWD_DETAIL] Chrome trace saved to /tmp/bwd_trace.json", flush=True)
+            else:
+                backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
             if _fwd_only_det:
                 torch.use_deterministic_algorithms(True)
             if _profile_enabled:
@@ -2108,6 +2123,18 @@ def forward_backward_pipelining_without_interleaving(
     if config.timers is not None:
         config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
 
+    # --- Forward profiling instrumentation for PP schedule ---
+    import time as _time
+    _profile_fwd_detail = os.environ.get("SLIME_PROFILE_FWD_DETAIL", "0") == "1"
+    _profile_fwd_bwd = os.environ.get("SLIME_PROFILE_FWD_BWD", "0") == "1"
+    _pp_rank = p2p_communicator.pp_group.rank()
+    _fwd_only_det = (
+        os.environ.get("MEGATRON_DETERMINISTIC_FORWARD_ONLY", "0") == "1"
+        and torch.are_deterministic_algorithms_enabled()
+    )
+    _fwd_times = []
+    _bwd_times = []
+
     # Disable async grad reductions
     no_sync_func = config.no_sync_func
     if no_sync_func is None:
@@ -2197,6 +2224,25 @@ def forward_backward_pipelining_without_interleaving(
         input_tensor = p2p_communicator.recv_forward(
             recv_tensor_shapes, is_pp_first_stage(p2p_communicator.pp_group)
         )
+
+        # --- torch.profiler on first warmup forward, rank 0 only ---
+        _use_profiler = _profile_fwd_detail and i == 0 and _pp_rank == 0
+        _profiler_ctx = None
+        if _use_profiler:
+            _profiler_ctx = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                record_shapes=True,
+                with_stack=False,
+            )
+            _profiler_ctx.__enter__()
+
+        if _profile_fwd_bwd:
+            torch.cuda.synchronize()
+            _t0 = _time.time()
+
         output_tensor, num_tokens = forward_step(
             forward_step_func,
             data_iterator,
@@ -2212,6 +2258,26 @@ def forward_backward_pipelining_without_interleaving(
             current_microbatch=i,
             is_last_stage=is_pp_last_stage(p2p_communicator.pp_group),
         )
+
+        if _profile_fwd_bwd:
+            torch.cuda.synchronize()
+            _fwd_times.append(_time.time() - _t0)
+
+        if _use_profiler and _profiler_ctx is not None:
+            _profiler_ctx.__exit__(None, None, None)
+            print(
+                f"\n[SLIME_PROFILE_FWD_DETAIL] PP rank {_pp_rank}, "
+                f"warmup microbatch 0 — top 40 CUDA kernels:\n"
+                f"{_profiler_ctx.key_averages().table(sort_by='cuda_time_total', row_limit=40)}",
+                flush=True,
+            )
+            try:
+                _trace_path = f"/tmp/fwd_trace_pp{_pp_rank}_rank{torch.distributed.get_rank()}.json"
+                _profiler_ctx.export_chrome_trace(_trace_path)
+                print(f"[SLIME_PROFILE_FWD_DETAIL] Chrome trace saved to {_trace_path}", flush=True)
+            except Exception as _e:
+                print(f"[SLIME_PROFILE_FWD_DETAIL] Failed to save trace: {_e}", flush=True)
+
         p2p_communicator.send_forward(output_tensor, is_pp_last_stage(p2p_communicator.pp_group))
         total_num_tokens += num_tokens
 
@@ -2240,6 +2306,10 @@ def forward_backward_pipelining_without_interleaving(
         else:
             checkpoint_activations_microbatch = None
 
+        if _profile_fwd_bwd:
+            torch.cuda.synchronize()
+            _t0 = _time.time()
+
         output_tensor, num_tokens = forward_step(
             forward_step_func,
             data_iterator,
@@ -2257,6 +2327,11 @@ def forward_backward_pipelining_without_interleaving(
             current_microbatch=i + num_warmup_microbatches,
             is_last_stage=is_pp_last_stage(p2p_communicator.pp_group),
         )
+
+        if _profile_fwd_bwd:
+            torch.cuda.synchronize()
+            _fwd_times.append(_time.time() - _t0)
+
         total_num_tokens += num_tokens
 
         if forward_only:
@@ -2288,9 +2363,19 @@ def forward_backward_pipelining_without_interleaving(
                 if config.grad_sync_func is None or rank == 0:
                     enable_grad_sync()
 
+            if _profile_fwd_bwd:
+                torch.cuda.synchronize()
+                _t0 = _time.time()
+            if _fwd_only_det:
+                torch.use_deterministic_algorithms(False)
             input_tensor_grad = backward_step(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config
             )
+            if _fwd_only_det:
+                torch.use_deterministic_algorithms(True)
+            if _profile_fwd_bwd:
+                torch.cuda.synchronize()
+                _bwd_times.append(_time.time() - _t0)
 
             if last_iteration:
                 input_tensor = None
@@ -2324,9 +2409,19 @@ def forward_backward_pipelining_without_interleaving(
                 send_tensor_shapes, is_pp_last_stage(p2p_communicator.pp_group)
             )
 
+            if _profile_fwd_bwd:
+                torch.cuda.synchronize()
+                _t0 = _time.time()
+            if _fwd_only_det:
+                torch.use_deterministic_algorithms(False)
             input_tensor_grad = backward_step(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config
             )
+            if _fwd_only_det:
+                torch.use_deterministic_algorithms(True)
+            if _profile_fwd_bwd:
+                torch.cuda.synchronize()
+                _bwd_times.append(_time.time() - _t0)
 
             p2p_communicator.send_backward(
                 input_tensor_grad, is_pp_first_stage(p2p_communicator.pp_group)
@@ -2337,6 +2432,19 @@ def forward_backward_pipelining_without_interleaving(
             enable_grad_sync()
             if config.grad_sync_func is not None:
                 config.grad_sync_func(model.parameters())
+
+    # --- Print PP schedule fwd/bwd timing summary ---
+    if _profile_fwd_bwd and (_fwd_times or _bwd_times):
+        _total_fwd = sum(_fwd_times)
+        _total_bwd = sum(_bwd_times)
+        print(
+            f"[SLIME_PROFILE_FWD_BWD] PP rank {_pp_rank} | "
+            f"forward: {_total_fwd:.2f}s ({len(_fwd_times)} microbatches, "
+            f"avg {_total_fwd/max(len(_fwd_times),1):.2f}s) | "
+            f"backward: {_total_bwd:.2f}s ({len(_bwd_times)} microbatches, "
+            f"avg {_total_bwd/max(len(_bwd_times),1):.2f}s)",
+            flush=True,
+        )
 
     if config.finalize_model_grads_func is not None and not forward_only:
 
