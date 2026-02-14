@@ -182,7 +182,11 @@ def enable_sglang_batch_invariant_mode(enable_bmm: bool = True):
     torch.backends.cudnn.benchmark = False
 
     os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
-    os.environ['NCCL_ALGO'] = 'Ring'
+    # When MEGATRON_DETERMINISTIC_FORWARD_ONLY=1, forward determinism is handled by
+    # software tree AllReduce (AllGather + tree sum), not NCCL AllReduce. Don't constrain
+    # NCCL_ALGO so backward can use the fastest available algorithm.
+    if os.environ.get('MEGATRON_DETERMINISTIC_FORWARD_ONLY', '0') != '1':
+        os.environ['NCCL_ALGO'] = 'Ring'
     os.environ['NVTE_ALLOW_NONDETERMINISTIC_ALGO'] = '0'
 
 
