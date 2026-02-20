@@ -344,20 +344,30 @@ class SGLangLinear(MegatronModule):
 
     def forward(self, x: Tensor) -> Tuple[Tensor, Optional[Tensor]]:
         """Forward pass using batch-invariant operations.
-        
+
         Uses explicit BF16 casting to match SGLang's FSDP-compatible numerical paths.
         """
         # Cast to BF16 to match SGLang's FSDP-compatible paths
         # In SGLang's logits_processor: torch.matmul(hidden_states.bfloat16(), weight.T.bfloat16())
         x = x.to(torch.bfloat16)
-        
+
         # Reshape for matrix multiplication
         orig_shape = x.shape
         x = x.view(-1, self.input_size if self.parallel_mode != "row" else x.shape[-1])
 
         # Use batch-invariant GEMM with BF16 weight
         weight_bf16 = self.weight.to(torch.bfloat16)
-        if self.bias is not None and not self.skip_bias_add:
+        # TP-invariant matmul for row-parallel: use matmul_tp_persistent for cross-TP support
+        _use_tp_inv = (
+            self.parallel_mode == "row"
+            and os.environ.get("ROW_LINEAR_ENABLE_INV", "0") == "1"
+        )
+        if _use_tp_inv:
+            from megatron.core.tensor_parallel.matmul_tp_inv import matmul_tp_persistent
+            output = matmul_tp_persistent(x, weight_bf16.t())
+            if self.bias is not None and not self.skip_bias_add:
+                output = output + self.bias.to(torch.bfloat16)
+        elif self.bias is not None and not self.skip_bias_add:
             bias_bf16 = self.bias.to(torch.bfloat16)
             output = sglang_addmm(
                 bias_bf16.unsqueeze(0).expand(x.size(0), -1),

@@ -757,6 +757,219 @@ def linear_with_grad_accumulation_and_async_allreduce(
 linear_with_grad_accumulation_and_async_allreduce.warned = False
 
 
+class LinearWithTPInvariantForward(torch.autograd.Function):
+    """Linear with TP-invariant forward (matmul_tp_persistent) and standard backward.
+
+    Forward uses tree-structured K accumulation so that the result is identical
+    regardless of how the K dimension is partitioned across TP ranks.
+    Backward uses standard torch.matmul for speed (gradients don't need cross-TP matching).
+    """
+
+    @staticmethod
+    @custom_fwd
+    def forward(
+        ctx,
+        input,
+        weight,
+        bias,
+        gradient_accumulation_fusion,
+        allreduce_dgrad,
+        sequence_parallel,
+        grad_output_buffer,
+        wgrad_deferral_limit,
+        tp_group,
+    ):
+        from megatron.core.tensor_parallel.matmul_tp_inv import matmul_tp_persistent
+
+        if gradient_accumulation_fusion and hasattr(weight, "main_grad"):
+            main_grad = weight.main_grad
+        else:
+            main_grad = None
+        ctx.save_for_backward(input, weight)
+        ctx.main_grad = main_grad
+        ctx.use_bias = bias is not None
+        ctx.gradient_accumulation_fusion = gradient_accumulation_fusion
+        ctx.allreduce_dgrad = allreduce_dgrad
+        ctx.sequence_parallel = sequence_parallel
+        ctx.wgrad_deferral_limit = wgrad_deferral_limit
+        ctx.grad_output_buffer = grad_output_buffer
+        ctx.tp_group = tp_group
+
+        if sequence_parallel:
+            dim_size = list(input.size())
+            dim_size[0] = dim_size[0] * tp_group.size()
+            all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu")
+            dist_all_gather_func(all_gather_buffer, input, group=tp_group)
+            total_input = all_gather_buffer
+        else:
+            total_input = input
+
+        # TP-invariant matmul: reshape 3D→2D, call kernel, reshape back
+        orig_shape = total_input.shape
+        input_2d = total_input.reshape(-1, orig_shape[-1])
+        output_2d = matmul_tp_persistent(input_2d, weight.t())
+        output = output_2d.reshape(*orig_shape[:-1], output_2d.shape[-1])
+
+        if bias is not None:
+            output = output + bias
+        return output
+
+    @staticmethod
+    @custom_bwd
+    def backward(ctx, grad_output):
+        """Backward — identical to LinearWithGradAccumulationAndAsyncCommunication."""
+        input, weight = ctx.saved_tensors
+        main_grad = ctx.main_grad
+        use_bias = ctx.use_bias
+        grad_output_buffer = ctx.grad_output_buffer
+        wgrad_deferral_limit = ctx.wgrad_deferral_limit
+        handle = None
+        tp_group = ctx.tp_group
+
+        if ctx.gradient_accumulation_fusion:
+            weight.main_grad = main_grad
+
+        wgrad_compute = True
+        if grad_output_buffer is not None:
+            if wgrad_deferral_limit == 0 or len(grad_output_buffer) < wgrad_deferral_limit:
+                grad_output_buffer.append(grad_output)
+                wgrad_compute = False
+
+        if wgrad_compute:
+            if ctx.sequence_parallel:
+                dim_size = list(input.size())
+                dim_size[0] = dim_size[0] * tp_group.size()
+                all_gather_buffer = get_global_memory_buffer().get_tensor(
+                    dim_size, input.dtype, "mpu"
+                )
+                handle = dist_all_gather_func(
+                    all_gather_buffer, input, group=tp_group, async_op=True
+                )
+                total_input = all_gather_buffer
+            else:
+                total_input = input
+        grad_input = grad_output.matmul(weight)
+
+        if ctx.sequence_parallel and wgrad_compute:
+            handle.wait()
+
+        if wgrad_compute:
+            grad_output, total_input = prepare_input_tensors_for_wgrad_compute(
+                grad_output, total_input
+            )
+
+        if ctx.allreduce_dgrad:
+            use_det = os.environ.get("MEGATRON_USE_DETERMINISTIC_ALLREDUCE", "0") == "1"
+            fwd_only = os.environ.get("MEGATRON_DETERMINISTIC_FORWARD_ONLY", "0") == "1"
+            if use_det and not fwd_only:
+                from megatron.core.tensor_parallel.mappings import _tree_all_reduce_sum_impl
+                grad_input_reduced = _tree_all_reduce_sum_impl(grad_input, tp_group)
+                grad_input.copy_(grad_input_reduced)
+                handle = None
+            else:
+                handle = torch.distributed.all_reduce(grad_input, group=tp_group, async_op=True)
+
+        if ctx.sequence_parallel:
+            assert not ctx.allreduce_dgrad
+            dim_size = list(input.size())
+            sub_grad_input = torch.empty(
+                dim_size, dtype=input.dtype, device=torch.cuda.current_device(), requires_grad=False
+            )
+            handle = dist_reduce_scatter_func(
+                sub_grad_input, grad_input, group=tp_group, async_op=True
+            )
+
+        if ctx.gradient_accumulation_fusion:
+            if wgrad_compute:
+                if hasattr(weight, "__fsdp_param__"):
+                    weight.main_grad = weight.get_main_grad()
+                    torch.matmul(grad_output.t(), total_input, out=weight.main_grad)
+                else:
+                    if weight.main_grad.dtype == torch.float32:
+                        fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(
+                            total_input, grad_output, weight.main_grad
+                        )
+                    elif weight.main_grad.dtype in (torch.float16, torch.bfloat16):
+                        fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16(
+                            total_input, grad_output, weight.main_grad
+                        )
+                    else:
+                        raise RuntimeError(
+                            "Unsupported gradient type for gradient accumulation fusion"
+                        )
+
+            if hasattr(weight, "grad_added_to_main_grad"):
+                if getattr(weight, "zero_out_wgrad", False):
+                    if HAVE_TE:
+                        grad_weight = get_dummy_wgrad(
+                            list(weight.main_grad.shape), input.dtype, zero=True
+                        )
+                    else:
+                        grad_weight = torch.zeros(
+                            weight.main_grad.shape,
+                            dtype=input.dtype,
+                            device=torch.cuda.current_device(),
+                            requires_grad=False,
+                        )
+                else:
+                    if HAVE_TE:
+                        grad_weight = get_dummy_wgrad(list(weight.main_grad.shape), input.dtype)
+                    else:
+                        grad_weight = torch.empty(
+                            weight.main_grad.shape,
+                            dtype=input.dtype,
+                            device=torch.cuda.current_device(),
+                            requires_grad=False,
+                        )
+                weight.grad_added_to_main_grad = True
+            else:
+                grad_weight = None
+        else:
+            grad_weight = grad_output.t().matmul(total_input)
+        grad_bias = grad_output.sum(dim=0) if use_bias else None
+
+        if ctx.sequence_parallel:
+            handle.wait()
+            return (sub_grad_input, grad_weight, grad_bias, None, None, None, None, None, None)
+
+        if ctx.allreduce_dgrad and handle is not None:
+            handle.wait()
+
+        return grad_input, grad_weight, grad_bias, None, None, None, None, None, None
+
+
+def linear_with_tp_invariant_forward(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    gradient_accumulation_fusion: bool,
+    allreduce_dgrad: bool,
+    sequence_parallel: bool,
+    grad_output_buffer: Optional[List[torch.Tensor]] = None,
+    wgrad_deferral_limit: Optional[int] = 0,
+    async_grad_allreduce: Optional[bool] = None,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> torch.Tensor:
+    """Linear with TP-invariant forward pass. Same API as
+    linear_with_grad_accumulation_and_async_allreduce."""
+
+    tp_group = get_tensor_model_parallel_group_if_none(tp_group)
+
+    args = [
+        input,
+        weight,
+        bias,
+        gradient_accumulation_fusion,
+        allreduce_dgrad,
+        sequence_parallel,
+        grad_output_buffer,
+        wgrad_deferral_limit,
+        tp_group,
+    ]
+
+    return LinearWithTPInvariantForward.apply(*args)
+
+
 class ColumnParallelLinear(torch.nn.Module):
     """Linear layer with column parallelism.
 
@@ -1239,7 +1452,10 @@ class RowParallelLinear(torch.nn.Module):
         )
 
     def _forward_impl(self, input, weight, *args, **kwargs):
-        if not weight.requires_grad:
+        _use_tp_inv = os.environ.get("ROW_LINEAR_ENABLE_INV", "0") == "1"
+        if _use_tp_inv:
+            return linear_with_tp_invariant_forward(input, weight, *args, **kwargs)
+        elif not weight.requires_grad:
             return linear_with_frozen_weight(input, weight, *args, **kwargs)
         else:
             return linear_with_grad_accumulation_and_async_allreduce(input, weight, *args, **kwargs)
