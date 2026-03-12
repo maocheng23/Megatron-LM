@@ -102,6 +102,8 @@ _MODEL_CONFIG_REGISTRY: Dict[str, TrueOnPolicyConfig] = {
     "qwen3_moe": get_qwen3_moe_config(),
     "qwen3-moe": get_qwen3_moe_config(),
     "qwen3moe": get_qwen3_moe_config(),
+    "qwen3_next": get_qwen3_moe_config(),
+    "qwen3-next": get_qwen3_moe_config(),
 }
 
 

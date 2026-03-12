@@ -1267,19 +1267,27 @@ def sglang_apply_rotary_pos_emb(
     if cos.dim() == 2:
         cos = cos.unsqueeze(-2)  # [seq, 1, head_dim//2]
         sin = sin.unsqueeze(-2)
-    
+
     cos = cos.to(x.dtype)
     sin = sin.to(x.dtype)
-    
+
+    # Handle partial RoPE (rotary_percent < 1.0, e.g. Qwen3-Next uses 0.25)
+    rotary_dim = cos.shape[-1] * 2  # cos has rotary_dim/2 elements
+    if rotary_dim < x.shape[-1]:
+        x_rot = x[..., :rotary_dim]
+        x_pass = x[..., rotary_dim:]
+        x_rot = sglang_apply_rotary_pos_emb(x_rot, cos, sin, is_neox_style)
+        return torch.cat((x_rot, x_pass), dim=-1)
+
     if is_neox_style:
         x1, x2 = torch.chunk(x, 2, dim=-1)
     else:
         x1 = x[..., ::2]
         x2 = x[..., 1::2]
-    
+
     o1 = x1 * cos - x2 * sin
     o2 = x2 * cos + x1 * sin
-    
+
     if is_neox_style:
         return torch.cat((o1, o2), dim=-1)
     else:
@@ -1298,7 +1306,7 @@ def sglang_apply_rotary_pos_emb_to_qk(
         q_freqs = k_freqs = freqs
     
     head_dim = query.shape[-1]
-    
+
     if q_freqs.shape[-1] == head_dim:
         cos = q_freqs[..., :head_dim // 2]
         sin = q_freqs[..., head_dim // 2:]
@@ -1306,15 +1314,27 @@ def sglang_apply_rotary_pos_emb_to_qk(
         # Deinterleave
         cos = q_freqs[..., 0::2]
         sin = q_freqs[..., 1::2]
-    
+
     while cos.dim() > 3 and cos.shape[1] == 1:
         cos = cos.squeeze(1)
         sin = sin.squeeze(1)
-    
+
     is_neox_style = not getattr(config, 'rotary_interleaved', False)
-    
-    rotated_query = sglang_apply_rotary_pos_emb(query, cos, sin, is_neox_style)
-    
+
+    # Handle partial RoPE (rotary_percent < 1.0, e.g. Qwen3-Next uses 0.25)
+    rotary_dim = cos.shape[-1] * 2  # cos has rotary_dim/2 elements
+
+    def _apply_partial_rope(x, cos, sin):
+        if rotary_dim < x.shape[-1]:
+            x_rot = x[..., :rotary_dim]
+            x_pass = x[..., rotary_dim:]
+            x_rot = sglang_apply_rotary_pos_emb(x_rot, cos, sin, is_neox_style)
+            return torch.cat((x_rot, x_pass), dim=-1)
+        else:
+            return sglang_apply_rotary_pos_emb(x, cos, sin, is_neox_style)
+
+    rotated_query = _apply_partial_rope(query, cos, sin)
+
     if k_freqs is not q_freqs:
         if k_freqs.shape[-1] == head_dim:
             k_cos = k_freqs[..., :head_dim // 2]
@@ -1325,10 +1345,10 @@ def sglang_apply_rotary_pos_emb_to_qk(
         while k_cos.dim() > 3 and k_cos.shape[1] == 1:
             k_cos = k_cos.squeeze(1)
             k_sin = k_sin.squeeze(1)
-        rotated_key = sglang_apply_rotary_pos_emb(key, k_cos, k_sin, is_neox_style)
+        rotated_key = _apply_partial_rope(key, k_cos, k_sin)
     else:
-        rotated_key = sglang_apply_rotary_pos_emb(key, cos, sin, is_neox_style)
-    
+        rotated_key = _apply_partial_rope(key, cos, sin)
+
     return rotated_query, rotated_key
 
 

@@ -249,6 +249,9 @@ def matmul_tp_persistent(A: torch.Tensor, B: torch.Tensor, bias: torch.Tensor = 
 
     M, K = A.shape
     _, N = B.shape
+    # Reduce BLOCK_K if K is too small (e.g. shared expert with large TP)
+    while BLOCK_K > K and BLOCK_K > 1:
+        BLOCK_K //= 2
     assert (
         K % BLOCK_K == 0
     ), f"Dimension K should be divisible by BLOCK_K. Got K={K}, BLOCK_K={BLOCK_K}."

@@ -321,18 +321,28 @@ class MoELayer(BaseMoELayer):
         return hidden_states, probs, residual
 
     def _get_expert_weights_for_sglang(self):
-        """Extract expert weights in SGLang format [num_experts, out_features, in_features]."""
-        # Get weights from TEGroupedMLP
-        # linear_fc1: [num_experts, ffn_hidden_size, hidden_size]
-        # linear_fc2: [num_experts, hidden_size, ffn_hidden_size // 2] (for gated)
+        """Extract expert weights in SGLang format [num_experts, out_features, in_features].
 
-        # Access weights - TEGroupedLinear stores weights as individual parameters
+        Caches the stacked tensor to avoid repeated allocation for 512+ experts.
+        The cache is invalidated when weights change (e.g., after optimizer step)
+        by checking data_ptr of the first weight.
+        """
+        # Check cache validity
+        cache_key = None
+        if hasattr(self.experts, 'linear_fc1'):
+            if hasattr(self.experts.linear_fc1, 'weight0'):
+                cache_key = self.experts.linear_fc1.weight0.data_ptr()
+        if hasattr(self, '_sglang_w_cache') and self._sglang_w_cache is not None:
+            cached_key, w1, w2 = self._sglang_w_cache
+            if cached_key == cache_key:
+                return w1, w2
+
+        # Build stacked weight tensors
         w1_list = []
         w2_list = []
         num_experts = self.num_local_experts
 
         for i in range(num_experts):
-            # Try different ways to access weights depending on implementation
             if hasattr(self.experts, 'linear_fc1'):
                 if hasattr(self.experts.linear_fc1, f'weight{i}'):
                     w1_list.append(getattr(self.experts.linear_fc1, f'weight{i}'))
@@ -341,7 +351,6 @@ class MoELayer(BaseMoELayer):
                 elif hasattr(self.experts.linear_fc1, 'weight'):
                     w1_list.append(self.experts.linear_fc1.weight[i])
             elif hasattr(self.experts, 'weight1'):
-                # GroupedMLP uses weight1/weight2 directly
                 w1_reshaped = self.experts.weight1.view(self.num_local_experts, self.config.hidden_size, -1)
                 w1_list.append(w1_reshaped[i])
 
@@ -353,27 +362,65 @@ class MoELayer(BaseMoELayer):
                 elif hasattr(self.experts.linear_fc2, 'weight'):
                     w2_list.append(self.experts.linear_fc2.weight[i])
             elif hasattr(self.experts, 'weight2'):
-                # GroupedMLP uses weight1/weight2 directly
                 w2_reshaped = self.experts.weight2.view(self.num_local_experts, -1, self.config.hidden_size)
                 w2_list.append(w2_reshaped[i])
 
-        # Stack into [num_experts, out_features, in_features]
         w1 = torch.stack(w1_list, dim=0)
         w2 = torch.stack(w2_list, dim=0)
 
+        self._sglang_w_cache = (cache_key, w1, w2)
         return w1, w2
+
+    def _sglang_shared_expert_forward(self, hidden_states: torch.Tensor):
+        """Compute shared expert using F.linear to match SGLang's Qwen2MoeMLP exactly.
+
+        SGLang's shared expert: gate_up_proj -> SiluAndMul -> down_proj -> sigmoid_gate * output
+        At TP=1, all are just F.linear calls. We replicate this using the TE weights.
+        """
+        if not self.use_shared_expert:
+            return None
+
+        shared = self.shared_experts
+        # TE SharedExpertMLP stores weights as linear_fc1.weight and linear_fc2.weight
+        # linear_fc1 is gate+up merged: [2*intermediate, hidden]
+        # linear_fc2 is down: [hidden, intermediate]
+        gate_up_weight = shared.linear_fc1.weight  # [2*intermediate, hidden]
+        down_weight = shared.linear_fc2.weight  # [hidden, intermediate]
+
+        # Reshape if needed
+        x = hidden_states
+        if x.ndim == 3:
+            x = x.view(-1, x.shape[-1])
+
+        # gate_up_proj
+        gate_up = torch.nn.functional.linear(x, gate_up_weight)
+        # SiluAndMul: split into gate and up, apply silu to gate, multiply
+        half = gate_up.shape[-1] // 2
+        gate = gate_up[..., :half]
+        up = gate_up[..., half:]
+        x = torch.nn.functional.silu(gate) * up
+        # down_proj
+        x = torch.nn.functional.linear(x, down_weight)
+
+        # shared_expert_gate (sigmoid gating)
+        if hasattr(shared, 'gate') and shared.gate is not None:
+            gate_weight = shared.gate.weight  # [1, hidden]
+            gate_val = torch.nn.functional.linear(hidden_states.view(-1, hidden_states.shape[-1]), gate_weight)
+            x = torch.sigmoid(gate_val) * x
+
+        return x
 
     def _sglang_forward(self, hidden_states: torch.Tensor):
         """Forward using SGLang's fused experts for true on-policy computation.
-        
+
         This implements SGLang's EP backend=None mode:
         - All tokens are processed on each EP rank
         - Router computes topk for all tokens (same result on each rank)
         - Expert computation only processes local experts (non-local experts skipped)
         - Results are all-reduced across EP ranks
         """
-        # Compute shared experts
-        shared_expert_output = self.shared_experts_compute(hidden_states)
+        # Compute shared experts using F.linear to match SGLang exactly
+        shared_expert_output = self._sglang_shared_expert_forward(hidden_states)
 
         # Get routing (this also stores topk_weights and topk_ids in router)
         probs, routing_map = self.route(hidden_states)
@@ -412,19 +459,25 @@ class MoELayer(BaseMoELayer):
             ep_size=ep_size,
             ep_group=self.attn_tp_group,  # Use TP group for gradient all-reduce to match forward all-reduce
         )
-
-        # MoE all-reduce: use TP group to match SGLang's tensor_model_parallel_tree_all_reduce
-        tp_size = utils.get_pg_size(self.attn_tp_group)
-        if tp_size > 1:
-            output = _tree_all_reduce_sum(output, self.attn_tp_group, layer_id=self.layer_number)
+        # Free stacked weight cache to save memory (significant for 512+ experts)
+        del w1, w2
+        self._sglang_w_cache = None
 
         # Reshape output if needed
         if len(original_shape) == 3:
             output = output.view(original_shape[0], original_shape[1], -1)
 
-        # Add shared expert output
+        # Match SGLang's qwen2_moe.py order: add shared FIRST, then all-reduce.
+        # SGLang uses NCCL all_reduce (tensor_model_parallel_all_reduce), so we use
+        # torch.distributed.all_reduce to match exactly (not _tree_all_reduce_sum).
         if shared_expert_output is not None:
+            if len(original_shape) == 3:
+                shared_expert_output = shared_expert_output.view(original_shape[0], original_shape[1], -1)
             output = output + shared_expert_output
+
+        tp_size = utils.get_pg_size(self.attn_tp_group)
+        if tp_size > 1:
+            torch.distributed.all_reduce(output, group=self.attn_tp_group)
 
         return output, None  # mlp_bias is None
 
