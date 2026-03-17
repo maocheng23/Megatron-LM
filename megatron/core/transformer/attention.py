@@ -1239,19 +1239,58 @@ class SelfAttention(Attention):
             num_qkv_heads_per_group += num_query_heads_per_group
 
         if self.config.num_query_groups < self.world_size:
-            # Note that weights are interleaved in the following manner:
-            # q1 q2 k1 v1 | q3 q4 k2 v2 | q5 q6 k3 v3 | ...
-            # When tp_size > num_kv_heads, we split "q1 q2 k1 v1" over multiple
-            # ranks, so a rank does not have a clean partitioning of just the q_heads
-            # it needs. Instead, we perform the following steps:
-            # 1. Assemble the full "q1 q2 k1 v1 | q3 q4 k2 v2 | q5 q6 k3 v3 | ..."
-            #    through an AG.
-            # 2. Pull out the right slice (e.g., "q1 q2 k1 v1" or "q3 q4 k2 v2").
-            # 3. Split q_heads (e.g., q1, q2), k_heads (e.g., k1), v_heads (e.g., v1).
-            # 4. Further index into query to get only the q_heads that this rank is
-            #    responsible for (e.g., q1).
-            # The block of code below performs steps 1 and 2.
+            # All-gather the full QKV output across TP ranks.
             mixed_qkv = all_gather_last_dim_from_tensor_parallel_region(mixed_qkv)
+
+            _true_on_policy = getattr(self.config, 'true_on_policy_model', None) is not None
+            if _true_on_policy:
+                # Match SGLang's QKVParallelLinear KV-head replication layout.
+                # After all-gather, mixed_qkv has the FULL QKV in interleaved format:
+                # [G0(Q*hpg, K, V), G1(Q*hpg, K, V), ...] where each group has
+                # hpg Q heads + 1 K head + 1 V head.
+                # We re-index to match SGLang's per-rank assignment:
+                #   Q: num_heads/tp heads per rank (contiguous)
+                #   K: 1 KV head per rank (with replication)
+                #   V: 1 KV head per rank (with replication)
+                _ng = self.config.num_query_groups
+                _hpg = self.config.num_attention_heads // _ng
+                _hd = self.hidden_size_per_attention_head
+                _group_size = (_hpg + 2) * _hd
+
+                _full_q_parts, _full_k_parts, _full_v_parts = [], [], []
+                for _g in range(_ng):
+                    _off = _g * _group_size
+                    _full_q_parts.append(mixed_qkv[..., _off : _off + _hpg * _hd])
+                    _full_k_parts.append(mixed_qkv[..., _off + _hpg * _hd : _off + (_hpg + 1) * _hd])
+                    _full_v_parts.append(mixed_qkv[..., _off + (_hpg + 1) * _hd : _off + (_hpg + 2) * _hd])
+                _full_q = torch.cat(_full_q_parts, dim=-1)
+                _full_k = torch.cat(_full_k_parts, dim=-1)
+                _full_v = torch.cat(_full_v_parts, dim=-1)
+
+                _rank = get_tensor_model_parallel_rank()
+                _q_per_rank = self.config.num_attention_heads // self.world_size
+                _q_s = _rank * _q_per_rank * _hd
+                _q_e = _q_s + _q_per_rank * _hd
+                _kv_repl = self.world_size // _ng
+                _kv_idx = _rank // _kv_repl
+                _kv_s = _kv_idx * _hd
+                _kv_e = _kv_s + _hd
+
+                query = _full_q[..., _q_s:_q_e].view(*mixed_qkv.shape[:-1], _q_per_rank, _hd)
+                key = _full_k[..., _kv_s:_kv_e].view(*mixed_qkv.shape[:-1], 1, _hd)
+                value = _full_v[..., _kv_s:_kv_e].view(*mixed_qkv.shape[:-1], 1, _hd)
+
+                self.num_query_groups_per_partition = 1
+                self.num_attention_heads_per_partition = _q_per_rank
+
+                if self.q_layernorm is not None:
+                    query = self.q_layernorm(query)
+                if self.k_layernorm is not None:
+                    key = self.k_layernorm(key)
+
+                return query, key, value
+
+            # Original Megatron logic for non-true-on-policy
             idx = get_tensor_model_parallel_rank() // (
                 self.world_size // self.config.num_query_groups
             )

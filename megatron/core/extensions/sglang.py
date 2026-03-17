@@ -359,6 +359,12 @@ class SGLangLinear(MegatronModule):
         weight_bf16 = self.weight.to(torch.bfloat16)
         # TP-invariant matmul for row-parallel: use matmul_tp_persistent for cross-TP support
         # Only use when TP>1; at TP=1 we must use sglang_mm to match SGLang's DeepGEMM kernel
+        # For true-on-policy mode, always use sglang_mm to match SGLang's
+        # matmul_persistent/DeepGEMM kernel. matmul_tp_persistent is a different
+        # kernel that produces slightly different numerical results.
+        # Use matmul_tp_persistent for RowParallel when ROW_LINEAR_ENABLE_INV=1.
+        # This matches SGLang's RowParallelLinear which uses torch.ops.tp_inv_ops.matmul_tp_inv
+        # when is_tp_invariant_mode_enabled() and ROW_LINEAR_ENABLE_INV=1.
         _use_tp_inv = (
             self.parallel_mode == "row"
             and self.tp_size > 1
@@ -929,6 +935,10 @@ class SGLangRMSNorm(MegatronModule):
 
         w = self.weight.float()
         x = w * x.to(orig_dtype)
+        # Ensure output dtype matches orig_dtype (SGLang weight is bf16 for MoE,
+        # so bf16*bf16→bf16, but Megatron weight is fp32, so fp32*bf16→fp32)
+        if x.dtype != orig_dtype:
+            x = x.to(orig_dtype)
 
         if residual is not None:
             return x, residual
@@ -977,11 +987,22 @@ class SGLangQKRMSNorm(MegatronModule):
         x = x.to(torch.float32)
         variance = x.pow(2).mean(dim=-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.eps)
-        w = self.weight.float()
-        if self.cast_x_before_out_mul:
-            x = w * x.to(orig_dtype)
+        # Match SGLang's forward_native with cast_x_before_out_mul=True:
+        # SGLang: x = x.to(orig_dtype); x = self.weight * x
+        # - MoE (weight=bf16): bf16 * bf16 -> bf16
+        # - Dense (weight=fp32): fp32 * bf16 -> fp32
+        # Use MEGATRON_ROPE_BF16 to distinguish: MoE sets it, dense doesn't
+        import os as _qkn_os
+        if _qkn_os.environ.get("MEGATRON_ROPE_BF16", "0") == "1":
+            # MoE: SGLang weight is bf16, cast both to bf16
+            x = self.weight.to(orig_dtype) * x.to(orig_dtype)
         else:
-            x = (x * w).to(orig_dtype)
+            # Dense: SGLang weight is fp32, keep fp32 * bf16 -> fp32
+            w = self.weight.float()
+            if self.cast_x_before_out_mul:
+                x = w * x.to(orig_dtype)
+            else:
+                x = (x * w).to(orig_dtype)
         return x
 
 

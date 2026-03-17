@@ -400,6 +400,9 @@ class FusedExpertsFunction(torch.autograd.Function):
         # Use SGLang's fused_experts_impl for bitwise identical forward output
         # NOTE: The triton output is used for the return value only.
         # In backward, we recompute using PyTorch ops to ensure gradient consistency.
+        # Cast to bf16 to match SGLang inference dtype (fused_moe_kernel requires same dtype)
+        if hidden_states.dtype != w1.dtype:
+            hidden_states = hidden_states.to(w1.dtype)
         with torch.no_grad():
             output = fused_experts_impl(
                 hidden_states=hidden_states.contiguous(),

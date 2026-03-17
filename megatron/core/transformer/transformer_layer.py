@@ -748,6 +748,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 _sglang_residual = linear_qkv._sglang_last_residual
                 del linear_qkv._sglang_last_residual
             self._sglang_pre_mlp_residual = _sglang_residual
+            if is_dump_enabled() and _layer_idx == 0:
+                dsave(f"layer{_layer_idx:02d}_after_attn_bda", hidden_states)
+                dsave(f"layer{_layer_idx:02d}_sglang_residual_after_attn", _sglang_residual)
         else:
             with self.bias_dropout_add_exec_handler():
                 hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
@@ -825,6 +828,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         from megatron.core.transformer.debug_dump import dsave, is_dump_enabled
         _layer_idx = self.layer_number - 1
+
+        if is_dump_enabled() and _layer_idx == 0:
+            dsave(f"layer{_layer_idx:02d}_attn_output_to_mlp", hidden_states)
+            dsave(f"layer{_layer_idx:02d}_pre_mlp_layernorm_out", pre_mlp_layernorm_output)
+            if sglang_residual is not None:
+                dsave(f"layer{_layer_idx:02d}_sglang_residual_at_mlp", sglang_residual)
 
         nvtx_range_push(suffix="mlp")
         # Potentially chunk the MLP computation during prefill to minimize the peak activation size

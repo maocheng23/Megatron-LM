@@ -119,25 +119,25 @@ def _apply_rotary_pos_emb_bshd(
 
     # first part is cosine component
     # second part is sine component, need to change signs with _rotate_half method
-    # CRITICAL: Compute RoPE in float32 to match SGLang's apply_rotary_pos_emb_native
-    # which does q.float(), cos.float(), sin.float() before rotation.
+    # Match SGLang's RoPE precision:
+    # - Dense models use apply_rotary_pos_emb_native: fp32 cos/sin, fp32 multiply
+    # - MoE models use _apply_rotary_emb via RotaryEmbedding.forward_native:
+    #   cos.to(x.dtype) i.e. bf16 cos/sin, bf16 multiply
+    # Check MEGATRON_ROPE_BF16 env to select the right mode.
+    import os as _os
     orig_dtype = t.dtype
-    cos_ = (torch.cos(freqs) * mscale).float()
-    sin_ = (torch.sin(freqs) * mscale).float()
+    _rope_bf16 = _os.environ.get("MEGATRON_ROPE_BF16", "0") == "1"
+    if _rope_bf16:
+        cos_ = (torch.cos(freqs) * mscale).to(orig_dtype)
+        sin_ = (torch.sin(freqs) * mscale).to(orig_dtype)
+    else:
+        cos_ = (torch.cos(freqs) * mscale).float()
+        sin_ = (torch.sin(freqs) * mscale).float()
 
-    import os
-    from megatron.core.transformer.debug_dump import dsave, is_dump_enabled
-    if is_dump_enabled():
-        _rope_dump_count = getattr(_apply_rotary_pos_emb_bshd, '_dump_count', 0)
-        if _rope_dump_count < 1:
-            _apply_dump_count = _rope_dump_count + 1
-            _apply_rotary_pos_emb_bshd._dump_count = _apply_dump_count
-            dsave("rope_freqs", freqs)
-            dsave("rope_cos", cos_)
-            dsave("rope_sin", sin_)
-            dsave("rope_t_input", t)
-
-    t = (t.float() * cos_) + (_rotate_half(t, rotary_interleaved).float() * sin_)
+    if _rope_bf16:
+        t = (t.to(orig_dtype) * cos_) + (_rotate_half(t, rotary_interleaved).to(orig_dtype) * sin_)
+    else:
+        t = (t.float() * cos_) + (_rotate_half(t, rotary_interleaved).float() * sin_)
     return torch.cat((t.to(orig_dtype), t_pass), dim=-1)
 
 

@@ -34,9 +34,16 @@ def increment_fwd_count():
 
 
 def dsave(name, tensor):
-    """Save a tensor for debug comparison with SGLang dumps."""
+    """Save a tensor for debug comparison with SGLang dumps. Only rank 0 saves."""
     if not is_dump_enabled():
         return
+    # Only save from TP rank 0 to avoid race condition
+    try:
+        import torch.distributed as _dist
+        if _dist.is_initialized() and _dist.get_rank() != 0:
+            return
+    except Exception:
+        pass
     os.makedirs(_DUMP_DIR, exist_ok=True)
     fwd = _dump_fwd_count[0]
     t = tensor.detach().cpu()
