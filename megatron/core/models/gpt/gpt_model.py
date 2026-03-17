@@ -630,9 +630,33 @@ class GPTModel(LanguageModule):
                     hidden_states.squeeze(1).unsqueeze(0)
                 ).unsqueeze(1)
 
+        if getattr(self.config, "use_sglang", False):
+            hidden_states = hidden_states.to(torch.bfloat16)
+
+        # #region agent log
+        try:
+            import torch.distributed as _dist_dbg
+            _r = _dist_dbg.get_rank() if _dist_dbg.is_initialized() else 0
+            if _r == 0:
+                _hs_flat = hidden_states.detach().float().reshape(-1)
+                _w = output_weight if output_weight is not None else self.output_layer.weight
+                print(f"[DBG2dcb4d] MEGATRON output_layer_pre: hs_shape={list(hidden_states.shape)} hs_dtype={hidden_states.dtype} hs_ndim={hidden_states.ndim} hs_first5={_hs_flat[:5].tolist()} hs_norm={_hs_flat.norm().item():.6f} layer_type={type(self.output_layer).__name__} w_shape={list(_w.shape)} w_requires_grad={_w.requires_grad}", flush=True)
+        except Exception as _e: print(f"[DBG2dcb4d] MEGATRON output_layer_pre ERROR: {_e}", flush=True)
+        # #endregion
+
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
         )
+
+        # #region agent log
+        try:
+            import torch.distributed as _dist_dbg2
+            _r2 = _dist_dbg2.get_rank() if _dist_dbg2.is_initialized() else 0
+            if _r2 == 0:
+                _lg_flat = logits.detach().float().reshape(-1)
+                print(f"[DBG2dcb4d] MEGATRON output_layer_post: logits_shape={list(logits.shape)} logits_dtype={logits.dtype} logits_first5={_lg_flat[:5].tolist()} logits_norm={_lg_flat.norm().item():.6f}", flush=True)
+        except Exception as _e2: print(f"[DBG2dcb4d] MEGATRON output_layer_post ERROR: {_e2}", flush=True)
+        # #endregion
 
         # Restore sequence parallel execution to the output layer if necessary.
         if sequence_parallel_override:

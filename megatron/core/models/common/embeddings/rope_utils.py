@@ -119,11 +119,26 @@ def _apply_rotary_pos_emb_bshd(
 
     # first part is cosine component
     # second part is sine component, need to change signs with _rotate_half method
-    cos_ = (torch.cos(freqs) * mscale).to(t.dtype)
-    sin_ = (torch.sin(freqs) * mscale).to(t.dtype)
+    # CRITICAL: Compute RoPE in float32 to match SGLang's apply_rotary_pos_emb_native
+    # which does q.float(), cos.float(), sin.float() before rotation.
+    orig_dtype = t.dtype
+    cos_ = (torch.cos(freqs) * mscale).float()
+    sin_ = (torch.sin(freqs) * mscale).float()
 
-    t = (t * cos_) + (_rotate_half(t, rotary_interleaved) * sin_)
-    return torch.cat((t, t_pass), dim=-1)
+    import os
+    from megatron.core.transformer.debug_dump import dsave, is_dump_enabled
+    if is_dump_enabled():
+        _rope_dump_count = getattr(_apply_rotary_pos_emb_bshd, '_dump_count', 0)
+        if _rope_dump_count < 1:
+            _apply_dump_count = _rope_dump_count + 1
+            _apply_rotary_pos_emb_bshd._dump_count = _apply_dump_count
+            dsave("rope_freqs", freqs)
+            dsave("rope_cos", cos_)
+            dsave("rope_sin", sin_)
+            dsave("rope_t_input", t)
+
+    t = (t.float() * cos_) + (_rotate_half(t, rotary_interleaved).float() * sin_)
+    return torch.cat((t.to(orig_dtype), t_pass), dim=-1)
 
 
 def _get_thd_freqs_on_this_cp_rank(

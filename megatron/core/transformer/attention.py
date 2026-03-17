@@ -907,8 +907,16 @@ class Attention(MegatronModule, ABC):
 
             if split_qkv:
                 # Check if SGLang RoPE mode is enabled for true on-policy
-                use_sglang_rope = HAVE_SGLANG_ROPE and is_sglang_rope_enabled()
-                
+                # CRITICAL: Do NOT use SGLang RoPE for packed sequences — it doesn't
+                # handle cu_seqlens and will partially apply RoPE (only to max_seqlen_q
+                # tokens instead of all packed tokens). The standard apply_rotary_pos_emb
+                # handles packed sequences correctly via cu_seqlens.
+                use_sglang_rope = (
+                    HAVE_SGLANG_ROPE
+                    and is_sglang_rope_enabled()
+                    and packed_seq_params is None  # disable for packed sequences
+                )
+
                 if q_pos_emb is not None:
                     sglang_rope_applied = False
                     if use_sglang_rope and sglang_apply_rotary_pos_emb_with_freqs is not None:
@@ -931,7 +939,7 @@ class Attention(MegatronModule, ABC):
                             query = inference_context.apply_rotary_emb_query(
                                 query, q_pos_emb, self.config, cu_seqlens_q, self.pg_collection.cp
                             )
-                            
+
                 if k_pos_emb is not None:
                     sglang_rope_applied = False
                     if use_sglang_rope and sglang_apply_rotary_pos_emb_with_freqs is not None:
@@ -959,6 +967,17 @@ class Attention(MegatronModule, ABC):
             # otherwise, only relative positional embedding takes effect
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
         nvtx_range_pop(suffix="rotary_pos_emb")
+
+        if getattr(self.config, 'use_sglang', False) and split_qkv:
+            query = query.to(torch.bfloat16)
+            key = key.to(torch.bfloat16)
+
+        from megatron.core.transformer.debug_dump import dsave, is_dump_enabled
+        if is_dump_enabled() and split_qkv:
+            _layer_idx = self.layer_number - 1
+            dsave(f"layer{_layer_idx:02d}_attn_q_after_rope", query)
+            dsave(f"layer{_layer_idx:02d}_attn_k_after_rope", key)
+            dsave(f"layer{_layer_idx:02d}_attn_v", value)
 
         # ==================================
         # core attention computation
@@ -1019,6 +1038,11 @@ class Attention(MegatronModule, ABC):
             # note that batch is a dummy dimension in the packed case
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
         nvtx_range_pop(suffix="core_attention")
+
+        from megatron.core.transformer.debug_dump import dsave, is_dump_enabled
+        if is_dump_enabled():
+            _layer_idx = self.layer_number - 1
+            dsave(f"layer{_layer_idx:02d}_attn_core_out", core_attn_out)
 
         # Output gate
         if gate is not None:
@@ -1201,6 +1225,12 @@ class SelfAttention(Attention):
         # If no output gate: Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
         # If have output gate: Attention heads [sq, b, h] --> [sq, b, ng * (2 * np/ng + 2) * hn)]
         mixed_qkv, _ = self.linear_qkv(hidden_states)
+
+        from megatron.core.transformer.debug_dump import dsave, is_dump_enabled
+        if is_dump_enabled():
+            _layer_idx = self.layer_number - 1
+            dsave(f"layer{_layer_idx:02d}_attn_mixed_qkv", mixed_qkv)
+
         num_query_heads_per_group = (
             self.num_attention_heads_per_partition // self.num_query_groups_per_partition
         )
@@ -1287,11 +1317,21 @@ class SelfAttention(Attention):
             )
             query = query[:, :, idx * size : (idx + 1) * size, :]
 
+        from megatron.core.transformer.debug_dump import dsave, is_dump_enabled
+        if is_dump_enabled():
+            _layer_idx = self.layer_number - 1
+            dsave(f"layer{_layer_idx:02d}_attn_q_before_qknorm", query)
+            dsave(f"layer{_layer_idx:02d}_attn_k_before_qknorm", key)
+
         if self.q_layernorm is not None:
             query = self.q_layernorm(query)
 
         if self.k_layernorm is not None:
             key = self.k_layernorm(key)
+
+        if is_dump_enabled():
+            dsave(f"layer{_layer_idx:02d}_attn_q_after_qknorm", query)
+            dsave(f"layer{_layer_idx:02d}_attn_k_after_qknorm", key)
 
         if self.config.test_mode:
             self.run_realtime_tests()

@@ -716,7 +716,17 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     use_inner_quantization_context=use_inner_quantization_context,
                 )
             else:
+                from megatron.core.transformer.debug_dump import dsave, is_dump_enabled
+
+                _use_sglang = getattr(self.config, 'use_sglang', False)
+                if _use_sglang:
+                    hidden_states = (hidden_states, None)
+
                 for l_no, layer in enumerate(self.layers):
+                    if is_dump_enabled():
+                        _hs_for_dump = hidden_states[0] if _use_sglang else hidden_states
+                        dsave(f"layer{l_no:02d}_input", _hs_for_dump)
+
                     # Get appropriate inner quantization context
                     if use_inner_quantization_context:
                         if self.config.fp8:
@@ -748,25 +758,46 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             sequence_len_offset=sequence_len_offset,
                         )
 
+                    if is_dump_enabled():
+                        _hs_for_dump = hidden_states[0] if _use_sglang else hidden_states
+                        dsave(f"layer{l_no:02d}_output", _hs_for_dump)
+
                     if (
                         torch.is_grad_enabled()
                         and self.config.cpu_offloading
                         and self.group_prefetch_offload_commit_async is not None
                     ):
-                        hidden_states = self.group_prefetch_offload_commit_async(hidden_states)
+                        if _use_sglang:
+                            _hs, _res = hidden_states
+                            _hs = self.group_prefetch_offload_commit_async(_hs)
+                            hidden_states = (_hs, _res)
+                        else:
+                            hidden_states = self.group_prefetch_offload_commit_async(hidden_states)
+
+                if _use_sglang:
+                    hidden_states, _sglang_final_residual = hidden_states
 
         # Final layer norm.
         if self.final_layernorm is not None:
-            hidden_states = self.final_layernorm(hidden_states)
-            # TENorm produces a "viewed" tensor. This will result in schedule.py's
-            # deallocate_output_tensor() throwing an error, so a viewless tensor is
-            # created to prevent this.
+            if is_dump_enabled():
+                dsave("before_final_layernorm", hidden_states)
+
+            _use_sglang = getattr(self.config, 'use_sglang', False)
+            if _use_sglang:
+                _sglang_final_res = locals().get('_sglang_final_residual', None)
+                result = self.final_layernorm(hidden_states, _sglang_final_res)
+                hidden_states = result[0] if isinstance(result, tuple) else result
+            else:
+                hidden_states = self.final_layernorm(hidden_states)
+
+            if is_dump_enabled():
+                from megatron.core.transformer.debug_dump import increment_fwd_count
+                dsave("after_final_layernorm", hidden_states)
+                increment_fwd_count()
             hidden_states = make_viewless_tensor(
                 inp=hidden_states, requires_grad=True, keep_graph=True
             )
 
-        # If this TransformerBlock is empty, input and output hidden states will be the same node
-        # on the computational graph and will lead to unexpected errors in pipeline schedules.
         if not self.pre_process and len(self.layers) == 0 and not self.final_layernorm:
             hidden_states = hidden_states.clone()
 

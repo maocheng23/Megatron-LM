@@ -160,11 +160,19 @@ class MLP(MegatronModule):
         intermediate_parallel, bias_parallel = self.linear_fc1(hidden_states)
         nvtx_range_pop(suffix="linear_fc1")
 
+        from megatron.core.transformer.debug_dump import dsave, is_dump_enabled
+        if is_dump_enabled() and hasattr(self, '_sglang_layer_idx'):
+            _li = self._sglang_layer_idx
+            dsave(f"layer{_li:02d}_mlp_gate_up_out", intermediate_parallel)
+
         nvtx_range_push(suffix="activation")
         if self.use_sglang or self.config.use_te_activation_func:
             if bias_parallel is not None:
                 intermediate_parallel = intermediate_parallel + bias_parallel
             intermediate_parallel = self.activation_func(intermediate_parallel)
+            if is_dump_enabled() and hasattr(self, '_sglang_layer_idx'):
+                _li = self._sglang_layer_idx
+                dsave(f"layer{_li:02d}_mlp_act_out", intermediate_parallel)
             if per_token_scale is not None:
                 original_dtype = intermediate_parallel.dtype
                 intermediate_parallel = intermediate_parallel * per_token_scale.unsqueeze(-1)

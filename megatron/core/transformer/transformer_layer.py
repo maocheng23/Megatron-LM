@@ -400,25 +400,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # [Module 9: BiasDropoutFusion]
         self.mlp_bda = build_module(submodules.mlp_bda)
-        
-        # For SGLang mode: override bias_dropout_add to use FP32 residual sum
-        # This matches SGLang's behavior: convert to FP32, perform sum, use FP32 for RMSNorm,
-        # then convert back to bf16 (for intermediate layers)
-        if getattr(config, 'use_sglang', False):
-            from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-            # Create a wrapper function that matches the expected signature:
-            # func(training, fused) -> bias_dropout_add_func
-            def _make_sglang_bda(is_final_layer=False):
-                def _sglang_bda(training, fused):
-                    return get_bias_dropout_add(
-                        training=training,
-                        fused=fused,
-                        use_sglang=True,
-                        is_final_layer=is_final_layer
-                    )
-                return _sglang_bda
-            # For intermediate layers, use bf16 output after FP32 residual sum
-            self.mlp_bda = _make_sglang_bda(is_final_layer=False)
 
         self.post_mlp_layernorm = build_module(
             submodules.post_mlp_layernorm,
@@ -553,8 +534,20 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             _start_mlp = torch.cuda.Event(enable_timing=True)
             _end_mlp = torch.cuda.Event(enable_timing=True)
 
+            _prof_sglang_res = None
+            if _use_sglang:
+                _hs_arg = args[0] if args else kwargs.get('hidden_states')
+                if isinstance(_hs_arg, tuple):
+                    _hs_val, _prof_sglang_res = _hs_arg
+                    if args:
+                        args = (_hs_val,) + args[1:]
+                    else:
+                        kwargs['hidden_states'] = _hs_val
+
             _start_attn.record()
-            hidden_states, context = self._forward_attention(*args, **kwargs)
+            hidden_states, context = self._forward_attention(
+                *args, **kwargs, _sglang_residual=_prof_sglang_res
+            )
             _end_attn.record()
 
             _start_mlp.record()
@@ -581,7 +574,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     f"(over {_n_calls} layer×microbatch calls)",
                     flush=True,
                 )
-                # Per-layer breakdown
                 for _ln_key in sorted(cls._component_attn_times.keys()):
                     _a = sum(cls._component_attn_times[_ln_key])
                     _m = sum(cls._component_mlp_times.get(_ln_key, [0]))
@@ -590,10 +582,30 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                         flush=True,
                     )
 
+            if _use_sglang:
+                return (output, getattr(self, '_sglang_residual_out', None)), context
             return output, context
 
-        hidden_states, context = self._forward_attention(*args, **kwargs)
+        _use_sglang = getattr(self.config, 'use_sglang', False)
+
+        # SGLang mode: unpack (hidden_states, residual) tuple from previous layer
+        sglang_residual = None
+        if _use_sglang:
+            hs_arg = args[0] if args else kwargs.get('hidden_states')
+            if isinstance(hs_arg, tuple):
+                hs_val, sglang_residual = hs_arg
+                if args:
+                    args = (hs_val,) + args[1:]
+                else:
+                    kwargs['hidden_states'] = hs_val
+
+        hidden_states, context = self._forward_attention(
+            *args, **kwargs, _sglang_residual=sglang_residual
+        )
         output = self._forward_mlp(hidden_states, kwargs.get("inference_context", None))
+
+        if _use_sglang:
+            return (output, getattr(self, '_sglang_residual_out', None)), context
         return output, context
 
     def _forward_attention(
@@ -612,6 +624,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         sequence_len_offset: Optional[Tensor] = None,
         *,
         inference_params: Optional[Any] = None,
+        _sglang_residual: Optional[Tensor] = None,
     ):
         """
         Perform a forward pass through the attention layer and the layernorms before and after
@@ -643,17 +656,33 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
+        _use_sglang = getattr(self.config, 'use_sglang', False)
+
         # Residual connection.
         residual = hidden_states
 
         # Optional Input Layer norm
-        if self.recompute_input_layernorm:
+        # SGLang mode: input_layernorm is IdentityOp (norm fused into linear_qkv).
+        # Pass residual via side-channel so SGLangLayerNormColumnParallelLinear
+        # can do the residual add inside its internal SGLangRMSNorm.
+        if _use_sglang:
+            if _sglang_residual is None:
+                _sglang_residual = hidden_states
+            else:
+                linear_qkv = getattr(self.self_attention, 'linear_qkv', None)
+                if linear_qkv is not None:
+                    linear_qkv._sglang_pending_residual = _sglang_residual
+            input_layernorm_output = self.input_layernorm(hidden_states)
+        elif self.recompute_input_layernorm:
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
             input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
                 self.input_layernorm, hidden_states
             )
         else:
             input_layernorm_output = self.input_layernorm(hidden_states)
+
+        from megatron.core.transformer.debug_dump import dsave, is_dump_enabled
+        _layer_idx = self.layer_number - 1  # 0-based for dump naming
 
         using_fused_tp_inference_kernel = (not self.training) and (
             self.config.inference_fuse_tp_communication
@@ -680,6 +709,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
         nvtx_range_pop(suffix="self_attention")
 
+        if is_dump_enabled():
+            # In use_sglang mode, input_layernorm is IdentityOp; real LN happens
+            # inside SGLangLayerNormColumnParallelLinear (self_attention.linear_qkv).
+            linear_qkv = getattr(self.self_attention, 'linear_qkv', None)
+            real_ln_out = getattr(linear_qkv, '_sglang_last_normed', None) if linear_qkv else None
+            dsave(f"layer{_layer_idx:02d}_after_input_ln", real_ln_out if real_ln_out is not None else input_layernorm_output)
+
         if self.recompute_input_layernorm:
             # discard the output of the input layernorm and register the recompute
             # as a gradient hook of attention_output_with_bias[0]
@@ -688,7 +724,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
 
         attention_output, attention_output_bias = attention_output_with_bias
-        
+
+        if is_dump_enabled():
+            dsave(f"layer{_layer_idx:02d}_after_attn", attention_output)
+
         attention_output = self.post_self_attn_layernorm(attention_output)
         attention_output_with_bias = (attention_output, attention_output_bias)
 
@@ -696,25 +735,25 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="self_attn_bda")
         if using_fused_tp_inference_kernel:
-            # In inference optimized transformer layer, there is no bias and dropout
-            # The remaining residual add is already handled inside the
-            # self attention module.
             hidden_states = attention_output_with_bias[0]
-            self._moe_pre_resadd_residual = None  # Not used for fused kernel
-        elif self.is_moe_layer and getattr(self.config, 'use_sglang', False):
-            # For MoE SGLang mode: don't do resadd here, let pre_mlp_layernorm do it
-            # This matches SGLang's behavior where RMSNorm does x = x + residual internally
+            self._sglang_pre_mlp_residual = None
+        elif _use_sglang:
             from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add_no_resadd
             with self.bias_dropout_add_exec_handler():
-                hidden_states, self._moe_pre_resadd_residual = get_bias_dropout_add_no_resadd(
+                hidden_states, _ = get_bias_dropout_add_no_resadd(
                     self.training, self.config.bias_dropout_fusion
                 )(attention_output_with_bias, residual, self.hidden_dropout)
+            linear_qkv = getattr(self.self_attention, 'linear_qkv', None)
+            if linear_qkv is not None and hasattr(linear_qkv, '_sglang_last_residual'):
+                _sglang_residual = linear_qkv._sglang_last_residual
+                del linear_qkv._sglang_last_residual
+            self._sglang_pre_mlp_residual = _sglang_residual
         else:
             with self.bias_dropout_add_exec_handler():
                 hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
                     attention_output_with_bias, residual, self.hidden_dropout
                 )
-            self._moe_pre_resadd_residual = None  # Not needed for non-MoE or non-SGLang
+            self._sglang_pre_mlp_residual = None
         nvtx_range_pop(suffix="self_attn_bda")
 
         # Residual connection.
@@ -754,35 +793,38 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             output (Tensor): Transformed hidden states of shape [s, b, h].
         """
 
+        _use_sglang = getattr(self.config, 'use_sglang', False)
+
         # Residual connection.
         residual = hidden_states
 
-        # Optional Layer norm post the cross-attention.
-        # For MoE SGLang mode, pass residual to pre_mlp_layernorm to do resadd inside
-        moe_residual = getattr(self, '_moe_pre_resadd_residual', None)
-        
-        # NOTE: For MoE SGLang true on-policy mode, tree_all_reduce is done inside 
-        # SGLangRowParallelLinear to match SGLang's numerical path exactly.
-        # Do NOT add additional all-reduce here as it would cause double all-reduce!
-        
-        if self.recompute_pre_mlp_layernorm:
-            self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            if moe_residual is not None:
-                # MoE SGLang mode: pass residual for internal resadd
-                pre_mlp_layernorm_output, residual = self.pre_mlp_norm_checkpoint.checkpoint(
-                    self.pre_mlp_layernorm, hidden_states, moe_residual
-                )
-            else:
-                pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
-                    self.pre_mlp_layernorm, hidden_states
-                )
-        else:
-            if moe_residual is not None:
-                # MoE SGLang mode: pass residual for internal resadd
-                # This matches SGLang's RMSNorm.forward_native with fp32_residual=False
-                pre_mlp_layernorm_output, residual = self.pre_mlp_layernorm(hidden_states, moe_residual)
-            else:
+        # SGLang mode: pass cross-layer residual into pre_mlp_layernorm so the
+        # residual add happens inside the norm (matching SGLang's prepare_mlp).
+        sglang_residual = getattr(self, '_sglang_pre_mlp_residual', None)
+
+        if _use_sglang and sglang_residual is not None:
+            if isinstance(self.pre_mlp_layernorm, IdentityOp):
+                linear_fc1 = getattr(self.mlp, 'linear_fc1', None)
+                if linear_fc1 is not None and hasattr(linear_fc1, 'norm'):
+                    linear_fc1._sglang_pending_residual = sglang_residual
                 pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
+            else:
+                result = self.pre_mlp_layernorm(hidden_states, sglang_residual)
+                if isinstance(result, tuple) and len(result) == 2:
+                    pre_mlp_layernorm_output, sglang_residual = result
+                else:
+                    pre_mlp_layernorm_output = result
+                self._sglang_pre_mlp_residual = sglang_residual
+        elif self.recompute_pre_mlp_layernorm:
+            self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+            pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
+                self.pre_mlp_layernorm, hidden_states
+            )
+        else:
+            pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
+
+        from megatron.core.transformer.debug_dump import dsave, is_dump_enabled
+        _layer_idx = self.layer_number - 1
 
         nvtx_range_push(suffix="mlp")
         # Potentially chunk the MLP computation during prefill to minimize the peak activation size
@@ -832,9 +874,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 # Set the residual for fused reduce-scatter + add + layer-norm + all-gather
                 # operation in MLP's fc2.
                 self._set_fc2_residual(residual)
+            self.mlp._sglang_layer_idx = _layer_idx
             mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
 
         mlp_output, mlp_output_bias = mlp_output_with_bias
+        if is_dump_enabled():
+            linear_fc1 = getattr(self.mlp, 'linear_fc1', None)
+            real_pre_mlp_ln = getattr(linear_fc1, '_sglang_last_normed', None) if linear_fc1 else None
+            dsave(f"layer{_layer_idx:02d}_moe_input", real_pre_mlp_ln if real_pre_mlp_ln is not None else pre_mlp_layernorm_output)
+            dsave(f"layer{_layer_idx:02d}_moe_output", mlp_output)
         mlp_output = self.post_mlp_layernorm(mlp_output)
         mlp_output_with_bias = (mlp_output, mlp_output_bias)
 
@@ -875,18 +923,26 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
         """
+        _use_sglang = getattr(self.config, 'use_sglang', False)
         using_fused_tp_inference_kernel = (not self.training) and (
             self.config.inference_fuse_tp_communication
         )
 
-        # TODO: could we move `bias_dropout_add_exec_handler` itself
-        # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="mlp_bda")
         if using_fused_tp_inference_kernel:
-            # In inference optimized transformer layer, there is no bias and dropout
-            # The remaining residual add is already handled inside the
-            # MLP module.
             hidden_states = mlp_output_with_bias[0]
+        elif _use_sglang:
+            from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add_no_resadd
+            with self.bias_dropout_add_exec_handler():
+                hidden_states, _ = get_bias_dropout_add_no_resadd(
+                    self.training, self.config.bias_dropout_fusion
+                )(mlp_output_with_bias, residual, self.hidden_dropout)
+            sglang_residual = getattr(self, '_sglang_pre_mlp_residual', None)
+            linear_fc1 = getattr(self.mlp, 'linear_fc1', None)
+            if linear_fc1 is not None and hasattr(linear_fc1, '_sglang_last_residual'):
+                sglang_residual = linear_fc1._sglang_last_residual
+                del linear_fc1._sglang_last_residual
+            self._sglang_residual_out = sglang_residual
         else:
             with self.bias_dropout_add_exec_handler():
                 hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
@@ -894,12 +950,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 )
         nvtx_range_pop(suffix="mlp_bda")
 
-        # Jit compiled function creates 'view' tensor. This tensor
-        # potentially gets saved in the MPU checkpoint function context,
-        # which rejects view tensors. While making a viewless tensor here
-        # won't result in memory savings (like the data loader, or
-        # p2p_communication), it serves to document the origin of this
-        # 'view' tensor.
         output = make_viewless_tensor(
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )

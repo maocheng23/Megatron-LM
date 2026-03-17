@@ -345,21 +345,23 @@ class SGLangLinear(MegatronModule):
     def forward(self, x: Tensor) -> Tuple[Tensor, Optional[Tensor]]:
         """Forward pass using batch-invariant operations.
 
-        Uses explicit BF16 casting to match SGLang's FSDP-compatible numerical paths.
+        SGLang's batch_invariant_mode replaces aten::mm with a Triton kernel
+        (matmul_persistent) that requires both operands to have the same dtype.
+        So we must cast input to bfloat16 before matmul, matching SGLang's
+        actual runtime behavior where all linear inputs are bfloat16.
         """
-        # Cast to BF16 to match SGLang's FSDP-compatible paths
-        # In SGLang's logits_processor: torch.matmul(hidden_states.bfloat16(), weight.T.bfloat16())
         x = x.to(torch.bfloat16)
-
         # Reshape for matrix multiplication
         orig_shape = x.shape
         x = x.view(-1, self.input_size if self.parallel_mode != "row" else x.shape[-1])
 
-        # Use batch-invariant GEMM with BF16 weight
+        # Use batch-invariant GEMM with BF16 weight (input dtype preserved)
         weight_bf16 = self.weight.to(torch.bfloat16)
         # TP-invariant matmul for row-parallel: use matmul_tp_persistent for cross-TP support
+        # Only use when TP>1; at TP=1 we must use sglang_mm to match SGLang's DeepGEMM kernel
         _use_tp_inv = (
             self.parallel_mode == "row"
+            and self.tp_size > 1
             and os.environ.get("ROW_LINEAR_ENABLE_INV", "0") == "1"
         )
         if _use_tp_inv:
@@ -875,13 +877,11 @@ class SGLangRowParallelGroupedLinear(SGLangGroupedLinear):
 
 class SGLangRMSNorm(MegatronModule):
     """
-    RMSNorm matching SGLang's FSDP-compatible numerical paths.
-    
-    When residual is provided (for MoE pre_mlp_layernorm), this matches SGLang's
-    RMSNorm.forward_native with fp32_residual=False:
-    1. x = x + residual (bf16 add)
-    2. residual = x.clone()
-    3. RMSNorm computation in FP32
+    RMSNorm matching SGLang's RMSNorm.forward_native exactly.
+
+    Supports two residual modes controlled by config.fp32_residual_connection:
+      - False (MoE/Qwen3-30B-A3B): residual add in input dtype, residual = (x+residual).clone()
+      - True  (Dense/Qwen3-0.6B):  residual add in fp32, residual NOT updated
     """
 
     def __init__(
@@ -894,65 +894,115 @@ class SGLangRMSNorm(MegatronModule):
 
         self.hidden_size = hidden_size
         self.eps = eps
-        self.variance_epsilon = eps  # Alias for compatibility
+        self.variance_epsilon = eps
+
+        self.fp32_residual = getattr(config, 'sglang_fp32_residual', False) or getattr(config, 'fp32_residual_connection', False)
+        self.override_orig_dtype = torch.float32 if self.fp32_residual else None
 
         if config.init_model_with_meta_device:
             device = 'meta'
         else:
             device = torch.cuda.current_device()
 
-        # Use FP32 weights to match SGLang's FSDP mode (weight_dtype=torch.float32)
         self.weight = nn.Parameter(
             torch.ones(hidden_size, dtype=torch.float32, device=device)
         )
-    
+
     def forward(self, x: Tensor, residual: Tensor = None):
-        """Forward matching SGLang's forward_native with FSDP settings.
-        
-        Args:
-            x: Input tensor (attention output for MoE, or already-resadded for Dense)
-            residual: Optional residual tensor. When provided (MoE case), performs
-                     bf16 residual add inside LayerNorm to match SGLang exactly.
-        
-        Returns:
-            If residual is None: normalized tensor
-            If residual is provided: (normalized tensor, updated residual)
-        """
+        """Matches SGLang's RMSNorm.forward_native with cast_x_before_out_mul=True."""
         if not x.is_contiguous():
             x = x.contiguous()
-        
-        orig_dtype = x.dtype
-        
-        # If residual is provided, do resadd in bf16 (matching SGLang's fp32_residual=False)
-        if residual is not None:
-            x = x + residual  # bf16 add, matching SGLang
-            residual = x.clone()  # Update residual to resadd result, matching SGLang
-        
+
+        orig_dtype = self.override_orig_dtype or x.dtype
+
+        if residual is not None and not self.fp32_residual:
+            x = x + residual
+            residual = x.clone()
+
         x = x.to(torch.float32)
-        
-        # RMSNorm computation in FP32
+
+        if residual is not None and self.fp32_residual:
+            x = x + residual.to(torch.float32)
+
         variance = x.pow(2).mean(dim=-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.eps)
-        
-        # cast_x_before_out_mul=True: weight * x.to(orig_dtype)
-        # Match SGLang exactly - don't add extra dtype conversion
-        x = self.weight * x.to(orig_dtype)
-        
+
+        w = self.weight.float()
+        x = w * x.to(orig_dtype)
+
         if residual is not None:
             return x, residual
         return x
 
 
+class SGLangQKRMSNorm(MegatronModule):
+    """RMSNorm for Q/K normalization — matches SGLang's actual code path.
+
+    For true-on-policy, keep the normalization multiply in fp32 and cast only
+    once at the end. That matches SGLang's batch-invariant Triton kernel and
+    avoids an extra bf16 truncation right before RoPE.
+    """
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        hidden_size: int,
+        eps: float = 1e-6,
+    ):
+        super().__init__(config=config)
+        self.hidden_size = hidden_size
+        self.eps = eps
+        self.variance_epsilon = eps
+
+        try:
+            from sglang.srt.server_args import get_global_server_args
+            target = getattr(get_global_server_args(), 'rl_on_policy_target', None)
+        except Exception:
+            target = None
+        self.cast_x_before_out_mul = target in ('fsdp', 'fsdp_tp', None)
+
+        if config.init_model_with_meta_device:
+            device = 'meta'
+        else:
+            device = torch.cuda.current_device()
+
+        self.weight = nn.Parameter(
+            torch.ones(hidden_size, dtype=torch.float32, device=device)
+        )
+
+    def forward(self, x: Tensor):
+        if not x.is_contiguous():
+            x = x.contiguous()
+        orig_dtype = x.dtype
+        x = x.to(torch.float32)
+        variance = x.pow(2).mean(dim=-1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.eps)
+        w = self.weight.float()
+        if self.cast_x_before_out_mul:
+            x = w * x.to(orig_dtype)
+        else:
+            x = (x * w).to(orig_dtype)
+        return x
+
+
 class SGLangFinalRMSNorm(MegatronModule):
     """
-    Final RMSNorm matching SGLang's FSDP-compatible numerical paths for true on-policy mode.
-    
-    This is specifically for the final layer norm, which in SGLang uses:
-    - override_orig_dtype=torch.float32
-    - cast_x_before_out_mul=True
-    
-    This ensures bitwise-identical results between SGLang inference and Megatron training
-    for the final layer norm output.
+    Final RMSNorm matching SGLang's model.norm for the last transformer layer.
+
+    SGLang's final norm config (qwen2.py):
+      - weight_dtype=None (commented out) → created as fp32, but model loading
+        converts to params_dtype (bf16)
+      - cast_x_before_out_mul=True
+      - override_orig_dtype=None (commented out) → orig_dtype = x.dtype
+      - fp32_residual=False → residual add in input dtype, residual = (x+res).clone()
+
+    So the runtime path is:
+      orig_dtype = x.dtype (bf16)
+      x = x + residual  (bf16 + fp32 → fp32 via type promotion)
+      residual = x.clone()  (fp32)
+      x = x.to(fp32)
+      x = x * rsqrt(var + eps)
+      x = weight(bf16) * x.to(bf16) → bf16
     """
 
     def __init__(
@@ -971,71 +1021,29 @@ class SGLangFinalRMSNorm(MegatronModule):
         else:
             device = torch.cuda.current_device()
 
-        # Use FP32 weights to match SGLang's FSDP mode (weight_dtype=torch.float32)
-        # In SGLang, weight is created as FP32 and stays FP32 even after loading from checkpoint
         self.weight = nn.Parameter(
             torch.ones(hidden_size, dtype=torch.float32, device=device)
         )
-        
-        _print_sglang_log(f"🔍 SGLangFinalRMSNorm.__init__ called: hidden_size={hidden_size}, eps={eps}")
 
-    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
-        """Override to ensure weight remains FP32 after loading from checkpoint.
-        
-        In SGLang, weight_dtype=torch.float32 ensures weight is always FP32.
-        We need to maintain this behavior even when loading from checkpoints
-        that might have bfloat16 weights.
-        """
-        weight_key = prefix + 'weight'
-        if weight_key in state_dict:
-            loaded_weight = state_dict[weight_key]
-            if loaded_weight.dtype != torch.float32:
-                _print_sglang_log(
-                    f"🔍 SGLangFinalRMSNorm: Converting weight from {loaded_weight.dtype} to FP32 during load",
-                    level=logging.INFO
-                )
-                # Convert to FP32 to match SGLang's weight_dtype=torch.float32 behavior
-                state_dict[weight_key] = loaded_weight.to(torch.float32)
-        # Call parent implementation
-        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
-
-    def forward(self, x: Tensor) -> Tensor:
-        """Forward matching SGLang's final RMSNorm with true on-policy settings.
-        
-        Matches SGLang's RMSNorm.forward_native with:
-        - cast_x_before_out_mul=True
-        - override_orig_dtype=torch.float32 (for true on-policy mode)
-        
-        In true on-policy mode, SGLang's final norm uses override_orig_dtype=torch.float32,
-        which means the output dtype should be FP32, not the input dtype.
-        """
+    def forward(self, x: Tensor, residual: Tensor = None) -> Tensor:
         if not x.is_contiguous():
             x = x.contiguous()
-        
-        # In true on-policy mode, SGLang uses override_orig_dtype=torch.float32
-        # This means orig_dtype should be FP32, not the input dtype
-        # This ensures bitwise-identical results with SGLang inference
-        orig_dtype = torch.bfloat16  # Match SGLang's override_orig_dtype=torch.float32
+
+        orig_dtype = x.dtype
+
+        if residual is not None:
+            x = x + residual
+            residual = x.clone()
+
         x = x.to(torch.float32)
-        
-        # RMSNorm computation in FP32
-        # Match SGLang's forward_native exactly:
-        # 1. Compute variance using x_var (which is x in our case, no variance_size_override)
-        #    SGLang line 201-202: x_var = x (when variance_size_override is None)
-        #    SGLang line 212: variance = x_var.pow(2).mean(dim=-1, keepdim=True)
+
         variance = x.pow(2).mean(dim=-1, keepdim=True)
-        #    SGLang line 213: x = x * torch.rsqrt(variance + self.variance_epsilon)
         x = x * torch.rsqrt(variance + self.eps)
-        
-        # Match SGLang line 216 exactly: x = self.weight * x.to(orig_dtype)
-        # where orig_dtype=torch.float32, so x.to(orig_dtype) is a no-op (x is already FP32)
-        # But we do it to match SGLang's exact computation path
+
         x = self.weight * x.to(orig_dtype)
-        
-        # CRITICAL: This function returns float32, not bfloat16.
-        # This matches SGLang's final norm output in true on-policy mode,
-        # which uses override_orig_dtype=torch.float32.
-        # The output dtype is float32, ensuring bitwise-identical results with SGLang.
+
+        if residual is not None:
+            return x, residual
         return x
 
 
@@ -1079,8 +1087,9 @@ class SGLangLayerNorm(MegatronModule):
         var = x_float.var(-1, keepdim=True, unbiased=False)
         normed = (x_float - mean) / torch.sqrt(var + self.eps)
 
-        # Apply weight and bias in FP32, then cast back
-        return (self.weight * normed + self.bias).to(orig_dtype)
+        w = self.weight.float()
+        b = self.bias.float()
+        return (w * normed + b).to(orig_dtype)
 
 
 class SGLangNorm(MegatronModule):
@@ -1177,8 +1186,27 @@ class SGLangLayerNormColumnParallelLinear(MegatronModule):
         """TE-compatible property for layer norm bias."""
         return getattr(self.norm, 'bias', None)
 
-    def forward(self, x: Tensor) -> Tuple[Tensor, Optional[Tensor]]:
+    _debug_printed = False
+
+    def forward(self, x: Tensor, residual: Tensor = None) -> Tuple[Tensor, Optional[Tensor]]:
+        if residual is None:
+            residual = getattr(self, '_sglang_pending_residual', None)
+            if residual is not None:
+                del self._sglang_pending_residual
+        if residual is not None:
+            if not SGLangLayerNormColumnParallelLinear._debug_printed:
+                print(f"[SGLANG_DEBUG] LN+Linear got residual: x.shape={x.shape}, "
+                      f"residual.shape={residual.shape}, x.dtype={x.dtype}, "
+                      f"residual.dtype={residual.dtype}, fp32_res={self.norm.fp32_residual}",
+                      flush=True)
+                SGLangLayerNormColumnParallelLinear._debug_printed = True
+            normed, residual = self.norm(x, residual)
+            self._sglang_last_residual = residual
+            self._sglang_last_normed = normed
+            linear_output, _ = self.linear(normed)
+            return linear_output, None
         normed = self.norm(x)
+        self._sglang_last_normed = normed
         linear_output, _ = self.linear(normed)
         return linear_output, None
 
@@ -1268,8 +1296,13 @@ def sglang_apply_rotary_pos_emb(
         cos = cos.unsqueeze(-2)  # [seq, 1, head_dim//2]
         sin = sin.unsqueeze(-2)
 
-    cos = cos.to(x.dtype)
-    sin = sin.to(x.dtype)
+    # CRITICAL: Compute RoPE in float32 to match SGLang's apply_rotary_pos_emb_native
+    # which does q, k = q.float(), k.float() before rotation.
+    # Do NOT cast cos/sin to x.dtype (bf16) — that causes huge numerical differences.
+    orig_dtype = x.dtype
+    x = x.float()
+    cos = cos.float()
+    sin = sin.float()
 
     # Handle partial RoPE (rotary_percent < 1.0, e.g. Qwen3-Next uses 0.25)
     rotary_dim = cos.shape[-1] * 2  # cos has rotary_dim/2 elements
@@ -1277,7 +1310,7 @@ def sglang_apply_rotary_pos_emb(
         x_rot = x[..., :rotary_dim]
         x_pass = x[..., rotary_dim:]
         x_rot = sglang_apply_rotary_pos_emb(x_rot, cos, sin, is_neox_style)
-        return torch.cat((x_rot, x_pass), dim=-1)
+        return torch.cat((x_rot, x_pass), dim=-1).to(orig_dtype)
 
     if is_neox_style:
         x1, x2 = torch.chunk(x, 2, dim=-1)
@@ -1289,9 +1322,9 @@ def sglang_apply_rotary_pos_emb(
     o2 = x2 * cos + x1 * sin
 
     if is_neox_style:
-        return torch.cat((o1, o2), dim=-1)
+        return torch.cat((o1, o2), dim=-1).to(orig_dtype)
     else:
-        return torch.stack((o1, o2), dim=-1).flatten(-2)
+        return torch.stack((o1, o2), dim=-1).flatten(-2).to(orig_dtype)
 
 
 def sglang_apply_rotary_pos_emb_to_qk(
@@ -1855,12 +1888,13 @@ class SGLangSpecProvider(BackendSpecProvider):
         This ensures numerical consistency between SGLang inference and Megatron training.
         Do NOT use fallback here as TransformerEngine's norms have different numerical behavior.
 
-        For Q/K layernorm (for_qk=True), always use RMSNorm as most LLMs (Qwen, LLaMA, etc.)
-        use RMSNorm for query/key normalization, even when the main layernorm might be different.
+        For Q/K layernorm (for_qk=True), use SGLangQKRMSNorm which never sets
+        override_orig_dtype — matching SGLang's Qwen3Attention q_norm/k_norm that
+        output in x.dtype (bf16), not float32.
         """
-        # For Q/K layernorm, always use RMSNorm (standard for most LLMs)
-        # This avoids bias parameters that would break checkpoint compatibility
-        if for_qk or rms_norm:
+        if for_qk:
+            return SGLangQKRMSNorm
+        if rms_norm:
             return SGLangRMSNorm
         # Return SGLangNorm which will check config.normalization at instantiation time
         # This ensures correct norm type (RMSNorm vs LayerNorm) based on model config

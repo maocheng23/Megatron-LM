@@ -435,6 +435,11 @@ class TransformerConfig(ModelParallelConfig):
     use_sglang: bool = False
     """Use the SGLang extension for batch-invariant kernels."""
 
+    sglang_fp32_residual: bool = False
+    """SGLang fp32_residual mode for dense models (Qwen3-0.6B/4B).
+    When True, residual add inside RMSNorm happens in fp32 and residual is NOT updated.
+    When False (MoE models), residual add happens in input dtype and residual IS updated."""
+
     use_sglang_attention: bool = True
     """Use the SGLang extension for attention (Flash Attention 3 with batch-invariant mode)."""
 

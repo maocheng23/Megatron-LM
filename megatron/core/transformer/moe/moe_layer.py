@@ -419,8 +419,13 @@ class MoELayer(BaseMoELayer):
         - Expert computation only processes local experts (non-local experts skipped)
         - Results are all-reduced across EP ranks
         """
+        from megatron.core.transformer.debug_dump import dsave, is_dump_enabled
+        _layer_idx = self.layer_number - 1
+
         # Compute shared experts using F.linear to match SGLang exactly
         shared_expert_output = self._sglang_shared_expert_forward(hidden_states)
+        if is_dump_enabled() and shared_expert_output is not None:
+            dsave(f"layer{_layer_idx:02d}_shared_expert", shared_expert_output)
 
         # Get routing (this also stores topk_weights and topk_ids in router)
         probs, routing_map = self.route(hidden_states)
@@ -428,7 +433,10 @@ class MoELayer(BaseMoELayer):
         # Get topk values from router (stored during _sglang_router_forward)
         topk_weights = self.router._sglang_topk_weights
         topk_ids = self.router._sglang_topk_ids
-        
+        if is_dump_enabled():
+            dsave(f"layer{_layer_idx:02d}_topk_weights", topk_weights)
+            dsave(f"layer{_layer_idx:02d}_topk_ids", topk_ids.float())
+
         # Get EP info
         ep_size = utils.get_pg_size(self.ep_group)
         ep_rank = utils.get_pg_rank(self.ep_group)
@@ -459,6 +467,9 @@ class MoELayer(BaseMoELayer):
             ep_size=ep_size,
             ep_group=self.attn_tp_group,  # Use TP group for gradient all-reduce to match forward all-reduce
         )
+        if is_dump_enabled():
+            dsave(f"layer{_layer_idx:02d}_fused_experts", output)
+
         # Free stacked weight cache to save memory (significant for 512+ experts)
         del w1, w2
         self._sglang_w_cache = None
@@ -468,16 +479,22 @@ class MoELayer(BaseMoELayer):
             output = output.view(original_shape[0], original_shape[1], -1)
 
         # Match SGLang's qwen2_moe.py order: add shared FIRST, then all-reduce.
-        # SGLang uses NCCL all_reduce (tensor_model_parallel_all_reduce), so we use
-        # torch.distributed.all_reduce to match exactly (not _tree_all_reduce_sum).
+        # With rl_on_policy_target="fsdp_tp", SGLang uses tree_all_reduce for MoE output.
+        # Megatron must also use tree_all_reduce to match (deterministic binary tree sum).
         if shared_expert_output is not None:
             if len(original_shape) == 3:
                 shared_expert_output = shared_expert_output.view(original_shape[0], original_shape[1], -1)
             output = output + shared_expert_output
 
+        if is_dump_enabled():
+            dsave(f"layer{_layer_idx:02d}_moe_before_allreduce", output)
+
         tp_size = utils.get_pg_size(self.attn_tp_group)
         if tp_size > 1:
-            torch.distributed.all_reduce(output, group=self.attn_tp_group)
+            output = _tree_all_reduce_sum(output, self.attn_tp_group)
+
+        if is_dump_enabled():
+            dsave(f"layer{_layer_idx:02d}_moe_after_allreduce", output)
 
         return output, None  # mlp_bias is None
 

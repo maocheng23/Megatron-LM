@@ -86,12 +86,6 @@ def bias_dropout_add_unfused(training, use_fp32_residual=False, output_dtype=Non
     return _bias_dropout_add
 
 
-def get_bias_dropout_add_sglang(training, fused, is_final_layer=False):
-    output_dtype = torch.float32 if is_final_layer else torch.bfloat16
-    
-    return bias_dropout_add_unfused(training, use_fp32_residual=True, output_dtype=output_dtype)
-
-
 @jit_fuser
 def bias_dropout_add_fused_train(
     x_with_bias: Tuple[torch.Tensor, Optional[torch.Tensor]], residual: torch.Tensor, prob: float

@@ -43,10 +43,11 @@ def _tree_all_reduce_sum_impl(x: torch.Tensor, group, layer_id: int = -1) -> tor
     torch.distributed.all_gather(result, x, group=group)
     
     # Tree-structured sum for deterministic order
+    # Must use in-place += to match SGLang's tree_all_reduce_sum exactly (bitwise)
     for level in range(1, world_size.bit_length()):
         for left in range(0, world_size, 1 << level):
             right = left + (1 << (level - 1))
-            result[left] = result[left] + result[right]  # Non-in-place to preserve autograd
+            result[left] += result[right]
     
     return result[0]
 

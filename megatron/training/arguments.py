@@ -3525,6 +3525,12 @@ def _add_sglang_arguments(parser: argparse.ArgumentParser):
             help="Use SGLang extension for batch-invariant kernels.",
         )
         group.add_argument(
+            '--sglang-fp32-residual',
+            action="store_true",
+            default=False,
+            help="Use fp32 residual add inside RMSNorm (matching SGLang dense models like Qwen3-0.6B/4B).",
+        )
+        group.add_argument(
             '--use-sglang-attention',
             action="store_true",
             default=False,

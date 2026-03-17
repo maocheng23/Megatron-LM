@@ -659,6 +659,10 @@ class TopKRouter(Router):
         if self.bias is not None:
             router_logits = router_logits + self.bias
 
+        from megatron.core.transformer.debug_dump import dsave, is_dump_enabled
+        if is_dump_enabled():
+            dsave(f"router_logits", router_logits)
+
         # Apply softmax, topk, and renormalize (matching SGLang)
         routing_weights = F.softmax(
             router_logits, dim=1, dtype=torch.float

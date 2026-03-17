@@ -12,6 +12,11 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
+try:
+    from sglang.srt.batch_invariant_ops.batch_invariant_ops import is_batch_invariant_mode_enabled
+except ImportError:
+    is_batch_invariant_mode_enabled = None
+
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.parallel_state import (
     get_global_memory_buffer,
@@ -316,6 +321,8 @@ class VocabParallelEmbedding(torch.nn.Module):
         }
 
 
+_dbg_frozen_count = 0
+
 class LinearWithFrozenWeight(torch.autograd.Function):
     """Linear operator that does not calculate gradient for weight.
     This op and LinearWithGradAccumulationAndAsyncCommunication performs
@@ -332,7 +339,29 @@ class LinearWithFrozenWeight(torch.autograd.Function):
         ctx.save_for_backward(weight)
         ctx.allreduce_dgrad = allreduce_dgrad
         ctx.tp_group = tp_group
+        # #region agent log
+        global _dbg_frozen_count
+        if _dbg_frozen_count < 2:
+            try:
+                import torch.distributed as _dist_fw
+                _r_fw = _dist_fw.get_rank() if _dist_fw.is_initialized() else 0
+                if _r_fw == 0:
+                    _dispatch = "bmm" if input.ndim == 3 else "mm"
+                    print(f"[DBG2dcb4d] LinearWithFrozenWeight.forward: dispatch={_dispatch} input_shape={list(input.shape)} weight_shape={list(weight.shape)}", flush=True)
+                    _dbg_frozen_count += 1
+            except Exception: pass
+        # #endregion
+        _need_reshape_fw = (
+            is_batch_invariant_mode_enabled is not None
+            and is_batch_invariant_mode_enabled()
+            and input.ndim == 3
+        )
+        if _need_reshape_fw:
+            _orig_shape_fw = input.shape
+            input = input.reshape(-1, _orig_shape_fw[-1])
         output = torch.matmul(input, weight.t())
+        if _need_reshape_fw:
+            output = output.reshape(*_orig_shape_fw[:-1], output.shape[-1])
         if bias is not None:
             output = output + bias
         return output
@@ -441,6 +470,8 @@ def linear_with_frozen_weight(
     return LinearWithFrozenWeight.apply(*args)
 
 
+_dbg_gradaccum_count = 0
+
 class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
     """See linear_with_grad_accumulation_and_async_allreduce"""
 
@@ -486,7 +517,29 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         else:
             total_input = input
 
+        # #region agent log
+        global _dbg_gradaccum_count
+        if _dbg_gradaccum_count < 2:
+            try:
+                import torch.distributed as _dist_ga
+                _r_ga = _dist_ga.get_rank() if _dist_ga.is_initialized() else 0
+                if _r_ga == 0:
+                    _dispatch_ga = "bmm" if total_input.ndim == 3 else "mm"
+                    print(f"[DBG2dcb4d] LinearWithGradAccum.forward: dispatch={_dispatch_ga} input_shape={list(total_input.shape)} weight_shape={list(weight.shape)}", flush=True)
+                    _dbg_gradaccum_count += 1
+            except Exception: pass
+        # #endregion
+        _need_reshape_ga = (
+            is_batch_invariant_mode_enabled is not None
+            and is_batch_invariant_mode_enabled()
+            and total_input.ndim == 3
+        )
+        if _need_reshape_ga:
+            _orig_shape_ga = total_input.shape
+            total_input = total_input.reshape(-1, _orig_shape_ga[-1])
         output = torch.matmul(total_input, weight.t())
+        if _need_reshape_ga:
+            output = output.reshape(*_orig_shape_ga[:-1], output.shape[-1])
         if bias is not None:
             output = output + bias
         return output
@@ -1167,11 +1220,41 @@ class ColumnParallelLinear(torch.nn.Module):
             )
         )
 
+    _dbg_col_logged = False
+
     def _forward_impl(self, input, weight, *args, **kwargs):
+        # #region agent log
+        if not ColumnParallelLinear._dbg_col_logged:
+            try:
+                import torch.distributed as _dist_cpl
+                _r_cpl = _dist_cpl.get_rank() if _dist_cpl.is_initialized() else 0
+                if _r_cpl == 0:
+                    _path = "frozen_weight" if not weight.requires_grad else "grad_accum_async"
+                    _bi = is_batch_invariant_mode_enabled() if is_batch_invariant_mode_enabled is not None else False
+                    _reshape = _bi and input.ndim == 3
+                    print(f"[DBG2dcb4d] ColumnParallelLinear._forward_impl: path={_path} input_shape={list(input.shape)} input_ndim={input.ndim} weight_shape={list(weight.shape)} w_requires_grad={weight.requires_grad} batch_inv={_bi} reshape_3d_to_2d={_reshape}", flush=True)
+                    ColumnParallelLinear._dbg_col_logged = True
+            except Exception: pass
+        # #endregion
+
+        need_reshape = (
+            is_batch_invariant_mode_enabled is not None
+            and is_batch_invariant_mode_enabled()
+            and input.ndim == 3
+        )
+        if need_reshape:
+            orig_shape = input.shape
+            input = input.reshape(-1, orig_shape[-1])
+
         if not weight.requires_grad:
-            return linear_with_frozen_weight(input, weight, *args, **kwargs)
+            output = linear_with_frozen_weight(input, weight, *args, **kwargs)
         else:
-            return linear_with_grad_accumulation_and_async_allreduce(input, weight, *args, **kwargs)
+            output = linear_with_grad_accumulation_and_async_allreduce(input, weight, *args, **kwargs)
+
+        if need_reshape:
+            output = output.reshape(*orig_shape[:-1], output.shape[-1])
+
+        return output
 
     def forward(
         self,
@@ -1453,12 +1536,28 @@ class RowParallelLinear(torch.nn.Module):
 
     def _forward_impl(self, input, weight, *args, **kwargs):
         _use_tp_inv = os.environ.get("ROW_LINEAR_ENABLE_INV", "0") == "1"
+
+        need_reshape = (
+            not _use_tp_inv
+            and is_batch_invariant_mode_enabled is not None
+            and is_batch_invariant_mode_enabled()
+            and input.ndim == 3
+        )
+        if need_reshape:
+            orig_shape = input.shape
+            input = input.reshape(-1, orig_shape[-1])
+
         if _use_tp_inv:
-            return linear_with_tp_invariant_forward(input, weight, *args, **kwargs)
+            output = linear_with_tp_invariant_forward(input, weight, *args, **kwargs)
         elif not weight.requires_grad:
-            return linear_with_frozen_weight(input, weight, *args, **kwargs)
+            output = linear_with_frozen_weight(input, weight, *args, **kwargs)
         else:
-            return linear_with_grad_accumulation_and_async_allreduce(input, weight, *args, **kwargs)
+            output = linear_with_grad_accumulation_and_async_allreduce(input, weight, *args, **kwargs)
+
+        if need_reshape:
+            output = output.reshape(*orig_shape[:-1], output.shape[-1])
+
+        return output
 
     def forward(self, input_):
         """Forward of RowParallelLinear
