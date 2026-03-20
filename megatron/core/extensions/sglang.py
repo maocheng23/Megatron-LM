@@ -365,10 +365,14 @@ class SGLangLinear(MegatronModule):
         # Use matmul_tp_persistent for RowParallel when ROW_LINEAR_ENABLE_INV=1.
         # This matches SGLang's RowParallelLinear which uses torch.ops.tp_inv_ops.matmul_tp_inv
         # when is_tp_invariant_mode_enabled() and ROW_LINEAR_ENABLE_INV=1.
+        # matmul_tp_persistent requires K divisible by BLOCK_K (128).
+        # Fall back to sglang_mm for small K (e.g. MoE expert down_proj with K=64).
+        _K = x.shape[-1]
         _use_tp_inv = (
             self.parallel_mode == "row"
             and self.tp_size > 1
             and os.environ.get("ROW_LINEAR_ENABLE_INV", "0") == "1"
+            and _K >= 128 and _K % 128 == 0
         )
         if _use_tp_inv:
             from megatron.core.tensor_parallel.matmul_tp_inv import matmul_tp_persistent

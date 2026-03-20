@@ -1243,7 +1243,7 @@ class SelfAttention(Attention):
             mixed_qkv = all_gather_last_dim_from_tensor_parallel_region(mixed_qkv)
 
             _true_on_policy = getattr(self.config, 'true_on_policy_model', None) is not None
-            if _true_on_policy:
+            if _true_on_policy and not output_gate:
                 # Match SGLang's QKVParallelLinear KV-head replication layout.
                 # After all-gather, mixed_qkv has the FULL QKV in interleaved format:
                 # [G0(Q*hpg, K, V), G1(Q*hpg, K, V), ...] where each group has
