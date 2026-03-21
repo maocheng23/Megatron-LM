@@ -198,6 +198,7 @@ def _apply_rotary_pos_emb_thd(
     multi_latent_attention: bool = False,
     mscale: float = 1.0,
     cp_group: torch.distributed.ProcessGroup = None,
+    ulysses_cp: bool = False,
 ) -> Tensor:
     """A baseline implementation of applying RoPE for `thd` format.
 
@@ -207,6 +208,8 @@ def _apply_rotary_pos_emb_thd(
         with shape [b + 1] and dtype torch.int32.
         freqs (Tensor): Rotary Positional embedding tensor freq is of shape [max_s, 1, 1, d]
         cp_group (torch.distributed.ProcessGroup): The context parallel group
+        ulysses_cp (bool): When True, sequence is NOT split across CP ranks
+            (Ulysses splits heads, not sequence), so treat cp_size=1 for RoPE.
 
     Returns:
         Tensor: Shape [t, h, d]. The input tensor after applying RoPE.
@@ -214,8 +217,8 @@ def _apply_rotary_pos_emb_thd(
 
     if cp_group is None:
         raise ValueError("cp_group must be provided for THD format RoPE")
-    cp_size = cp_group.size()
-    cp_rank = cp_group.rank()
+    cp_size = 1 if ulysses_cp else cp_group.size()
+    cp_rank = 0 if ulysses_cp else cp_group.rank()
     seqlens = ((cu_seqlens[1:] - cu_seqlens[:-1]) // cp_size).tolist()
 
     # Handle two different frequency tensor formats:
@@ -269,10 +272,14 @@ def apply_rotary_pos_emb(
     cu_seqlens: Optional[Tensor] = None,
     mscale: float = 1.0,
     cp_group: torch.distributed.ProcessGroup = None,
+    ulysses_cp: bool = False,
 ):
     """
     Reroute to the appropriate apply_rotary_pos_emb function depending on
-    fused/unfused kernels, or bshd (conventional) / thd (packed seq) format
+    fused/unfused kernels, or bshd (conventional) / thd (packed seq) format.
+
+    When *ulysses_cp* is True the sequence is NOT split across CP ranks, so
+    RoPE should behave as if cp_size == 1 (no position-offset adjustment).
     """
     global fused_apply_rotary_pos_emb, fused_apply_rotary_pos_emb_thd
 
@@ -302,8 +309,10 @@ def apply_rotary_pos_emb(
                 return fused_apply_rotary_pos_emb(t, freqs, interleaved=config.rotary_interleaved)
         else:
             assert fused_apply_rotary_pos_emb_thd is not None, "apply_rope_fusion is not available."
+            _cp_size = 1 if ulysses_cp else cp_group.size()
+            _cp_rank = 0 if ulysses_cp else cp_group.rank()
             return fused_apply_rotary_pos_emb_thd(
-                t, cu_seqlens, freqs, cp_size=cp_group.size(), cp_rank=cp_group.rank()
+                t, cu_seqlens, freqs, cp_size=_cp_size, cp_rank=_cp_rank
             )
     # use unfused implementation
     if cu_seqlens is None:
@@ -323,6 +332,7 @@ def apply_rotary_pos_emb(
             multi_latent_attention=config.multi_latent_attention,
             mscale=mscale,
             cp_group=cp_group,
+            ulysses_cp=ulysses_cp,
         )
 
 

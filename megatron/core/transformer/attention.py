@@ -917,6 +917,15 @@ class Attention(MegatronModule, ABC):
                     and packed_seq_params is None  # disable for packed sequences
                 )
 
+                # Ulysses CP does not split the sequence, so RoPE should
+                # behave as if cp_size == 1 (no position-offset adjustment).
+                _cp_comm = getattr(self.config, 'cp_comm_type', None)
+                if isinstance(_cp_comm, list) and len(_cp_comm) > 0:
+                    _cp_comm = _cp_comm[0]
+                _ulysses_cp = (
+                    self.config.context_parallel_size > 1 and _cp_comm == "a2a"
+                )
+
                 if q_pos_emb is not None:
                     sglang_rope_applied = False
                     if use_sglang_rope and sglang_apply_rotary_pos_emb_with_freqs is not None:
@@ -934,6 +943,7 @@ class Attention(MegatronModule, ABC):
                                 cu_seqlens=cu_seqlens_q,
                                 mscale=_yarn_get_concentration_factor_from_config(self.config),
                                 cp_group=self.pg_collection.cp,
+                                ulysses_cp=_ulysses_cp,
                             )
                         else:
                             query = inference_context.apply_rotary_emb_query(
@@ -956,6 +966,7 @@ class Attention(MegatronModule, ABC):
                             cu_seqlens=cu_seqlens_kv,
                             mscale=_yarn_get_concentration_factor_from_config(self.config),
                             cp_group=self.pg_collection.cp,
+                            ulysses_cp=_ulysses_cp,
                         )
             else:
                 query, key, value = apply_fused_qkv_rotary_pos_emb(

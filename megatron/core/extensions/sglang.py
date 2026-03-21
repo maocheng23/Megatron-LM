@@ -1481,6 +1481,10 @@ class SGLangFlashAttention(MegatronModule):
     Uses FA3 with num_splits=1 for batch-invariant behavior.
     This ensures consistent results regardless of batch size.
 
+    Supports Ulysses (a2a) context parallelism: heads are scattered across the
+    CP group before attention and gathered back afterwards.  Because each head
+    is computed independently, the result is bitwise identical to CP=1.
+
     Note: This is a simplified implementation for training. For inference with
     KV cache, use the full Attention class with flash_decode_and_prefill.
 
@@ -1505,8 +1509,21 @@ class SGLangFlashAttention(MegatronModule):
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
 
-        assert config.context_parallel_size == 1, \
-            "Context parallelism is not supported by SGLangFlashAttention!"
+        # Ulysses (a2a) context parallelism setup
+        self.cp_size = config.context_parallel_size
+        self.cp_comm_type = cp_comm_type
+        if self.cp_size > 1:
+            assert cp_comm_type == "a2a", (
+                f"SGLangFlashAttention only supports Ulysses (a2a) context parallelism, "
+                f"got cp_comm_type={cp_comm_type!r}"
+            )
+            assert pg_collection is not None and hasattr(pg_collection, "cp"), (
+                "ProcessGroupCollection must have a 'cp' group for context parallelism"
+            )
+            self.cp_group = pg_collection.cp
+        else:
+            self.cp_group = None
+
         assert config.window_size is None, \
             "Sliding Window Attention is not supported by SGLangFlashAttention!"
 
@@ -1523,6 +1540,8 @@ class SGLangFlashAttention(MegatronModule):
             _print_sglang_log("   - Using Flash Attention 3 (FA3) with batch-invariant mode")
             _print_sglang_log("   - num_splits=1 (deterministic attention)")
             _print_sglang_log(f"   - Attention mask type: {attn_mask_type}")
+            if self.cp_size > 1:
+                _print_sglang_log(f"   - Ulysses CP: cp_size={self.cp_size}")
             _print_sglang_log("=" * 80)
 
         kv_channels = config.kv_channels
@@ -1539,6 +1558,12 @@ class SGLangFlashAttention(MegatronModule):
         self.num_attention_heads_per_partition = divide(config.num_attention_heads, world_size)
         self.num_query_groups_per_partition = divide(config.num_query_groups, world_size)
 
+        if self.cp_size > 1:
+            assert self.num_attention_heads_per_partition % self.cp_size == 0, (
+                f"num_attention_heads_per_partition ({self.num_attention_heads_per_partition}) "
+                f"must be divisible by cp_size ({self.cp_size})"
+            )
+
         # Softmax scale
         if softmax_scale is None:
             self.softmax_scale = 1.0 / math.sqrt(self.hidden_size_per_attention_head)
@@ -1551,6 +1576,26 @@ class SGLangFlashAttention(MegatronModule):
         # Dropout (FA3 handles dropout internally)
         dropout_rate = config.attention_dropout if attention_dropout is None else attention_dropout
         self.attention_dropout = dropout_rate
+
+    def _ulysses_slice_heads(self, x: Tensor) -> Tensor:
+        """Slice this CP rank's heads: [t, H, d] -> [t, H/cp, d].
+
+        In Ulysses true-on-policy mode every CP rank holds the full sequence
+        with all heads (no sequence splitting).  Each rank simply picks its
+        disjoint subset of heads — pure local slicing, no communication.
+        """
+        cp_rank = self.cp_group.rank()
+        h_local = x.shape[1] // self.cp_size
+        start = cp_rank * h_local
+        return x[:, start : start + h_local, :].contiguous()
+
+    def _ulysses_gather_heads(self, x: Tensor) -> Tensor:
+        """All-gather heads from all CP ranks: [t, H/cp, d] -> [t, H, d]."""
+        t, h_local, d = x.shape
+        cp = self.cp_size
+        out_list = [torch.empty_like(x) for _ in range(cp)]
+        torch.distributed.all_gather(out_list, x.contiguous(), group=self.cp_group)
+        return torch.cat(out_list, dim=1)                  # [t, H, d]
 
     def forward(
         self,
@@ -1654,6 +1699,12 @@ class SGLangFlashAttention(MegatronModule):
             max_seqlen_q = sq
             max_seqlen_k = sk
 
+        # Ulysses CP: each rank slices its own subset of heads before FA3
+        if self.cp_size > 1:
+            query = self._ulysses_slice_heads(query)
+            key = self._ulysses_slice_heads(key)
+            value = self._ulysses_slice_heads(value)
+
         # Use Flash Attention 3 with backward support
         # CRITICAL: Use flash_attn_varlen_func (high-level API) instead of _flash_attn_forward
         # _flash_attn_forward is a low-level CUDA kernel WITHOUT autograd support
@@ -1739,6 +1790,10 @@ class SGLangFlashAttention(MegatronModule):
                 pack_gqa=None,
                 sm_margin=0,
             )[0]
+
+        # Ulysses CP: all-gather heads back from all CP ranks
+        if self.cp_size > 1:
+            output = self._ulysses_gather_heads(output)
 
         # Reshape output based on input format
         if is_packed:
