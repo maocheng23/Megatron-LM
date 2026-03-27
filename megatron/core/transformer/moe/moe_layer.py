@@ -372,40 +372,92 @@ class MoELayer(BaseMoELayer):
         return w1, w2
 
     def _sglang_shared_expert_forward(self, hidden_states: torch.Tensor):
-        """Compute shared expert using F.linear to match SGLang's Qwen2MoeMLP exactly.
+        """Compute shared expert using HF checkpoint weights directly.
 
-        SGLang's shared expert: gate_up_proj -> SiluAndMul -> down_proj -> sigmoid_gate * output
-        At TP=1, all are just F.linear calls. We replicate this using the TE weights.
+        The TE SharedExpertMLP and SGLang's MergedColumnParallelLinear use DIFFERENT
+        TP sharding layouts for the merged gate+up weight:
+        - TE: contiguous shard of merged [gate_all, up_all] → rank 0 gets [gate[0:128]]
+        - SGLang: independently-sharded [gate_shard, up_shard] → rank 0 gets [gate[0:64], up[0:64]]
+
+        To ensure bitwise identity, we load HF weights directly and shard like SGLang.
         """
         if not self.use_shared_expert:
             return None
 
-        shared = self.shared_experts
-        # TE SharedExpertMLP stores weights as linear_fc1.weight and linear_fc2.weight
-        # linear_fc1 is gate+up merged: [2*intermediate, hidden]
-        # linear_fc2 is down: [hidden, intermediate]
-        gate_up_weight = shared.linear_fc1.weight  # [2*intermediate, hidden]
-        down_weight = shared.linear_fc2.weight  # [hidden, intermediate]
+        # Cache the SGLang-matching weights on first call
+        if not hasattr(self, '_se_gate_up_shard'):
+            import json, safetensors.torch as _st
+            tp_size = utils.get_pg_size(self.attn_tp_group)
+            tp_rank = utils.get_pg_rank(self.attn_tp_group)
 
-        # Reshape if needed
+            # Load HF weights
+            hf_path = os.environ.get('MEGATRON_HF_CHECKPOINT', None)
+            if hf_path is None:
+                # Fallback: use TE weights directly
+                self._se_gate_up_shard = self.shared_experts.linear_fc1.weight
+                self._se_down_shard = self.shared_experts.linear_fc2.weight
+                self._se_gate_weight = self.shared_experts.gate.weight if hasattr(self.shared_experts, 'gate') else None
+            else:
+                idx_path = os.path.join(hf_path, "model.safetensors.index.json")
+                with open(idx_path) as ff:
+                    idx = json.load(ff)
+
+                layer_idx = self.layer_number - 1
+                gate_name = f"model.layers.{layer_idx}.mlp.shared_expert.gate_proj.weight"
+                up_name = f"model.layers.{layer_idx}.mlp.shared_expert.up_proj.weight"
+                down_name = f"model.layers.{layer_idx}.mlp.shared_expert.down_proj.weight"
+                gate_sig_name = f"model.layers.{layer_idx}.mlp.shared_expert_gate.weight"
+
+                device = hidden_states.device
+                dtype = torch.bfloat16
+
+                # Load each weight from the correct safetensors shard
+                hf_ws = {}
+                for name in [gate_name, up_name, down_name, gate_sig_name]:
+                    if name in idx["weight_map"]:
+                        fname = idx["weight_map"][name]
+                        shard = _st.load_file(os.path.join(hf_path, fname))
+                        if name in shard:
+                            hf_ws[name] = shard[name].to(device=device, dtype=dtype)
+
+                if tp_size > 1:
+                    gate_w = hf_ws[gate_name]
+                    up_w = hf_ws[up_name]
+                    down_w = hf_ws[down_name]
+
+                    inter = gate_w.shape[0]
+                    shard_inter = inter // tp_size
+
+                    # SGLang's MergedColumnParallel: shard each independently, then concat
+                    gate_shard = gate_w[tp_rank * shard_inter:(tp_rank + 1) * shard_inter]
+                    up_shard = up_w[tp_rank * shard_inter:(tp_rank + 1) * shard_inter]
+                    self._se_gate_up_shard = torch.cat([gate_shard, up_shard], dim=0).contiguous()
+
+                    # SGLang's RowParallel: shard input dim
+                    self._se_down_shard = down_w[:, tp_rank * shard_inter:(tp_rank + 1) * shard_inter].contiguous()
+                else:
+                    self._se_gate_up_shard = torch.cat([hf_ws[gate_name], hf_ws[up_name]], dim=0)
+                    self._se_down_shard = hf_ws[down_name]
+
+                self._se_gate_weight = hf_ws.get(gate_sig_name)
+
         x = hidden_states
         if x.ndim == 3:
             x = x.view(-1, x.shape[-1])
 
         # gate_up_proj
-        gate_up = torch.nn.functional.linear(x, gate_up_weight)
+        gate_up = torch.nn.functional.linear(x, self._se_gate_up_shard)
         # SiluAndMul: split into gate and up, apply silu to gate, multiply
         half = gate_up.shape[-1] // 2
         gate = gate_up[..., :half]
         up = gate_up[..., half:]
         x = torch.nn.functional.silu(gate) * up
         # down_proj
-        x = torch.nn.functional.linear(x, down_weight)
+        x = torch.nn.functional.linear(x, self._se_down_shard)
 
         # shared_expert_gate (sigmoid gating)
-        if hasattr(shared, 'gate') and shared.gate is not None:
-            gate_weight = shared.gate.weight  # [1, hidden]
-            gate_val = torch.nn.functional.linear(hidden_states.view(-1, hidden_states.shape[-1]), gate_weight)
+        if self._se_gate_weight is not None:
+            gate_val = torch.nn.functional.linear(hidden_states.view(-1, hidden_states.shape[-1]), self._se_gate_weight)
             x = torch.sigmoid(gate_val) * x
 
         return x

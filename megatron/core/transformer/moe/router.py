@@ -663,18 +663,27 @@ class TopKRouter(Router):
         if is_dump_enabled():
             dsave(f"router_logits", router_logits)
 
-        # Apply softmax, topk, and renormalize (matching SGLang)
-        routing_weights = F.softmax(
-            router_logits, dim=1, dtype=torch.float
+        # Use SGLang's fused topk_softmax kernel for bitwise-identical routing.
+        # This replaces F.softmax + torch.topk + renormalize with a single fused CUDA kernel.
+        # Critical: torch.topk has non-deterministic tie-breaking, while sgl_kernel.topk_softmax
+        # is deterministic and matches SGLang's inference path exactly.
+        from sgl_kernel import topk_softmax as _sgl_topk_softmax
+        num_tokens = input_2d.shape[0]
+        routing_weights = torch.empty(
+            num_tokens, self.topk, dtype=torch.float32, device=input_2d.device
         )
-        routing_weights, selected_experts = torch.topk(
-            routing_weights, self.topk, dim=-1
+        selected_experts = torch.empty(
+            num_tokens, self.topk, dtype=torch.int32, device=input_2d.device
         )
-        # Use non-in-place operation to preserve gradient computation
-        routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
-        routing_weights = routing_weights.to(input_2d.dtype)
+        _sgl_topk_softmax(
+            routing_weights,
+            selected_experts,
+            router_logits,
+            True,  # renormalize=True (matches SGLang's Qwen MoE config)
+        )
 
         # Store topk values for SGLang fused experts (used in MoE layer)
+        # routing_weights is already float32 and renormalized — DO NOT cast to input dtype
         self._sglang_topk_weights = routing_weights
         self._sglang_topk_ids = selected_experts
 

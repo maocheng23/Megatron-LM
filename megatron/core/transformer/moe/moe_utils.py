@@ -405,19 +405,19 @@ class FusedExpertsFunction(torch.autograd.Function):
             hidden_states = hidden_states.to(w1.dtype)
         with torch.no_grad():
             output = fused_experts_impl(
-                hidden_states=hidden_states.contiguous(),
-                w1=w1.contiguous(),
-                w2=w2.contiguous(),
-                topk_weights=topk_weights.contiguous(),
-                topk_ids=topk_ids.contiguous(),
-                inplace=False,
+                hidden_states=hidden_states,
+                w1=w1,
+                w2=w2,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                inplace=True,  # Match SGLang's inplace=True for bitwise identity
                 activation=activation,
                 is_gated=True,
                 apply_router_weight_on_input=False,
                 filter_expert=True,
                 layer_id=layer_id,
             )
-        
+
         # CRITICAL FIX: Also compute PyTorch forward to save intermediates for backward.
         # This ensures gradient computation uses consistent intermediate values.
         # Without this, backward uses recomputed PyTorch intermediates that may differ

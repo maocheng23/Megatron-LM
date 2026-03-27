@@ -667,12 +667,26 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # can do the residual add inside its internal SGLangRMSNorm.
         if _use_sglang:
             if _sglang_residual is None:
+                # First layer: hidden_states IS the residual (embedding)
                 _sglang_residual = hidden_states
+                input_layernorm_output = self.input_layernorm(hidden_states)
             else:
+                # Subsequent layers: SGLang's input_layernorm does fused add+norm:
+                #   gemma_fused_add_rmsnorm(hidden_states, residual) -> residual += hs; norm(residual)
+                # We must NOT pre-accumulate here (separate add + norm != fused add+norm).
+                # Instead, pass hidden_states and residual separately so the attention module's
+                # internal norm can call gemma_fused_add_rmsnorm for bitwise identity.
+                self.self_attention._sglang_input_residual = _sglang_residual
+                # IdentityOp passes hidden_states through to the attention module
+                input_layernorm_output = self.input_layernorm(hidden_states)
+                # For full-attention layers with linear_qkv: pass UN-accumulated residual.
+                # SGLangLayerNormColumnParallelLinear.forward calls self.norm(x, residual)
+                # where x=hidden_states, residual=_sglang_residual.
+                # The norm does: x = x + residual (accumulates hidden_states into residual).
+                # If we pre-accumulate here, hidden_states gets double-counted.
                 linear_qkv = getattr(self.self_attention, 'linear_qkv', None)
                 if linear_qkv is not None:
                     linear_qkv._sglang_pending_residual = _sglang_residual
-            input_layernorm_output = self.input_layernorm(hidden_states)
         elif self.recompute_input_layernorm:
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
             input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
@@ -747,6 +761,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             if linear_qkv is not None and hasattr(linear_qkv, '_sglang_last_residual'):
                 _sglang_residual = linear_qkv._sglang_last_residual
                 del linear_qkv._sglang_last_residual
+            # For GDN layers: gemma_fused_add_rmsnorm updated residual in-place inside the module.
+            # Pick up the accumulated residual.
+            elif hasattr(self.self_attention, '_sglang_updated_residual'):
+                _sglang_residual = self.self_attention._sglang_updated_residual
+                del self.self_attention._sglang_updated_residual
             self._sglang_pre_mlp_residual = _sglang_residual
             if is_dump_enabled() and _layer_idx == 0:
                 dsave(f"layer{_layer_idx:02d}_after_attn_bda", hidden_states)
@@ -884,13 +903,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 # operation in MLP's fc2.
                 self._set_fc2_residual(residual)
             self.mlp._sglang_layer_idx = _layer_idx
+            # Save moe_input BEFORE MLP (inplace=True overwrites the tensor)
+            if is_dump_enabled():
+                _saved_moe_input = pre_mlp_layernorm_output.clone()
             mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
 
         mlp_output, mlp_output_bias = mlp_output_with_bias
         if is_dump_enabled():
             linear_fc1 = getattr(self.mlp, 'linear_fc1', None)
             real_pre_mlp_ln = getattr(linear_fc1, '_sglang_last_normed', None) if linear_fc1 else None
-            dsave(f"layer{_layer_idx:02d}_moe_input", real_pre_mlp_ln if real_pre_mlp_ln is not None else pre_mlp_layernorm_output)
+            dsave(f"layer{_layer_idx:02d}_moe_input", real_pre_mlp_ln if real_pre_mlp_ln is not None else _saved_moe_input)
             dsave(f"layer{_layer_idx:02d}_moe_output", mlp_output)
         mlp_output = self.post_mlp_layernorm(mlp_output)
         mlp_output_with_bias = (mlp_output, mlp_output_bias)

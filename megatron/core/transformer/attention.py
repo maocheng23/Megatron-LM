@@ -1075,8 +1075,13 @@ class Attention(MegatronModule, ABC):
         x_dtype = x.dtype
         gate = gate.contiguous()
         gate = gate.view(*x.shape)
-        x = x * torch.sigmoid(gate.float())
-        x = x.to(x_dtype)
+        # Match SGLang: sigmoid in native dtype (bf16), not float32.
+        # SGLang's qwen3_next.py: gate = torch.sigmoid(gate); attn_output = attn_output * gate
+        if getattr(self.config, 'use_sglang', False):
+            x = x * torch.sigmoid(gate)
+        else:
+            x = x * torch.sigmoid(gate.float())
+            x = x.to(x_dtype)
         return x
 
     def set_for_recompute_input_layernorm(self):
