@@ -1070,7 +1070,6 @@ class Attention(MegatronModule, ABC):
 
         return output, bias
 
-    @jit_fuser
     def _apply_output_gate(self, x, gate):
         x_dtype = x.dtype
         gate = gate.contiguous()
