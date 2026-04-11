@@ -665,8 +665,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         _use_sglang_pp = getattr(self.config, 'use_sglang', False) and not self.pre_process
         if _use_sglang_pp and hidden_states is not None:
             H = hidden_states.shape[-1]
-            if H % 2 == 0:
-                half = H // 2
+            expected_packed = self.config.hidden_size * 2
+            if H == expected_packed:
+                half = self.config.hidden_size
                 _sglang_pp_residual = hidden_states[..., half:].contiguous()
                 hidden_states = hidden_states[..., :half].contiguous()
 
@@ -732,7 +733,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
                 _use_sglang = getattr(self.config, 'use_sglang', False)
                 if _use_sglang:
-                    hidden_states = (hidden_states, None)
+                    # Use residual unpacked from PP boundary if available (PP>1)
+                    hidden_states = (hidden_states, _sglang_pp_residual)
 
                 for l_no, layer in enumerate(self.layers):
                     if is_dump_enabled():
@@ -788,6 +790,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
                 if _use_sglang:
                     hidden_states, _sglang_final_residual = hidden_states
+                    self._sglang_final_residual_for_pp = _sglang_final_residual
 
         # Final layer norm.
         if self.final_layernorm is not None:
@@ -812,6 +815,17 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         if not self.pre_process and len(self.layers) == 0 and not self.final_layernorm:
             hidden_states = hidden_states.clone()
+
+        # PP + SGLang: pack residual into output for the next PP stage.
+        # Concatenate [hidden_states, residual] along last dim (hidden_size)
+        # so the next stage can split and restore the residual stream.
+        # Always pack when use_sglang + PP>1 + not last stage, using zeros if no residual.
+        _use_sglang_pack = getattr(self.config, 'use_sglang', False) and not self.post_process
+        if _use_sglang_pack:
+            _res = getattr(self, '_sglang_final_residual_for_pp', None)
+            if _res is None:
+                _res = torch.zeros_like(hidden_states)
+            hidden_states = torch.cat([hidden_states, _res], dim=-1)
 
         return hidden_states
 
