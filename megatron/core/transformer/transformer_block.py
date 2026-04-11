@@ -658,6 +658,18 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             # See set_input_tensor()
             hidden_states = self.input_tensor
 
+        # PP + SGLang: unpack residual from the PP input tensor.
+        # When PP>1 and use_sglang, the previous PP stage concatenates
+        # [hidden_states, residual] along the last dim before send_forward.
+        _sglang_pp_residual = None
+        _use_sglang_pp = getattr(self.config, 'use_sglang', False) and not self.pre_process
+        if _use_sglang_pp and hidden_states is not None:
+            H = hidden_states.shape[-1]
+            if H % 2 == 0:
+                half = H // 2
+                _sglang_pp_residual = hidden_states[..., half:].contiguous()
+                hidden_states = hidden_states[..., :half].contiguous()
+
         # Viewless tensor.
         # - We only need to create a viewless tensor in the case of micro batch
         #   size (mbs) == 1, since in this case, 'hidden_states.transpose()'

@@ -118,7 +118,7 @@ def fused_moe_backward_input_kernel(
                 # grad_out: (BLOCK_SIZE_M, BLOCK_SIZE_N)
                 # w: (BLOCK_SIZE_N, BLOCK_SIZE_K)
                 # result: (BLOCK_SIZE_M, BLOCK_SIZE_K)
-                contribution = tl.dot(grad_out, w)
+                contribution = tl.dot(grad_out, w.to(grad_out.dtype))
 
                 # Atomic add to grad_input because different N blocks contribute to same K
                 grad_input_ptrs = grad_input_ptr + (
@@ -259,7 +259,7 @@ def fused_moe_backward_weight_kernel(
         inp = inp * input_mask_col
 
         # Compute grad_weight contribution: grad_out.T @ inp
-        grad_w_contribution = tl.dot(grad_out.T, inp)
+        grad_w_contribution = tl.dot(grad_out.to(compute_type).T, inp.to(compute_type))
 
         # Write back using atomic add
         grad_weight_ptrs = (
@@ -386,7 +386,7 @@ def fused_moe_backward_topk_weights_kernel(
 
                     # Accumulate forward output: input @ weight.T
                     # inp: (M, K), w.T: (K, N) -> (M, N)
-                    forward_output_n += tl.dot(inp, w.T)
+                    forward_output_n += tl.dot(inp.to(compute_type), w.to(compute_type).T)
 
                 # Compute contribution to grad_topk_weights: sum(grad_out * forward_output)
                 # Sum over N dimension

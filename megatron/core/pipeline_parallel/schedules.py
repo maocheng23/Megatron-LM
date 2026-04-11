@@ -2022,7 +2022,12 @@ def get_tensor_shapes(
     if config.sequence_parallel:
         effective_seq_length = effective_seq_length // tp_group.size()
 
-    tensor_shapes.append((effective_seq_length, micro_batch_size, config.hidden_size))
+    hidden_size = config.hidden_size
+    # PP + SGLang: non-last PP stages pack [hidden_states, residual] along hidden dim,
+    # doubling the hidden_size in the P2P tensor.
+    if getattr(config, 'use_sglang', False) and config.pipeline_model_parallel_size > 1:
+        hidden_size = hidden_size * 2
+    tensor_shapes.append((effective_seq_length, micro_batch_size, hidden_size))
     return tensor_shapes
 
 

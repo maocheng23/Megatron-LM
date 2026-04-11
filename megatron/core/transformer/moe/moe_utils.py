@@ -410,7 +410,7 @@ class FusedExpertsFunction(torch.autograd.Function):
                 w2=w2,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
-                inplace=True,  # Match SGLang's inplace=True for bitwise identity
+                inplace=False,  # Must be False: inplace=True corrupts hidden_states used by PyTorch intermediates loop below
                 activation=activation,
                 is_gated=True,
                 apply_router_weight_on_input=False,
